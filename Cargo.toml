@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/protocol", "crates/server", "crates/client"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+authors = ["FlyCockpit LLC"]
+repository = "https://github.com/FlyCockpit/tunnel"
+homepage = "https://github.com/FlyCockpit/tunnel"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.23.1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rand = "0.10.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+# Features are chosen per crate: the protocol needs none, the server only
+# `handshake` (accept key), the client `connect` + rustls.
+tokio-tungstenite = { version = "0.30.0", default-features = false }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# reqwest 0.13 tls_certs_only needs full DER certificates, not trust anchors.
+webpki-root-certs = "1.0.11"
+tunnel-protocol = { path = "crates/protocol" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

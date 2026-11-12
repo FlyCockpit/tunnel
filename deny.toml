@@ -1,0 +1,32 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained; webrtc-util pulls it in through nix 0.26, with no upstream fix available." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Select only the licenses needed to satisfy the dependency SPDX expressions.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

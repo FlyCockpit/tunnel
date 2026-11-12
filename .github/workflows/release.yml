@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Manual runs build and validate artifacts without signing or publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '3'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check version and extract release notes
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          if os.environ['EVENT_NAME'] == 'push' and os.environ['RELEASE_TAG'] != f'v{version}':
+              raise SystemExit('Release tag must equal v + workspace version')
+          changelog = Path('CHANGELOG.md').read_text()
+          section = re.search(r'^## ' + re.escape(version) + r' - [^\n]+\n(.*?)(?=^## |\Z)', changelog, re.M | re.S)
+          if not section or not section.group(1).strip():
+              raise SystemExit('Missing changelog entry for workspace version')
+          Path('dist').mkdir()
+          Path('dist/release-notes.md').write_text(section.group(1).strip() + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (rolling branch)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Generate third-party notices
+        run: |
+          nice -n 10 cargo install --locked --features cli cargo-about@0.9.3
+          nice -n 10 cargo about generate --locked about.hbs -o dist/THIRD_PARTY_LICENSES.html
+          cp install.sh dist/install.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-metadata
+          path: dist/
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            # GitHub has no ubuntu-latest label for Arm runners; this matches
+            # ubuntu-latest's release. The output is a static musl binary.
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (rolling branch)
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export "CC_${TARGET//-/_}=musl-gcc"
+            linker_target=${TARGET//-/_}
+            export "CARGO_TARGET_${linker_target^^}_LINKER=musl-gcc"
+            nice -n 10 cargo build --release --locked --target "$TARGET" -p tunnel-server -p tunnel-client
+            cp "target/$TARGET/release/tunnel-server" "dist/tunnel-server-$TARGET"
+            # Both distributed Linux binaries must be statically linked.
+            for binary in tunnel-server tunnel; do
+              if readelf -l "target/$TARGET/release/$binary" | grep -q INTERP; then
+                echo "Expected a static musl binary: $binary" >&2
+                exit 1
+              fi
+            done
+          else
+            nice -n 10 cargo build --release --locked --target "$TARGET" -p tunnel-client
+          fi
+          cp "target/$TARGET/release/tunnel" "dist/tunnel-$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-assets-*
+          path: dist
+          merge-multiple: true
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+      - name: Check assets, checksum and sign
+        working-directory: dist
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q '^MINISIGN_PUBKEY="REPLACE_WITH_MINISIGN_PUBLIC_KEY"' install.sh; then
+            echo 'Replace the installer minisign public key before the first release.' >&2
+            exit 1
+          fi
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            test -s "tunnel-server-$target"
+            test -s "tunnel-$target"
+          done
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            test -s "tunnel-$target"
+          done
+          test -s install.sh
+          test -s THIRD_PARTY_LICENSES.html
+          mv release-notes.md "$RUNNER_TEMP/release-notes.md"
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          test -n "$MINISIGN_SECRET_KEY"
+          umask 077
+          signing_key=$(mktemp "$RUNNER_TEMP/minisign.XXXXXX")
+          trap 'rm -f "$signing_key"' EXIT
+          chmod 0600 "$signing_key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$signing_key" -m SHA256SUMS -x SHA256SUMS.minisig
+          minisign_pubkey=$(sed -n 's/^MINISIGN_PUBKEY="\([^"]*\)"$/\1/p' install.sh)
+          minisign -V -q -P "$minisign_pubkey" -m SHA256SUMS -x SHA256SUMS.minisig
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag \
+            --title "Tunnel $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            dist/*

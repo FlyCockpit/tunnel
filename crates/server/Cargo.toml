@@ -1,0 +1,65 @@
+[package]
+name = "tunnel-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Self-hosted Tunnel edge server: TLS, access gate, management API and built-in TURN relay."
+
+[[bin]]
+name = "tunnel-server"
+path = "src/main.rs"
+
+[dependencies]
+tunnel-protocol.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite = { workspace = true, features = ["handshake"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustls.workspace = true
+webpki-root-certs.workspace = true
+
+axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1"] }
+hex = "0.4"
+hmac = "0.13.0"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls-no-provider"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+sha1 = "0.11.0"
+subtle = "2"
+argon2 = "0.6.0"
+time = "0.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+toml = "1.2"
+tower = { version = "0.5", features = ["util"] }
+url = "2"
+turn = "0.17.3"
+webrtc-util = { version = "0.17.3", default-features = false, features = ["conn"] }
+async-trait = "0.1"
+utoipa = "6.0.0"
+x509-parser = "0.18.1"
+stun = "0.17.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
