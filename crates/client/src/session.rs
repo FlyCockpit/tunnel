@@ -35,6 +35,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const PREAMBLE_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a Close may trail the end of the session (see `drain_close`).
+const CLOSE_DRAIN: Duration = Duration::from_secs(1);
 /// Max frame on the outer socket (plan: control plane, item 7).
 const MAX_FRAME: usize = 512 * 1024;
 const ICE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -161,7 +163,7 @@ async fn establish(
     let _pump = AbortOnDrop(pump);
     let session = mux::Session::new_client(duplex);
     let mut control = session.control();
-    let mut driver = AbortOnDrop(tokio::spawn(drive_session(daemon.clone(), session)));
+    let mut driver = AbortOnDrop(tokio::spawn(drive_session(daemon.clone(), session, generation)));
 
     let stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, control.open_stream()).await {
         Err(_) => bail!("timed out opening the control stream"),
@@ -208,6 +210,8 @@ async fn establish(
 
     loop {
         tokio::select! {
+            // A Close that arrived with the end of the session is read first.
+            biased;
             msg = read_json_line::<_, ServerMsg>(&mut rd, &mut buf) => match msg {
                 Ok(Some(ServerMsg::Reply { id, ok, error, ice })) => {
                     let tx = lock_poisoned(&pending).remove(&id);
@@ -222,7 +226,20 @@ async fn establish(
             },
             // Cancelling the read only happens on this exit path, so a
             // partially read line is never lost mid-session.
-            _ = &mut driver.0 => return Ok(End::Lost("tunnel session ended".to_string())),
+            _ = &mut driver.0 => return Ok(drain_close(&mut rd, &mut buf).await),
+        }
+    }
+}
+
+/// The session ended: the server may have sent `Close` just before hanging
+/// up. Its reason decides the exit code (e.g. 4 for replaced, not a
+/// reconnect that only finds the token rotated), so read what is buffered.
+async fn drain_close<R: tokio::io::AsyncBufRead + Unpin>(rd: &mut R, buf: &mut String) -> End {
+    loop {
+        match tokio::time::timeout(CLOSE_DRAIN, read_json_line::<_, ServerMsg>(rd, buf)).await {
+            Ok(Ok(Some(ServerMsg::Close { reason }))) => return close_end(reason),
+            Ok(Ok(Some(_))) => {}
+            _ => return End::Lost("tunnel session ended".to_string()),
         }
     }
 }
@@ -243,9 +260,9 @@ fn close_end(reason: CloseReason) -> End {
 
 /// Own the Yamux session: polling it drives all streams. Every inbound stream
 /// is a server-opened data stream.
-async fn drive_session(daemon: Arc<Daemon>, mut session: mux::Session) {
+async fn drive_session(daemon: Arc<Daemon>, mut session: mux::Session, generation: u64) {
     while let Some(stream) = session.next().await {
-        tokio::spawn(handle_data_stream(daemon.clone(), stream));
+        tokio::spawn(handle_data_stream(daemon.clone(), stream, generation));
     }
     debug!("yamux session ended");
 }
@@ -313,20 +330,22 @@ fn ice_refresh_delay(config: &tunnel_protocol::IceConfig, now: u64) -> Duration 
     Duration::from_secs(refresh_at.saturating_sub(now)).min(ICE_CHECK_INTERVAL).max(Duration::from_secs(5))
 }
 
-async fn handle_data_stream(daemon: Arc<Daemon>, mut stream: StreamHandle) {
+/// `generation`: the connection the stream arrived on. A stream that outlives
+/// a switch to another tunnel must not reach that tunnel's ports or target.
+async fn handle_data_stream(daemon: Arc<Daemon>, mut stream: StreamHandle, generation: u64) {
     let mut preamble = [0u8; 2];
     match tokio::time::timeout(PREAMBLE_TIMEOUT, stream.read_exact(&mut preamble)).await {
         Ok(Ok(_)) => {}
         _ => return,
     }
     let port = decode_preamble(preamble);
-    if !daemon.is_exposed(port) {
+    let Some(target) = daemon.dial_target(port, generation) else {
         debug!(port, "stream for a port that is not exposed");
         let _ = stream.write_all(&[STREAM_NOT_EXPOSED]).await;
         let _ = stream.shutdown().await;
         return;
-    }
-    let Some(mut local) = connect_local(port).await else {
+    };
+    let Some(mut local) = connect_local(port, target).await else {
         debug!(port, "local origin refused the connection");
         let _ = stream.write_all(&[STREAM_REFUSED]).await;
         let _ = stream.shutdown().await;
@@ -340,10 +359,16 @@ async fn handle_data_stream(daemon: Arc<Daemon>, mut stream: StreamHandle) {
     }
 }
 
-/// Loopback only: a sandbox port is never forwarded to another host. Node ≥17
-/// dev servers often bind `localhost` to `::1` only, hence the fallback.
-async fn connect_local(port: u16) -> Option<TcpStream> {
-    let candidates = [SocketAddr::from((Ipv4Addr::LOCALHOST, port)), SocketAddr::from((Ipv6Addr::LOCALHOST, port))];
+/// Loopback by default; Node ≥17 dev servers often bind `localhost` to `::1`
+/// only, hence the fallback. With a target (`TUNNEL_TARGET_HOST`, an IP
+/// literal set by whoever started the daemon, e.g. a sandbox host dialling its
+/// guest), only `<target>:<port>` is dialled. Either way only exposed ports
+/// are reached: the caller checks `is_exposed` first.
+async fn connect_local(port: u16, target: Option<std::net::IpAddr>) -> Option<TcpStream> {
+    let candidates = match target {
+        Some(ip) => vec![SocketAddr::new(ip, port)],
+        None => vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port)), SocketAddr::from((Ipv6Addr::LOCALHOST, port))],
+    };
     for addr in candidates {
         if let Ok(Ok(tcp)) = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
             let _ = tcp.set_nodelay(true);
@@ -366,5 +391,36 @@ mod tests {
         assert_eq!(ice_refresh_delay(&config(101, 60), 100), Duration::from_secs(5));
         assert_eq!(ice_refresh_delay(&config(99, 60), 100), Duration::from_secs(5));
         assert_eq!(ice_refresh_delay(&config(86_500, 86_400), 100), ICE_CHECK_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn target_is_dialled_alone_without_loopback_fallback() {
+        // Listen on IPv6 loopback only.
+        let Ok(listener) = tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+            return; // No IPv6 loopback in this environment.
+        };
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        // Loopback default falls back to ::1.
+        assert!(connect_local(port, None).await.is_some());
+        // An explicit target is the only address tried.
+        assert!(connect_local(port, Some(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST))).await.is_some());
+        assert!(connect_local(port, Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn close_buffered_at_session_end_decides_the_outcome() {
+        let mut buf = String::new();
+        let lines = b"{\"type\":\"reply\",\"id\":1,\"ok\":true}\n{\"type\":\"close\",\"reason\":\"replaced\"}\n";
+        let mut rd = tokio::io::BufReader::new(&lines[..]);
+        assert!(matches!(drain_close(&mut rd, &mut buf).await, End::Replaced));
+        let mut rd = tokio::io::BufReader::new(&b"{\"type\":\"close\",\"reason\":\"deleted\"}\n"[..]);
+        assert!(matches!(drain_close(&mut rd, &mut buf).await, End::Revoked(_)));
+        let mut rd = tokio::io::BufReader::new(&b""[..]);
+        assert!(matches!(drain_close(&mut rd, &mut buf).await, End::Lost(_)));
     }
 }

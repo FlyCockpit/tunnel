@@ -17,6 +17,7 @@ The binary is `target/release/tunnel`.
 ```sh
 TUNNEL_TOKEN=tntun_… tunnel expose 3000                  # starts the daemon if needed, adds the port
 tunnel expose 8080 5173                                  # adds ports to the running daemon
+tunnel expose 3000 --target 10.20.0.2                    # dial 10.20.0.2:3000 instead of loopback (IP literals only)
 tunnel unexpose 8080
 tunnel status                                            # human-readable
 tunnel status --json                                     # for scripts and automation
@@ -91,13 +92,15 @@ at the tunnel's remaining lifetime with a small margin.
 |---|---|
 | `TUNNEL_TOKEN` | Tunnel token (`tntun_…`). Pass by environment, never argv. The client refuses values without the `tntun_` prefix. |
 | `TUNNEL_SERVER` | Tunnel server, e.g. `wss://tunnel.example.com` (`https://` and bare hosts are accepted). `expose` falls back to the logged-in server, then the daemon's saved server (when reusing its tunnel), then `TUNNEL_DEFAULT_SERVER` baked in at build time. |
+| `TUNNEL_TARGET_HOST` | IPv4 or IPv6 literal the daemon dials for exposed ports instead of loopback (e.g. a VM's address when the client runs on its host). Hostnames are refused. Saved with the tunnel; `--target` on `expose`/`share` sets it too. Only exposed ports are ever dialled. |
+| `TUNNEL_STATE_DIR` | State directory, used as is (absolute path); same as the global `--state-dir`. One daemon and one tunnel per directory. |
 | `TUNNEL_ICE_FILE` | ICE file the daemon keeps fresh. Default `/run/tunnel/ice.json` if writable, else `<state dir>/ice.json`. |
 | `TUNNEL_ICE_PORT` | Port of `http://127.0.0.1:<port>/ice` (default `47801`). Requests need `Authorization: Bearer $TUNNEL_ICE_TOKEN`. |
 | `TUNNEL_SHARE_PASSWORD` | Password for `share --password`; otherwise prompted without echo. |
 | `RUST_LOG` | Log filter (daemon default `info`, commands `warn`). |
 
-State lives in `$XDG_RUNTIME_DIR/tunnel/` (else
-`/tmp/tunnel-<uid>/`, mode 0700): `daemon.sock`, `state.json` (0600,
+State lives in `--state-dir` / `$TUNNEL_STATE_DIR` if given, else
+`$XDG_RUNTIME_DIR/tunnel/` (else `/tmp/tunnel-<uid>/`), mode 0700: `daemon.sock`, `state.json` (0600,
 holds the token), `daemon.log`, `daemon.lock`, `share.json`, `ice-token`, and
 `ice.json` (unless `TUNNEL_ICE_FILE` or the writable `/run/tunnel/` default
 places the ICE file elsewhere).
@@ -125,7 +128,36 @@ status. Invalid command-line arguments exit with code 2 (Clap).
 
 The daemon exits with the same terminal codes. A revoked daemon is never restarted until
 a different token is supplied; a replaced one can be restarted by an explicit
-`expose` or `share`, or by supplying a different token.
+`expose` or `share`, or by supplying a different token. These codes are stable.
+
+## Supervised daemon
+
+A supervisor (for example a systemd unit started by a sandbox host) can run the
+daemon in the foreground instead of letting commands start it:
+
+```sh
+# environment (from a 0600 file, never argv): TUNNEL_TOKEN, TUNNEL_SERVER, TUNNEL_TARGET_HOST
+tunnel --state-dir /run/user/1000/host/tunnels/sbx-1 daemon      # logs to stderr; exit 3 = gone, 4 = replaced
+tunnel --state-dir /run/user/1000/host/tunnels/sbx-1 expose 3000 5173
+tunnel --state-dir /run/user/1000/host/tunnels/sbx-1 status --json   # includes tunnel_id, target and features
+```
+
+- One daemon per state directory; a second one exits 0 at once. The directory is
+  created (0700) if missing; its parent must exist.
+- The daemon saves the token in `state.json` in that directory, so put it on
+  tmpfs (`/run/user/<uid>/…`) if the token must not reach persistent disk.
+  A daemon refuses to start on an unreadable or malformed `state.json`
+  (`tunnel stop` removes it) instead of falling back to defaults.
+- Ports can also be sent over `<state dir>/daemon.sock` as the `expose` command does
+  (newline-delimited JSON `{"type":"expose","ports":[3000]}`).
+- `status --json` lists the daemon's `features`; `"target"` means it honours
+  `--target` / `TUNNEL_TARGET_HOST` (a command refuses `--target` with a
+  running daemon that does not list it). IPv4-mapped IPv6 targets are
+  treated as the IPv4 address.
+- On Linux the daemon marks itself non-dumpable, so other processes of the same
+  user cannot read its memory or environment through `/proc` or ptrace.
+- Suggested supervision: restart on failure, but not on exit 3 (and treat 4 as
+  "another client holds the tunnel").
 
 ## Using it from scripts / automation
 

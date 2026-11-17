@@ -25,26 +25,33 @@ pub struct Persisted {
     pub replaced: bool,
     pub tunnel_id: Option<String>,
     pub host_template: Option<String>,
+    /// Where exposed ports are dialled (`TUNNEL_TARGET_HOST` / `--target`);
+    /// `None`: loopback.
+    #[serde(default)]
+    pub target: Option<std::net::IpAddr>,
 }
 
 impl Persisted {
-    /// A missing or unreadable file is treated as no state.
+    /// A missing or unreadable file is treated as no state (commands); the
+    /// daemon uses [`Persisted::load_strict`].
     pub fn load(path: &Path) -> Option<Self> {
+        Self::load_strict(path).unwrap_or_else(|e| {
+            tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "ignoring unreadable state file");
+            None
+        })
+    }
+
+    /// `Ok(None)` only if there is no file; unreadable or malformed state
+    /// (including an invalid target) is an error.
+    pub fn load_strict(path: &Path) -> anyhow::Result<Option<Self>> {
         let bytes = match fs::read(path) {
             Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read state file");
-                return None;
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("cannot read state file: {e}")),
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(state) => Some(state),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "ignoring corrupt state file");
-                None
-            }
-        }
+        let mut state: Self = serde_json::from_slice(&bytes).map_err(|e| anyhow!("malformed state file: {e}"))?;
+        state.target = state.target.map(crate::paths::validate_target).transpose()?;
+        Ok(Some(state))
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -138,5 +145,35 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(!dir.join("state.json.tmp").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn target_round_trips_and_defaults_to_loopback() {
+        let p = Persisted { target: Some("fd00::2".parse().unwrap()), ..Persisted::default() };
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["target"], "fd00::2");
+        assert_eq!(serde_json::from_value::<Persisted>(json.clone()).unwrap().target, p.target);
+        let mut without = json;
+        without.as_object_mut().unwrap().remove("target");
+        assert_eq!(serde_json::from_value::<Persisted>(without).unwrap().target, None);
+    }
+
+    #[test]
+    fn strict_load_refuses_malformed_or_invalid_targets() {
+        let dir = std::env::temp_dir().join(format!("tunnel-state-strict-{}", rand::random::<u64>()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("state.json");
+        assert!(Persisted::load_strict(&path).unwrap().is_none());
+        let mut value = serde_json::to_value(Persisted::default()).unwrap();
+        value.as_object_mut().unwrap().remove("target");
+        fs::write(&path, value.to_string()).unwrap();
+        assert_eq!(Persisted::load_strict(&path).unwrap().unwrap().target, None, "no target: loopback");
+        for bad in [serde_json::json!("vm.internal"), serde_json::json!("0.0.0.0"), serde_json::json!(42)] {
+            value["target"] = bad.clone();
+            fs::write(&path, value.to_string()).unwrap();
+            assert!(Persisted::load_strict(&path).is_err(), "{bad}");
+            assert!(Persisted::load(&path).is_none(), "commands still treat it as no state");
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

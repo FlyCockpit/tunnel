@@ -12,6 +12,10 @@ use tunnel_protocol::TUNNEL_TOKEN_PREFIX;
 
 pub const ENV_TOKEN: &str = "TUNNEL_TOKEN";
 pub const ENV_SERVER: &str = "TUNNEL_SERVER";
+/// IP literal the daemon dials for exposed ports instead of loopback.
+pub const ENV_TARGET: &str = "TUNNEL_TARGET_HOST";
+/// The daemon's state directory, used as is (see [`Paths::resolve`]).
+pub const ENV_STATE_DIR: &str = "TUNNEL_STATE_DIR";
 pub const ENV_ICE_FILE: &str = "TUNNEL_ICE_FILE";
 pub const ENV_ICE_PORT: &str = "TUNNEL_ICE_PORT";
 pub const DEFAULT_ICE_PORT: u16 = 47801;
@@ -25,13 +29,33 @@ pub struct Paths {
     pub lock_file: PathBuf,
 }
 
+static STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--state-dir`: takes precedence over `$TUNNEL_STATE_DIR`. Set once at startup.
+pub fn set_state_dir(dir: PathBuf) -> anyhow::Result<()> {
+    if !dir.is_absolute() {
+        bail!("--state-dir must be an absolute path");
+    }
+    STATE_DIR.set(dir).map_err(|_| anyhow::anyhow!("state dir already set"))
+}
+
+/// The explicit state directory (`--state-dir`, else `$TUNNEL_STATE_DIR`), if any.
+pub fn explicit_state_dir() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(dir) = STATE_DIR.get() {
+        return Ok(Some(dir.clone()));
+    }
+    match std::env::var_os(ENV_STATE_DIR).filter(|v| !v.is_empty()).map(PathBuf::from) {
+        Some(dir) if !dir.is_absolute() => bail!("{ENV_STATE_DIR} must be an absolute path"),
+        dir => Ok(dir),
+    }
+}
+
 impl Paths {
-    /// Resolve and create (0700) the per-user state directory.
+    /// Resolve and create (0700) the state directory: `--state-dir` or
+    /// `$TUNNEL_STATE_DIR` as given (one daemon and tunnel per directory),
+    /// else `$XDG_RUNTIME_DIR/tunnel`, else `/tmp/tunnel-<uid>`.
     pub fn resolve() -> anyhow::Result<Self> {
-        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-            Some(xdg) if xdg.is_absolute() && xdg.is_dir() => xdg.join("tunnel"),
-            _ => PathBuf::from(format!("/tmp/tunnel-{}", uid())),
-        };
+        let dir = state_dir(explicit_state_dir()?, std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
         ensure_private_dir(&dir)?;
         Ok(Self {
             socket: dir.join("daemon.sock"),
@@ -40,6 +64,14 @@ impl Paths {
             lock_file: dir.join("daemon.lock"),
             dir,
         })
+    }
+}
+
+fn state_dir(explicit: Option<PathBuf>, xdg_runtime: Option<PathBuf>) -> PathBuf {
+    match (explicit, xdg_runtime) {
+        (Some(dir), _) => dir,
+        (None, Some(xdg)) if xdg.is_absolute() && xdg.is_dir() => xdg.join("tunnel"),
+        _ => PathBuf::from(format!("/tmp/tunnel-{}", uid())),
     }
 }
 
@@ -73,6 +105,52 @@ pub fn validate_tunnel_token(token: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parse a forwarding target: an IPv4 or IPv6 literal (IPv6 may be in
+/// brackets). Hostnames are refused so the dialled address can't change
+/// behind the caller's back (DNS), as are unspecified, multicast and broadcast
+/// addresses.
+pub fn parse_target(raw: &str) -> anyhow::Result<std::net::IpAddr> {
+    let s = raw.trim();
+    let unbracketed = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(s);
+    let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() else {
+        bail!("target must be an IPv4 or IPv6 address, not a hostname: {}", terminal_text(s));
+    };
+    validate_target(ip)
+}
+
+/// Canonical form of a target (IPv4-mapped IPv6 becomes IPv4, which is how
+/// the kernel dials it), refusing unspecified, multicast and broadcast
+/// addresses. Applied to every target source, including saved state.
+pub fn validate_target(ip: std::net::IpAddr) -> anyhow::Result<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+    if ip.is_unspecified() || ip.is_multicast() || broadcast {
+        bail!("target {ip} is not a unicast address");
+    }
+    Ok(ip)
+}
+
+/// `$TUNNEL_TARGET_HOST`, validated. Set but unusable (including not UTF-8)
+/// is an error, never a silent fallback to loopback.
+pub fn env_target() -> anyhow::Result<Option<std::net::IpAddr>> {
+    parse_env_target(std::env::var_os(ENV_TARGET))
+}
+
+fn parse_env_target(value: Option<OsString>) -> anyhow::Result<Option<std::net::IpAddr>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| anyhow::anyhow!("{ENV_TARGET} is set but is not valid UTF-8"))?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_target(&value).map(Some).map_err(|e| anyhow::anyhow!("{ENV_TARGET}: {e}"))
 }
 
 pub fn env_token() -> anyhow::Result<Option<String>> {
@@ -149,6 +227,64 @@ pub fn ice_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_are_unicast_ip_literals_only() {
+        for (raw, want) in [
+            ("10.12.0.2", "10.12.0.2"),
+            (" 192.168.1.5 ", "192.168.1.5"),
+            ("fd00::2", "fd00::2"),
+            ("[fd00::2]", "fd00::2"),
+            ("127.0.0.1", "127.0.0.1"),
+        ] {
+            assert_eq!(parse_target(raw).unwrap().to_string(), want, "{raw}");
+        }
+        for bad in [
+            "localhost",
+            "guest.internal",
+            "10.0.0.2:3000",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+            "",
+            // IPv4-mapped forms are judged as the IPv4 address the kernel dials.
+            "::ffff:0.0.0.0",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+        ] {
+            assert!(parse_target(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_target("::ffff:10.20.0.2").unwrap().to_string(), "10.20.0.2");
+        // Saved state goes through the same check.
+        assert!(validate_target("0.0.0.0".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn target_environment_is_never_silently_ignored() {
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(parse_env_target(None).unwrap(), None);
+        assert_eq!(parse_env_target(Some(" ".into())).unwrap(), None);
+        assert_eq!(parse_env_target(Some("10.20.0.2".into())).unwrap(), Some("10.20.0.2".parse().unwrap()));
+        assert!(parse_env_target(Some("guest.internal".into())).is_err());
+        assert!(
+            parse_env_target(Some(OsString::from_vec(vec![0x31, 0xff]))).unwrap_err().to_string().contains("UTF-8")
+        );
+        assert!(parse_target("guest.example").unwrap_err().to_string().contains("not a hostname"));
+    }
+
+    #[test]
+    fn explicit_state_dir_is_used_as_is() {
+        let xdg = std::env::temp_dir();
+        assert_eq!(
+            state_dir(Some(PathBuf::from("/run/user/1/wssp/tunnels/s1")), Some(xdg.clone())),
+            PathBuf::from("/run/user/1/wssp/tunnels/s1")
+        );
+        assert_eq!(state_dir(None, Some(xdg.clone())), xdg.join("tunnel"));
+        assert_eq!(state_dir(None, Some(PathBuf::from("relative"))), PathBuf::from(format!("/tmp/tunnel-{}", uid())));
+        assert!(set_state_dir(PathBuf::from("relative/dir")).is_err());
+    }
 
     #[test]
     fn terminal_text_escapes_controls_and_preserves_printable_unicode() {

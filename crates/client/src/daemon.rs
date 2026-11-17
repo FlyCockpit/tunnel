@@ -152,6 +152,14 @@ impl Daemon {
         self.lock().persisted.ports.contains(&port)
     }
 
+    /// Where to dial `port` for a stream from connection `generation`
+    /// (`Some(None)`: loopback), checked under one lock; `None` if the port is
+    /// not exposed or the connection is no longer the current one.
+    pub fn dial_target(&self, port: u16, generation: u64) -> Option<Option<std::net::IpAddr>> {
+        let g = self.lock();
+        (g.generation == generation && g.persisted.ports.contains(&port)).then_some(g.persisted.target)
+    }
+
     pub fn set_last_error(&self, error: String) {
         self.lock().last_error = Some(error);
     }
@@ -318,16 +326,20 @@ impl Daemon {
             host_template: template,
             last_error: g.last_error.clone(),
             ice_file: Some(self.ice_file.display().to_string()),
+            target: g.persisted.target,
+            features: crate::ipc::DAEMON_FEATURES.iter().map(|f| f.to_string()).collect(),
         }
     }
 
-    /// Switch tunnels when a command brings a different token (clears ports
-    /// and the revoked flag), or reconnect when the server URL changes.
-    fn retarget(&self, token: Option<String>, server: Option<String>) -> anyhow::Result<u64> {
+    /// Switch tunnels when a command brings a different token (clears ports,
+    /// the target and the revoked flag), or reconnect when the server URL
+    /// changes. A new forwarding target applies to new visitor streams.
+    fn retarget(&self, token: Option<String>, server: Option<String>, target: Option<String>) -> anyhow::Result<u64> {
         if let Some(token) = &token {
             paths::validate_tunnel_token(token)?;
         }
         let server = server.map(|s| normalize_server(&s)).transpose()?;
+        let target = target.map(|t| paths::parse_target(&t)).transpose()?;
         let mut g = self.lock();
         let mut changed = false;
         if let Some(token) = token.filter(|t| *t != g.persisted.token) {
@@ -343,6 +355,11 @@ impl Daemon {
             g.persisted.server = server;
             changed = true;
         }
+        if let Some(target) = target.filter(|t| g.persisted.target != Some(*t)) {
+            info!(%target, "forwarding target changed");
+            g.persisted.target = Some(target);
+            self.save(&g);
+        }
         if changed {
             g.generation += 1;
             g.link = None;
@@ -354,8 +371,14 @@ impl Daemon {
         Ok(g.generation)
     }
 
-    async fn expose(&self, ports: Vec<u16>, token: Option<String>, server: Option<String>) -> anyhow::Result<Status> {
-        let generation = self.retarget(token, server)?;
+    async fn expose(
+        &self,
+        ports: Vec<u16>,
+        token: Option<String>,
+        server: Option<String>,
+        target: Option<String>,
+    ) -> anyhow::Result<Status> {
+        let generation = self.retarget(token, server, target)?;
         for port in ports {
             let link = {
                 let mut g = self.lock();
@@ -452,8 +475,8 @@ impl Daemon {
 
     async fn handle(&self, req: Request) -> Response {
         let result = match req {
-            Request::Expose { ports, token, server } => {
-                self.expose(ports, token, server).await.map(|status| Response::Status { status })
+            Request::Expose { ports, token, server, target } => {
+                self.expose(ports, token, server, target).await.map(|status| Response::Status { status })
             }
             Request::Unexpose { port } => self.unexpose(port).await.map(|status| Response::Status { status }),
             Request::Status | Request::Stop => Ok(Response::Status { status: self.status() }),
@@ -477,21 +500,29 @@ impl Daemon {
     }
 }
 
-/// Entry point of the hidden `daemon` subcommand.
+/// Entry point of the `daemon` subcommand (foreground; also what commands spawn).
 pub async fn run() -> anyhow::Result<()> {
+    harden_process();
     let paths = Paths::resolve()?;
     let Some(_lock) = lock_daemon(&paths)? else {
         info!("another daemon holds the lock; exiting");
         return Ok(());
     };
 
-    let mut persisted = Persisted::load(&paths.state_file).unwrap_or_default();
+    // An unreadable saved state (e.g. a malformed target) stops the daemon
+    // rather than being replaced by defaults such as a loopback target.
+    let mut persisted = Persisted::load_strict(&paths.state_file)
+        .with_context(|| format!("{}; `tunnel stop` removes it", paths.state_file.display()))?
+        .unwrap_or_default();
     if let Some(token) = paths::env_token()?.filter(|t| *t != persisted.token) {
         // A different token is a different tunnel: start clean.
         persisted = Persisted { token, ..Persisted::default() };
     }
     if persisted.token.is_empty() {
         bail!("no tunnel token: set {ENV_TOKEN}");
+    }
+    if let Some(target) = paths::env_target()? {
+        persisted.target = Some(target);
     }
     if persisted.revoked {
         warn!("tunnel was revoked; not reconnecting");
@@ -528,6 +559,19 @@ pub async fn run() -> anyhow::Result<()> {
     tokio::spawn(exit_on_signal(daemon.clone()));
     session::run(daemon).await;
     Ok(())
+}
+
+/// The daemon holds the tunnel token in memory: keep other processes of the
+/// same user from reading it through ptrace or `/proc/<pid>/mem` and
+/// `environ`, and from core dumps (Linux).
+fn harden_process() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl(PR_SET_DUMPABLE, 0) only changes this process's dumpable flag.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            warn!(error = %io::Error::last_os_error(), "could not mark the daemon non-dumpable");
+        }
+    }
 }
 
 /// One daemon per state dir; held for the process lifetime.
@@ -635,6 +679,7 @@ mod tests {
                 ports: vec![8080],
                 token: Some("foreign-credential".into()),
                 server: Some("wss://other.example.com".into()),
+                target: None,
             })
             .await;
         let Response::Error { message } = response else {
@@ -708,7 +753,7 @@ mod tests {
         let fixture = Fixture::new(vec![3000]);
         let daemon = &fixture.daemon;
         let old = daemon.target().2;
-        let generation = daemon.retarget(Some("tntun_new".into()), None).unwrap();
+        let generation = daemon.retarget(Some("tntun_new".into()), None, None).unwrap();
         {
             let mut g = daemon.lock();
             g.persisted.ports.push(3000);
@@ -726,11 +771,11 @@ mod tests {
         let fixture = Fixture::new(vec![]);
         let (link, mut rx) = fixture.connect();
         let daemon = fixture.daemon.clone();
-        let request = tokio::spawn(async move { daemon.expose(vec![3000, 5173], None, None).await });
+        let request = tokio::spawn(async move { daemon.expose(vec![3000, 5173], None, None, None).await });
         let Some(ClientMsg::Expose { id, port: 3000 }) = rx.recv().await else {
             panic!("expected expose");
         };
-        fixture.daemon.retarget(Some("tntun_new".into()), None).unwrap();
+        fixture.daemon.retarget(Some("tntun_new".into()), None, None).unwrap();
         fixture.daemon.lock().persisted.ports.push(3000);
         reply(&link, id, ok, None);
         assert!(request.await.unwrap().is_err());
@@ -804,7 +849,7 @@ mod tests {
         let Some(ClientMsg::IceRequest { id }) = rx.recv().await else {
             panic!("expected ICE request");
         };
-        fixture.daemon.retarget(Some("tntun_new".into()), None).unwrap();
+        fixture.daemon.retarget(Some("tntun_new".into()), None, None).unwrap();
         reply(&link, id, true, Some(IceConfig { ice_servers: vec![], expires_at: ice::unix_now() + 60, ttl_s: 60 }));
         assert!(refresh.await.unwrap().is_err());
         assert!(fixture.daemon.current_ice().is_none());
@@ -849,7 +894,7 @@ mod tests {
         };
         // Re-expose the next stale port while reconciliation waits for the first reply.
         let daemon = fixture.daemon.clone();
-        let expose = tokio::spawn(async move { daemon.expose(vec![8080], None, None).await });
+        let expose = tokio::spawn(async move { daemon.expose(vec![8080], None, None, None).await });
         let Some(ClientMsg::Expose { id, port: 8080 }) = rx.recv().await else {
             panic!("expected re-expose");
         };
@@ -875,7 +920,7 @@ mod tests {
             _ = &mut removal => panic!("removal must wait for queue capacity"),
             _ = std::future::ready(()) => {}
         }
-        let expose = fixture.daemon.expose(vec![3000], None, None);
+        let expose = fixture.daemon.expose(vec![3000], None, None, None);
         tokio::pin!(expose);
         tokio::select! {
             biased;
@@ -911,7 +956,7 @@ mod tests {
             _ = &mut removal => panic!("removal must wait for queue capacity"),
             _ = std::future::ready(()) => {}
         }
-        fixture.daemon.retarget(Some("tntun_new".into()), None).unwrap();
+        fixture.daemon.retarget(Some("tntun_new".into()), None, None).unwrap();
         for _ in 0..16 {
             assert!(matches!(rx.recv().await, Some(ClientMsg::IceRequest { id: 0 })));
         }
@@ -933,7 +978,7 @@ mod tests {
         let Some(ClientMsg::Expose { id, port: 3000 }) = rx.recv().await else {
             panic!("expected expose");
         };
-        fixture.daemon.retarget(Some("tntun_new".into()), None).unwrap();
+        fixture.daemon.retarget(Some("tntun_new".into()), None, None).unwrap();
         fixture.daemon.lock().persisted.ports.push(3000);
         fixture.daemon.set_last_error("new generation error".into());
         reply(&link, id, false, None);
@@ -941,5 +986,43 @@ mod tests {
         assert_eq!(fixture.daemon.ports(), vec![3000]);
         assert_eq!(fixture.daemon.status().last_error.as_deref(), Some("new generation error"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn target_is_saved_with_the_tunnel_and_cleared_by_a_new_token() {
+        let h = Fixture::new(vec![]);
+        let token = h.daemon.target().1;
+        h.daemon.retarget(None, None, Some("10.20.0.2".into())).unwrap();
+        assert_eq!(h.daemon.status().target, Some("10.20.0.2".parse().unwrap()));
+        assert_eq!(h.daemon.status().target, Some("10.20.0.2".parse().unwrap()));
+        assert!(h.daemon.retarget(None, None, Some("sandbox.internal".into())).is_err());
+        assert_eq!(h.daemon.status().target, Some("10.20.0.2".parse().unwrap()), "a refused target changes nothing");
+        // The same token keeps it; a different token is a different tunnel.
+        h.daemon.retarget(Some(token), None, None).unwrap();
+        assert_eq!(h.daemon.status().target, Some("10.20.0.2".parse().unwrap()));
+        h.daemon.retarget(Some(format!("{}other", tunnel_protocol::TUNNEL_TOKEN_PREFIX)), None, None).unwrap();
+        assert_eq!(h.daemon.status().target, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_process_is_not_dumpable() {
+        harden_process();
+        // SAFETY: PR_GET_DUMPABLE only reads this process's flag.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+    }
+
+    #[test]
+    fn streams_from_a_previous_connection_cannot_dial() {
+        let f = Fixture::new(vec![3000]);
+        let generation = f.daemon.target().2;
+        f.daemon.retarget(None, None, Some("10.20.0.2".into())).unwrap();
+        assert_eq!(f.daemon.dial_target(3000, generation), Some(Some("10.20.0.2".parse().unwrap())));
+        assert_eq!(f.daemon.dial_target(3001, generation), None, "not exposed");
+        // Switching tunnels makes the old connection's streams stale.
+        f.daemon.retarget(Some(format!("{}other", tunnel_protocol::TUNNEL_TOKEN_PREFIX)), None, None).unwrap();
+        f.daemon.lock().persisted.ports.push(3000);
+        assert_eq!(f.daemon.dial_target(3000, generation), None, "stale generation");
+        assert_eq!(f.daemon.dial_target(3000, f.daemon.target().2), Some(None));
     }
 }

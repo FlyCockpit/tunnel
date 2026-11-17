@@ -14,7 +14,9 @@ use tokio::net::UnixStream;
 use tokio::time::Instant;
 use tunnel_protocol::{EXIT_REPLACED, EXIT_REVOKED, IceConfig, read_json_line, write_json_line};
 
-use crate::paths::{ENV_ICE_FILE, ENV_SERVER, ENV_TOKEN, Paths, env_nonempty, env_token, validate_tunnel_token};
+use crate::paths::{
+    ENV_ICE_FILE, ENV_SERVER, ENV_TARGET, ENV_TOKEN, Paths, env_nonempty, env_token, validate_tunnel_token,
+};
 use crate::state::{Persisted, resolve_server};
 
 const SPAWN_WAIT: Duration = Duration::from_secs(5);
@@ -30,6 +32,10 @@ pub enum Request {
         token: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server: Option<String>,
+        /// IP literal to dial for exposed ports instead of loopback; saved with
+        /// the tunnel (a different token starts again from loopback).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     Unexpose {
         port: u16,
@@ -94,7 +100,17 @@ pub struct Status {
     pub ports: Vec<PortStatus>,
     pub last_error: Option<String>,
     pub ice_file: Option<String>,
+    /// Address exposed ports are dialled on; `null`: loopback.
+    #[serde(default)]
+    pub target: Option<std::net::IpAddr>,
+    /// What the answering daemon supports (see [`DAEMON_FEATURES`]); empty
+    /// for a daemon that predates this list.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
+
+/// Reported in `Status.features`. `target`: honours `Expose.target`.
+pub const DAEMON_FEATURES: &[&str] = &["target"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortStatus {
@@ -116,6 +132,8 @@ impl Status {
             ports: Vec::new(),
             last_error: None,
             ice_file: None,
+            target: None,
+            features: Vec::new(),
         }
     }
 
@@ -136,6 +154,8 @@ impl Status {
                 .collect(),
             last_error: None,
             ice_file: None,
+            target: p.target,
+            features: Vec::new(),
         }
     }
 
@@ -158,6 +178,9 @@ impl Status {
         println!("state: {}", self.state.as_str());
         if let Some(id) = &self.tunnel_id {
             println!("tunnel: {}", crate::paths::terminal_text(id));
+        }
+        if let Some(target) = &self.target {
+            println!("target: {target}");
         }
         if self.ports.is_empty() {
             println!("ports: none");
@@ -205,6 +228,7 @@ pub async fn ensure_daemon(
     takeover: bool,
     token: Option<&str>,
     server: Option<&str>,
+    target: Option<&str>,
 ) -> anyhow::Result<Reach> {
     let env_token = daemon_token(token, env_token())?;
     if let Ok(stream) = UnixStream::connect(&paths.socket).await {
@@ -231,7 +255,7 @@ pub async fn ensure_daemon(
 
     // The daemon itself removes a stale socket, under its lock file, so a
     // concurrently starting daemon's fresh socket is never deleted here.
-    let mut child = spawn_daemon(paths, env_token.as_deref(), server.as_deref())?;
+    let mut child = spawn_daemon(paths, env_token.as_deref(), server.as_deref(), target)?;
     let deadline = Instant::now() + SPAWN_WAIT;
     loop {
         if let Ok(stream) = UnixStream::connect(&paths.socket).await {
@@ -272,15 +296,24 @@ fn set_daemon_token(cmd: &mut std::process::Command, token: Option<&str>) {
     }
 }
 
-fn spawn_daemon(paths: &Paths, token: Option<&str>, server: Option<&str>) -> anyhow::Result<Child> {
+fn spawn_daemon(
+    paths: &Paths,
+    token: Option<&str>,
+    server: Option<&str>,
+    target: Option<&str>,
+) -> anyhow::Result<Child> {
     let exe = std::env::current_exe().context("locating the tunnel executable")?;
     let log = open_log(paths)?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().context("duplicating log handle")?)
-        .stderr(log);
+    cmd.arg("daemon");
+    // An explicit state dir (flag or environment) must reach the daemon too.
+    if crate::paths::explicit_state_dir()?.is_some() {
+        cmd.arg("--state-dir").arg(&paths.dir);
+    }
+    if let Some(target) = target {
+        cmd.env(ENV_TARGET, target);
+    }
+    cmd.current_dir("/").stdin(Stdio::null()).stdout(log.try_clone().context("duplicating log handle")?).stderr(log);
     // TUNNEL_TOKEN / _SERVER reach the daemon through its environment,
     // never argv (argv is visible in `ps`): only a validated token is set here.
     // Only a relative ICE file path needs fixing up because the daemon runs from `/`.
@@ -319,8 +352,13 @@ fn open_log(paths: &Paths) -> anyhow::Result<File> {
 
 /// Send one request. `Ok(None)` means the daemon closed the connection
 /// without answering (it exited, e.g. on revocation).
-pub async fn call(stream: UnixStream, req: &Request, timeout: Duration) -> anyhow::Result<Option<Response>> {
-    let (rd, mut wr) = stream.into_split();
+pub async fn call(mut stream: UnixStream, req: &Request, timeout: Duration) -> anyhow::Result<Option<Response>> {
+    call_on(&mut stream, req, timeout).await
+}
+
+/// [`call`] on a connection that stays open for further requests.
+pub async fn call_on(stream: &mut UnixStream, req: &Request, timeout: Duration) -> anyhow::Result<Option<Response>> {
+    let (rd, mut wr) = stream.split();
     let mut rd = BufReader::new(rd);
     match write_json_line(&mut wr, req).await {
         Ok(()) => {}

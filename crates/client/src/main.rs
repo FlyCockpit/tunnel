@@ -23,6 +23,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "tunnel", version, about = "Expose sandbox ports through Tunnel")]
 struct Cli {
+    /// State directory (absolute): one daemon and one tunnel per directory.
+    /// Default `$TUNNEL_STATE_DIR`, else `$XDG_RUNTIME_DIR/tunnel`, else `/tmp/tunnel-<uid>`.
+    #[arg(long, global = true, value_name = "DIR")]
+    state_dir: Option<std::path::PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -33,6 +37,9 @@ enum Cmd {
     Expose {
         #[arg(required = true, num_args = 1.., value_parser = clap::value_parser!(u16).range(1..))]
         ports: Vec<u16>,
+        /// Dial the ports on this IP address instead of loopback (default $TUNNEL_TARGET_HOST; no hostnames).
+        #[arg(long, value_name = "IP")]
+        target: Option<String>,
     },
     /// Stop exposing a port.
     Unexpose {
@@ -88,6 +95,9 @@ enum Cmd {
         ttl: u64,
         #[arg(long)]
         label: Option<String>,
+        /// Dial the ports on this IP address instead of loopback (default $TUNNEL_TARGET_HOST; no hostnames).
+        #[arg(long, value_name = "IP")]
+        target: Option<String>,
     },
     /// Print a new access link for what this machine is sharing.
     Link {
@@ -100,7 +110,10 @@ enum Cmd {
         #[arg(long, default_value = "10m", value_parser = login::parse_duration)]
         ttl: u64,
     },
-    #[command(hide = true)]
+    /// Run the daemon in the foreground, e.g. under systemd. Token, server and
+    /// target come from TUNNEL_TOKEN, TUNNEL_SERVER and TUNNEL_TARGET_HOST (or the
+    /// state dir's saved tunnel); ports from `expose` over the state dir's socket.
+    /// Exits 3 when the tunnel is gone or its token rejected, 4 when replaced.
     Daemon,
 }
 
@@ -120,6 +133,13 @@ fn main() {
     init_tracing(is_daemon);
     // Fails only if a provider is already installed, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    if let Some(dir) = cli.state_dir
+        && let Err(e) = paths::set_state_dir(dir)
+    {
+        eprintln!("tunnel: {e:#}");
+        std::process::exit(2);
+    }
 
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -144,15 +164,15 @@ fn main() {
 
 async fn run(cmd: Cmd) -> anyhow::Result<i32> {
     match cmd {
-        Cmd::Expose { ports } => commands::expose(ports).await,
+        Cmd::Expose { ports, target } => commands::expose(ports, target).await,
         Cmd::Unexpose { port } => commands::unexpose(port).await,
         Cmd::Status { json } => commands::status(json).await,
         Cmd::Ice { format, fresh, exec: _, command } => commands::ice(format, fresh, command).await,
         Cmd::Stop => commands::stop().await,
         Cmd::Login { code } => share::login(code.as_deref()).await,
         Cmd::Logout => share::logout(),
-        Cmd::Share { ports, public, password, link, username, ttl, label } => {
-            share::share(ports, share::ShareAccess { public, password, link, username }, ttl, label).await
+        Cmd::Share { ports, public, password, link, username, ttl, label, target } => {
+            share::share(ports, share::ShareAccess { public, password, link, username }, ttl, label, target).await
         }
         Cmd::Link { port, reusable, ttl } => share::link(port, reusable, ttl).await,
         Cmd::Daemon => daemon::run().await.map(|()| 0),

@@ -140,7 +140,14 @@ fn hostname() -> String {
         .unwrap_or_else(|| "machine".to_string())
 }
 
-pub async fn share(ports: Vec<u16>, access: ShareAccess, ttl_s: u64, label: Option<String>) -> anyhow::Result<i32> {
+pub async fn share(
+    ports: Vec<u16>,
+    access: ShareAccess,
+    ttl_s: u64,
+    label: Option<String>,
+    target: Option<String>,
+) -> anyhow::Result<i32> {
+    let target = crate::commands::resolve_target(target)?;
     let login = Login::require()?;
     let api = Api::new(&login)?;
     let paths = Paths::resolve()?;
@@ -181,7 +188,7 @@ pub async fn share(ports: Vec<u16>, access: ShareAccess, ttl_s: u64, label: Opti
         }
     };
 
-    let req = Request::Expose { ports: ports.clone(), token, server: Some(login.server.clone()) };
+    let req = Request::Expose { ports: ports.clone(), token, server: Some(login.server.clone()), target };
     let mut status = match ask(req, true, false).await? {
         Answer::Response(Response::Status { status }) => status,
         Answer::Response(_) => bail!("unexpected daemon response"),

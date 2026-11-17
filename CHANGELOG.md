@@ -24,5 +24,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   others, each with its own live-tunnel quota; tunnel-token rotation; a
   `label` filter on the tunnel list; public previews limited to the admin
   unless `limits.allow_public_for_clients` is set.
+- Client: `TUNNEL_TARGET_HOST` / `--target` to forward exposed ports to an IP
+  address instead of loopback, `--state-dir` / `TUNNEL_STATE_DIR` with a
+  documented foreground `tunnel daemon` for supervisors, the forwarding target
+  in `status --json`, and a non-dumpable daemon on Linux.
 - GitHub Release binaries for Linux and macOS clients, static Linux servers,
   signed SHA-256 checksums, installer and third-party license notices.
