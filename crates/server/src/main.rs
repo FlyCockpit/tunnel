@@ -22,6 +22,7 @@ mod proxy;
 mod purge;
 mod ratelimit;
 mod registry;
+mod services;
 mod setup;
 mod sni;
 mod state;
@@ -78,6 +79,43 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClientCmd,
     },
+    /// API-only credentials for other services (e.g. a sandbox platform): they
+    /// create and delete their own tunnels and access links within a quota.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Create a service and print its token once (or write it to --token-file).
+    Add {
+        name: String,
+        /// Live tunnels it may own at once (1..=10000).
+        #[arg(long)]
+        max_tunnels: u32,
+        /// Write the token to this new file (mode 0600) instead of printing it.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// List services, when they were last used, and their open tunnels.
+    List,
+    /// Change a service's live-tunnel quota.
+    Set {
+        name: String,
+        #[arg(long)]
+        max_tunnels: u32,
+    },
+    /// Replace a service's token; the old one stops working at once.
+    Rotate {
+        name: String,
+        /// Write the token to this new file (mode 0600) instead of printing it.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// Remove a service: its token stops working and its tunnels close.
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -142,5 +180,16 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Client { cmd: ClientCmd::Add { name } } => commands::client_add(&config, &name).await,
         Cmd::Client { cmd: ClientCmd::List } => commands::client_list(&config).await,
         Cmd::Client { cmd: ClientCmd::Delete { name } } => commands::client_delete(&config, &name).await,
+        Cmd::Service { cmd: ServiceCmd::Add { name, max_tunnels, token_file } } => {
+            commands::service_add(&config, &name, max_tunnels, token_file.as_deref()).await
+        }
+        Cmd::Service { cmd: ServiceCmd::List } => commands::service_list(&config).await,
+        Cmd::Service { cmd: ServiceCmd::Set { name, max_tunnels } } => {
+            commands::service_set(&config, &name, max_tunnels).await
+        }
+        Cmd::Service { cmd: ServiceCmd::Rotate { name, token_file } } => {
+            commands::service_rotate(&config, &name, token_file.as_deref()).await
+        }
+        Cmd::Service { cmd: ServiceCmd::Delete { name } } => commands::service_delete(&config, &name).await,
     }
 }

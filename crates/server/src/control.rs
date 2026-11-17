@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use anyhow::Context;
+
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::upgrade::Upgraded;
@@ -53,7 +55,8 @@ pub async fn handle_connect(state: Arc<AppState>, req: Request<Incoming>) -> Res
     let Some(token) = bearer(&req).filter(|t| t.starts_with(TUNNEL_TOKEN_PREFIX)) else {
         return error(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid tunnel token");
     };
-    let tunnel = match state.db.find_tunnel_by_token_hash(tokens::hash_token(token)).await {
+    let token_hash = tokens::hash_token(token);
+    let tunnel = match state.db.find_tunnel_by_token_hash(token_hash.clone()).await {
         Ok(Some(t)) => t,
         Ok(None) => return error(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid tunnel token"),
         Err(e) => {
@@ -70,7 +73,7 @@ pub async fn handle_connect(state: Arc<AppState>, req: Request<Incoming>) -> Res
         let id = tunnel.id.clone();
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Err(e) = run_session(state, tunnel, upgraded).await {
+                if let Err(e) = run_session(state, tunnel, token_hash, upgraded).await {
                     tracing::info!(tunnel = %id, error = %format!("{e:#}"), "control session ended with error");
                 }
             }
@@ -114,7 +117,12 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
     json_response(status, &json!({ "error": { "code": code, "message": message } }))
 }
 
-async fn run_session(state: Arc<AppState>, tunnel: TunnelRow, upgraded: Upgraded) -> anyhow::Result<()> {
+async fn run_session(
+    state: Arc<AppState>,
+    tunnel: TunnelRow,
+    token_hash: String,
+    upgraded: Upgraded,
+) -> anyhow::Result<()> {
     let ws_config = WebSocketConfig::default().max_frame_size(Some(MAX_WS_FRAME)).max_message_size(Some(MAX_WS_FRAME));
     let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(ws_config)).await;
     let (duplex, mut bridge) = ws_bridge::bridge(ws, PING_INTERVAL);
@@ -152,7 +160,7 @@ async fn run_session(state: Arc<AppState>, tunnel: TunnelRow, upgraded: Upgraded
         })
     };
 
-    let result = control_loop(&state, &tunnel, control.clone(), ctrl_stream, cancel.clone()).await;
+    let result = control_loop(&state, &tunnel, token_hash, control.clone(), ctrl_stream, cancel.clone()).await;
 
     cancel.cancel();
     let mut control = control;
@@ -167,11 +175,48 @@ async fn run_session(state: Arc<AppState>, tunnel: TunnelRow, upgraded: Upgraded
     result
 }
 
+/// Hang up if the tunnel ended or its token was rotated (by the CLI, or
+/// while this connection was being set up).
+pub(crate) async fn recheck(state: &AppState, live: &LiveTunnel) {
+    match token_verdict(state, live).await {
+        Ok(Some(reason)) => live.close(reason),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(tunnel = %live.tunnel_id, error = %format!("{e:#}"), "tunnel recheck failed"),
+    }
+}
+
+/// Publish `live`, replacing an older connection, only while its token is
+/// current. Rotation holds the same lock, so a handshake that started with a
+/// rotated token cannot evict the host holding the new one. `Some`: not
+/// registered; the reason to send the client.
+pub(crate) async fn register(state: &AppState, live: &Arc<LiveTunnel>) -> anyhow::Result<Option<CloseReason>> {
+    let _guard = state.token_lock(&live.tunnel_id).lock().await;
+    if let Some(reason) = token_verdict(state, live).await.context("tunnel token check")? {
+        return Ok(Some(reason));
+    }
+    if let Some(old) = state.registry.insert(live.clone()) {
+        old.close(CloseReason::Replaced);
+    }
+    Ok(None)
+}
+
+/// Why `live` must close, if it must: the tunnel expired or was deleted, or
+/// its token was rotated after this connection authenticated.
+async fn token_verdict(state: &AppState, live: &LiveTunnel) -> anyhow::Result<Option<CloseReason>> {
+    Ok(match state.db.tunnel_token_state(live.tunnel_id.clone()).await? {
+        Some((_, expires_at)) if expires_at <= now() => Some(CloseReason::Expired),
+        Some((hash, _)) if !tokens::hashes_equal(&hash, &live.token_hash) => Some(CloseReason::Replaced),
+        Some(_) => None,
+        None => Some(CloseReason::Deleted),
+    })
+}
+
 /// Hello/Welcome, registration, then the message loop. Returns when the
 /// connection ends for any reason; the caller tears down the transport.
 async fn control_loop(
     state: &Arc<AppState>,
     tunnel: &TunnelRow,
+    token_hash: String,
     control: mux::Control,
     ctrl_stream: mux::Stream,
     cancel: CancellationToken,
@@ -224,6 +269,7 @@ async fn control_loop(
         connected_at: now(),
         streams: Default::default(),
         pool: Default::default(),
+        token_hash,
     });
 
     // Writer: the only task that writes to the control stream. A Close is the
@@ -288,19 +334,42 @@ async fn control_loop(
     };
     let _ = ctrl_tx.send(welcome).await;
 
-    if let Some(old) = state.registry.insert(live.clone()) {
-        old.close(CloseReason::Replaced);
+    if let Some(reason) = register(state, &live).await? {
+        // The writer cancels the session itself once the Close is written.
+        // Cancelling first could cut off the Welcome still being written ahead
+        // of it, and with it the Close (the client would see 401, not replaced).
+        let _ = ctrl_tx.send(ServerMsg::Close { reason }).await;
+        let _ = tokio::time::timeout(TEARDOWN_GRACE, cancel.cancelled()).await;
+        tracing::info!(tunnel = %tunnel.id, conn = live.conn_id, ?reason, "tunnel connection refused at registration");
+    } else {
+        tracing::info!(tunnel = %tunnel.id, conn = live.conn_id, ports = ?accepted_list, "tunnel connected");
+        serve(state, tunnel, &live, &ctrl_tx, &mut msg_rx, &cancel).await;
     }
-    tracing::info!(tunnel = %tunnel.id, conn = live.conn_id, ports = ?accepted_list, "tunnel connected");
 
-    // A DELETE that ran between authentication and insert would have found
-    // nothing to close; make sure this connection does not outlive the tunnel.
-    match state.db.get_tunnel(tunnel.id.clone()).await {
-        Ok(Some(row)) if !row.is_expired() => {}
-        Ok(Some(_)) => live.close(CloseReason::Expired),
-        Ok(None) => live.close(CloseReason::Deleted),
-        Err(e) => tracing::warn!(tunnel = %tunnel.id, error = %format!("{e:#}"), "tunnel recheck failed"),
+    state.registry.remove_if(&tunnel.id, live.conn_id);
+    cancel.cancel();
+    reader_task.abort();
+    let mut writer = writer;
+    if tokio::time::timeout(TEARDOWN_GRACE, &mut writer).await.is_err() {
+        writer.abort();
     }
+    tracing::info!(tunnel = %tunnel.id, conn = live.conn_id, "tunnel disconnected");
+    Ok(())
+}
+
+/// The registered connection's message loop, until it ends for any reason.
+async fn serve(
+    state: &Arc<AppState>,
+    tunnel: &TunnelRow,
+    live: &Arc<LiveTunnel>,
+    ctrl_tx: &mpsc::Sender<ServerMsg>,
+    msg_rx: &mut mpsc::Receiver<ClientMsg>,
+    cancel: &CancellationToken,
+) {
+    // A DELETE or token rotation that ran between authentication and insert
+    // would have found nothing to close; make sure this connection does not
+    // outlive the tunnel or its token.
+    recheck(state, live).await;
     touch(state, &tunnel.id).await;
 
     let mut ticker = tokio::time::interval(TICK);
@@ -314,16 +383,11 @@ async fn control_loop(
                 touch(state, &tunnel.id).await;
                 // Expiry deletion is the purge job's; here we only hang up.
                 // PATCH may have extended the TTL, so re-read the row.
-                match state.db.get_tunnel(tunnel.id.clone()).await {
-                    Ok(Some(row)) if row.is_expired() => live.close(CloseReason::Expired),
-                    Ok(None) => live.close(CloseReason::Deleted),
-                    Ok(Some(_)) => {}
-                    Err(e) => tracing::warn!(tunnel = %tunnel.id, error = %format!("{e:#}"), "tunnel recheck failed"),
-                }
+                recheck(state, live).await;
             }
             msg = msg_rx.recv() => {
                 let Some(msg) = msg else { break };
-                let reply = handle_msg(state, tunnel, &live, msg);
+                let reply = handle_msg(state, tunnel, live, msg);
                 if let Some(reply) = reply {
                     let sent = tokio::select! {
                         r = ctrl_tx.send(reply) => r.is_ok(),
@@ -336,16 +400,6 @@ async fn control_loop(
             }
         }
     }
-
-    state.registry.remove_if(&tunnel.id, live.conn_id);
-    cancel.cancel();
-    reader_task.abort();
-    let mut writer = writer;
-    if tokio::time::timeout(TEARDOWN_GRACE, &mut writer).await.is_err() {
-        writer.abort();
-    }
-    tracing::info!(tunnel = %tunnel.id, conn = live.conn_id, "tunnel disconnected");
-    Ok(())
 }
 
 fn handle_msg(state: &AppState, tunnel: &TunnelRow, live: &LiveTunnel, msg: ClientMsg) -> Option<ServerMsg> {
@@ -396,5 +450,117 @@ fn reply_err(id: u64, error: &str) -> ServerMsg {
 async fn touch(state: &AppState, tunnel_id: &str) {
     if let Err(e) = state.db.touch_last_seen(tunnel_id.to_string()).await {
         tracing::warn!(tunnel = %tunnel_id, error = %format!("{e:#}"), "touch_last_seen failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Access, HostHeaderMode, NewTunnel};
+    use tunnel_protocol::write_json_line;
+
+    fn test_state() -> Arc<AppState> {
+        let config: crate::config::Config = serde_json::from_value(json!({
+            "preview_zone": "previews.example.com", "api_host": "api.example.com",
+            "tunnel_host": "tunnel.example.com", "turn_host": "turn.example.com",
+            "admin_token_hash": "x", "acme": {"email": "test@example.com"},
+            "dns": {"provider": "cloudflare", "zone": "example.com"}
+        }))
+        .unwrap();
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).unwrap();
+        let certs = crate::tls::CertStore::new(std::env::temp_dir().join("tunnel-control-tests").join("certs"));
+        AppState::new(config, db, certs)
+    }
+
+    /// A rotated token's handshake gets `Welcome` then `Close { Replaced }`
+    /// over the real control stream, so the client exits as replaced (4),
+    /// and the host holding the current token stays registered.
+    #[tokio::test]
+    async fn stale_token_handshake_is_told_replaced_over_the_stream() {
+        let state = test_state();
+        let tunnel = state
+            .db
+            .create_tunnel(
+                NewTunnel {
+                    id: "abcdefghij".into(),
+                    token_hash: tokens::hash_token("tntun_new"),
+                    label: None,
+                    metadata: None,
+                    max_ports: 8,
+                    host_header: HostHeaderMode::Rewrite,
+                    inject_ice: false,
+                    expires_at: now() + 600,
+                    access: Access::default(),
+                    client_id: None,
+                },
+                20,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let mut server = mux::Session::new_server(server_io);
+        let mut client = mux::Session::new_client(client_io);
+        let mut client_control = client.control();
+        let client_driver = tokio::spawn(async move { while client.next().await.is_some() {} });
+        // Streams open lazily: the server sees this one once Hello is written.
+        let opened = tokio::spawn(async move {
+            let mut stream = client_control.open_stream().await.unwrap();
+            write_json_line(&mut stream, &ClientMsg::Hello { version: PROTOCOL_VERSION, ports: vec![3000] })
+                .await
+                .unwrap();
+            stream
+        });
+        let ctrl_stream = tokio::time::timeout(Duration::from_secs(5), server.next()).await.unwrap().unwrap();
+        let control = server.control();
+        let server_driver = tokio::spawn(async move { while server.next().await.is_some() {} });
+        let client_stream = opened.await.unwrap();
+
+        let current_conn = {
+            let (transport, _peer) = tokio::io::duplex(64);
+            let session = mux::Session::new_server(transport);
+            let (ctrl_tx, _rx) = mpsc::channel(1);
+            let current = Arc::new(LiveTunnel {
+                conn_id: 999,
+                tunnel_id: tunnel.id.clone(),
+                control: session.control(),
+                ports: Default::default(),
+                ctrl_tx,
+                cancel: CancellationToken::new(),
+                connected_at: now(),
+                streams: Default::default(),
+                pool: Default::default(),
+                token_hash: tokens::hash_token("tntun_new"),
+            });
+            assert_eq!(register(&state, &current).await.unwrap(), None);
+            (current, session)
+        };
+
+        let cancel = CancellationToken::new();
+        // Like the real client, read while the server runs.
+        let client_reader = tokio::spawn(async move {
+            let mut reader = BufReader::new(client_stream);
+            let mut buf = String::new();
+            let mut got = Vec::new();
+            while let Ok(Some(msg)) = read_json_line::<_, ServerMsg>(&mut reader, &mut buf).await {
+                let close = matches!(msg, ServerMsg::Close { .. });
+                got.push(msg);
+                if close {
+                    break;
+                }
+            }
+            got
+        });
+        let run = control_loop(&state, &tunnel, tokens::hash_token("tntun_old"), control, ctrl_stream, cancel);
+        tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), client_reader).await.unwrap().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(matches!(got[0], ServerMsg::Welcome { .. }), "{got:?}");
+        assert_eq!(got[1], ServerMsg::Close { reason: CloseReason::Replaced });
+        assert_eq!(state.registry.get(&tunnel.id).unwrap().conn_id, current_conn.0.conn_id);
+        assert!(!current_conn.0.cancel.is_cancelled());
+        client_driver.abort();
+        server_driver.abort();
     }
 }

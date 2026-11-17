@@ -579,6 +579,7 @@ mod tests {
                 connected_at: crate::tokens::now(),
                 streams: Default::default(),
                 pool: Default::default(),
+                token_hash: String::new(),
             }));
             state.tunnel(&tunnel.id).await.unwrap();
             let grant =

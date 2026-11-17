@@ -57,7 +57,7 @@ tunnel token:
 ```sh
 tunnel login                                             # paste the code from `tunnel-server client add <name>`
 tunnel share 3000 [5173 …]                               # link-only; prints a one-time link per port
-tunnel share 3000 --public                               # anyone with the URL
+tunnel share 3000 --public                               # anyone with the URL (if the server allows it)
 TUNNEL_SHARE_PASSWORD=… tunnel share 3000 --password [--username bob]
 tunnel share 3000 --link                                 # back to links only
 tunnel link [--port 3000] [--reusable] [--ttl 1h]

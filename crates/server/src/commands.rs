@@ -1,4 +1,5 @@
-//! Non-interactive subcommands: `serve`, `token rotate`, `status`, `backup`, `cert renew`.
+//! Non-interactive subcommands: `serve`, `token rotate`, `status`, `backup`,
+//! `cert renew`, `client …`, `service …`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -407,6 +408,159 @@ pub async fn client_delete(config_path: &Path, name: &str) -> anyhow::Result<()>
     }
 }
 
+/// Write a new service token to a new file (0600, never overwritten), synced
+/// before the token's hash is committed.
+fn write_token_file(path: &Path, token: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {} (it must not exist yet)", path.display()))?;
+    let written = f.write_all(format!("{token}\n").as_bytes()).and_then(|()| f.sync_all());
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(path);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Hand out a new service token: written to `token_file` first, then `commit`
+/// stores its hash; if that fails the file is removed again. Without a file the
+/// token is printed once after the commit.
+async fn issue_service_token<F>(
+    cfg: &Config,
+    name: &str,
+    token_file: Option<&Path>,
+    commit: impl FnOnce(String) -> F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let token = crate::services::new_token();
+    if let Some(path) = token_file {
+        write_token_file(path, &token)?;
+        if let Err(e) = commit(token).await {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        println!("Wrote the token for service {name} to {} (mode 0600).", path.display());
+    } else {
+        commit(token.clone()).await?;
+        println!("Token for service {name} (shown once):");
+        println!();
+        println!("  {token}");
+        println!();
+    }
+    println!("Use it as the bearer token for the management API:");
+    println!("  TUNNEL_API=https://{}", cfg.api_host);
+    println!("  TUNNEL_SERVER=wss://{}", cfg.tunnel_host);
+    Ok(())
+}
+
+fn service_error(name: &str, e: crate::services::Error) -> anyhow::Error {
+    match e {
+        crate::services::Error::Invalid(m) => anyhow::anyhow!(m),
+        crate::services::Error::Taken => {
+            anyhow::anyhow!("service {name} exists; `service rotate {name}` for a new token, or delete it first")
+        }
+        crate::services::Error::NotFound => anyhow::anyhow!("no service named {name}"),
+        crate::services::Error::Other(e) => e,
+    }
+}
+
+/// Config and database for a subcommand that writes the database; call
+/// `restore_ownership` after dropping the database.
+fn open_for_write(config_path: &Path, what: &str) -> anyhow::Result<(Config, Db)> {
+    ensure_can_write(config_path, what)?;
+    let cfg = Config::load(config_path)?;
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    Ok((cfg, db))
+}
+
+pub async fn service_add(
+    config_path: &Path,
+    name: &str,
+    max_tunnels: u32,
+    token_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    crate::services::validate_new(name, max_tunnels).map_err(|e| service_error(name, e))?;
+    let (cfg, db) = open_for_write(config_path, "service add")?;
+    let result = issue_service_token(&cfg, name, token_file, |token| {
+        let db = &db;
+        async move {
+            crate::services::add(db, name, max_tunnels, &token).await.map(drop).map_err(|e| service_error(name, e))
+        }
+    })
+    .await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    result?;
+    println!("Service {name} may own up to {max_tunnels} live tunnels.");
+    Ok(())
+}
+
+pub async fn service_rotate(config_path: &Path, name: &str, token_file: Option<&Path>) -> anyhow::Result<()> {
+    let (cfg, db) = open_for_write(config_path, "service rotate")?;
+    let result = issue_service_token(&cfg, name, token_file, |token| {
+        let db = &db;
+        async move { crate::services::rotate(db, name, &token).await.map_err(|e| service_error(name, e)) }
+    })
+    .await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    result?;
+    println!("The previous token of service {name} no longer works.");
+    Ok(())
+}
+
+pub async fn service_set(config_path: &Path, name: &str, max_tunnels: u32) -> anyhow::Result<()> {
+    let (cfg, db) = open_for_write(config_path, "service set")?;
+    let result = crate::services::set_quota(&db, name, max_tunnels).await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    result.map_err(|e| service_error(name, e))?;
+    println!("Service {name} may now own up to {max_tunnels} live tunnels.");
+    Ok(())
+}
+
+pub async fn service_list(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path)?;
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    let services = db.list_services(None, None).await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    let services = services?;
+    if services.is_empty() {
+        println!("No services. Add one with `tunnel-server service add <name> --max-tunnels <n>`.");
+        return Ok(());
+    }
+    println!("{:<24} {:<22} {:>7} {:>11}", "NAME", "LAST USED", "TUNNELS", "MAX TUNNELS");
+    for s in services {
+        let last = s.last_used_at.map(describe_ago).unwrap_or_else(|| "never".to_string());
+        println!("{:<24} {:<22} {:>7} {:>11}", s.name, last, s.tunnels, s.max_tunnels);
+    }
+    Ok(())
+}
+
+pub async fn service_delete(config_path: &Path, name: &str) -> anyhow::Result<()> {
+    let (cfg, db) = open_for_write(config_path, "service delete")?;
+    let result = db.delete_service(name.to_string()).await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    let tunnels = result?.ok_or_else(|| anyhow::anyhow!("no service named {name}"))?;
+    println!("Deleted service {name}; its token no longer works.");
+    if !tunnels.is_empty() {
+        // The running server's control sessions re-check their tunnel every minute.
+        println!("Its {} tunnel(s) stopped serving and close within a minute.", tunnels.len());
+    }
+    Ok(())
+}
+
 fn describe_ago(unix: i64) -> String {
     let s = (tokens::now() - unix).max(0);
     match s {
@@ -465,6 +619,59 @@ mod tests {
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("tunnel-{name}-{}-{}", std::process::id(), rand::random::<u64>()))
+    }
+
+    #[tokio::test]
+    async fn service_token_file_is_written_before_commit_and_removed_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("svc-token");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "preview_zone": "previews.example.com", "api_host": "api.example.com",
+            "tunnel_host": "tunnel.example.com", "turn_host": "turn.example.com",
+            "admin_token_hash": "x", "acme": {"email": "test@example.com"},
+            "dns": {"provider": "cloudflare", "zone": "example.com"}
+        }))
+        .unwrap();
+        let file = dir.join("svc");
+        let committed = std::sync::Mutex::new(None::<String>);
+        issue_service_token(&cfg, "wssp", Some(&file), |token| {
+            // The file is complete before the hash is committed.
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{token}\n"));
+            *committed.lock().unwrap() = Some(token);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        let token = committed.lock().unwrap().clone().unwrap();
+        assert!(token.starts_with(tunnel_protocol::SERVICE_TOKEN_PREFIX));
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // An existing file is never overwritten, and nothing is committed.
+        let mut called = false;
+        let existing = issue_service_token(&cfg, "wssp", Some(&file), |_| {
+            called = true;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(existing.is_err() && !called);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{token}\n"));
+
+        // An unwritable path fails before the commit (the old credential stays valid).
+        let mut called = false;
+        let missing = issue_service_token(&cfg, "wssp", Some(&dir.join("missing").join("svc")), |_| {
+            called = true;
+            async { Ok(()) }
+        })
+        .await;
+        assert!(missing.is_err() && !called);
+
+        // A failed commit removes the file again.
+        let other = dir.join("other");
+        let failed = issue_service_token(&cfg, "wssp", Some(&other), |_| async { anyhow::bail!("name taken") }).await;
+        assert!(failed.is_err());
+        assert!(!other.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

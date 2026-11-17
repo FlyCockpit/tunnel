@@ -98,7 +98,11 @@ pub struct AppState {
     visitor_lookups: tokio::sync::Semaphore,
     /// The built-in TURN relay, once started (WebRTC enabled).
     pub turn: std::sync::OnceLock<Arc<crate::turn_relay::Relay>>,
+    /// Serialize tunnel-token rotation with connection registration (sharded by tunnel id).
+    token_locks: Vec<tokio::sync::Mutex<()>>,
 }
+
+const TOKEN_LOCK_SHARDS: usize = 64;
 
 impl AppState {
     pub fn new(config: Config, db: Db, certs: Arc<CertStore>) -> Arc<Self> {
@@ -114,7 +118,16 @@ impl AppState {
             session_cache: Cache::new(SESSION_CACHE_TTL),
             visitor_lookups: tokio::sync::Semaphore::new(VISITOR_LOOKUPS),
             turn: std::sync::OnceLock::new(),
+            token_locks: (0..TOKEN_LOCK_SHARDS).map(|_| tokio::sync::Mutex::new(())).collect(),
         })
+    }
+
+    /// Held while a tunnel's token is rotated and while a connection checks
+    /// its token and registers, so neither can act on a superseded token.
+    pub fn token_lock(&self, tunnel_id: &str) -> &tokio::sync::Mutex<()> {
+        let h =
+            tunnel_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+        &self.token_locks[(h % TOKEN_LOCK_SHARDS as u64) as usize]
     }
 
     /// Attach the TURN lifecycle validator before publishing the relay.

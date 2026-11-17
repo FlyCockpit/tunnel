@@ -33,6 +33,9 @@ pub const TUNNEL_TOKEN_PREFIX: &str = "tntun_";
 pub const ACCESS_TOKEN_PREFIX: &str = "tnacc_";
 /// Long-lived per-machine API token (`tunnel login`).
 pub const CLIENT_TOKEN_PREFIX: &str = "tncli_";
+/// Service credential (e.g. a sandbox platform): creates and manages its own
+/// tunnels and access links under an admin-set quota; no client or service management.
+pub const SERVICE_TOKEN_PREFIX: &str = "tnsvc_";
 /// One-time enrollment code printed by `client add`; traded for a client token.
 pub const ENROLL_CODE_PREFIX: &str = "tnenr_";
 

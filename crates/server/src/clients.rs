@@ -36,11 +36,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("client name must be 1..={MAX_NAME_LEN} characters: letters, digits, '.', '_', '-'"))
-    }
+    if ok { Ok(()) } else { Err(format!("name must be 1..={MAX_NAME_LEN} characters: letters, digits, '.', '_', '-'")) }
 }
 
 /// Create client `name` and its one-time login command.

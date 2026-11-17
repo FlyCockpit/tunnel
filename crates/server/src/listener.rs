@@ -362,6 +362,7 @@ zone = "example.com"
             connected_at: crate::tokens::now(),
             streams: AtomicUsize::new(0),
             pool: crate::pool::OriginPool::default(),
+            token_hash: String::new(),
         }));
         (server, streams, requests)
     }

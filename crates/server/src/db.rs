@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS tunnels (
     access_mode  TEXT NOT NULL DEFAULT 'link',
     password_user TEXT,
     password_hash TEXT,
-    -- The client that created the tunnel; NULL for the admin token.
+    -- The owner: the client (`cl…`) or service (`sv…`) that created the
+    -- tunnel; NULL for the admin token.
     client_id    TEXT
 );
 CREATE INDEX IF NOT EXISTS tunnels_expires_at ON tunnels(expires_at);
@@ -91,6 +92,16 @@ CREATE TABLE IF NOT EXISTS clients (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     token_hash   TEXT UNIQUE,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER
+);
+-- Service credentials (`service add`): API-only callers such as a sandbox
+-- platform. They manage only their own tunnels, within `max_tunnels`.
+CREATE TABLE IF NOT EXISTS services (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    token_hash   TEXT NOT NULL UNIQUE,
+    max_tunnels  INTEGER NOT NULL,
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER
 );
@@ -181,7 +192,8 @@ pub struct TunnelRow {
     pub expires_at: i64,
     pub last_seen_at: Option<i64>,
     pub access: Access,
-    /// Creating client's id; `None` for tunnels created with the admin token.
+    /// Owner: the creating client's or service's id; `None` for tunnels
+    /// created with the admin token.
     pub client_id: Option<String>,
 }
 
@@ -202,11 +214,12 @@ pub struct NewTunnel {
     pub inject_ice: bool,
     pub expires_at: i64,
     pub access: Access,
+    /// Owner id (client or service); `None` for the admin token.
     pub client_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("client live-tunnel quota reached")]
+#[error("live-tunnel quota reached")]
 pub struct TunnelQuotaExceeded;
 
 #[derive(Debug, Clone, Default)]
@@ -219,11 +232,18 @@ pub struct TunnelPatch {
     pub access: Option<Access>,
     /// Resolve an omitted password from the row in the update transaction.
     pub keep_password_hash: bool,
+    /// Refuse a switch into public access (the row is checked in the update
+    /// transaction; a tunnel that is already public may stay public).
+    pub forbid_public: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("access.password is required for password mode")]
 pub struct PasswordRequired;
+
+#[derive(Debug, thiserror::Error)]
+#[error("public access is not allowed for this caller")]
+pub struct PublicNotAllowed;
 
 pub struct TunnelUpdate {
     pub row: TunnelRow,
@@ -240,6 +260,17 @@ pub struct NewAccessLink {
     pub label: Option<String>,
     pub session_ttl_s: i64,
     pub expires_at: i64,
+}
+
+/// A service credential.
+#[derive(Debug, Clone)]
+pub struct ServiceRow {
+    pub name: String,
+    pub max_tunnels: u32,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    /// Unexpired tunnels it created.
+    pub tunnels: i64,
 }
 
 /// An enrolled machine.
@@ -352,10 +383,12 @@ impl Db {
         .await
     }
 
-    /// `None` if `t.client_id` names a client that no longer exists (deleted
-    /// after the request authenticated). The client existence and live-tunnel
-    /// quota checks share the INSERT's write transaction, including across connections.
-    /// Admin-owned tunnels ignore `max_tunnels_per_client`.
+    /// `None` if `t.client_id` names an owner (client or service) that no
+    /// longer exists (deleted after the request authenticated). The owner
+    /// existence and live-tunnel quota checks share the INSERT's write
+    /// transaction, including across connections. Clients are limited by
+    /// `max_tunnels_per_client`, services by their own `max_tunnels`;
+    /// admin-owned tunnels are not limited.
     pub async fn create_tunnel(&self, t: NewTunnel, max_tunnels_per_client: u32) -> anyhow::Result<Option<TunnelRow>> {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -366,8 +399,9 @@ impl Db {
                                       access_mode, password_user, password_hash, client_id)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
                  WHERE ?13 IS NULL OR (
-                     EXISTS (SELECT 1 FROM clients WHERE id = ?13)
-                     AND (SELECT COUNT(*) FROM tunnels WHERE client_id = ?13 AND expires_at > ?8) < ?14
+                     (EXISTS (SELECT 1 FROM clients WHERE id = ?13) OR EXISTS (SELECT 1 FROM services WHERE id = ?13))
+                     AND (SELECT COUNT(*) FROM tunnels WHERE client_id = ?13 AND expires_at > ?8)
+                         < COALESCE((SELECT max_tunnels FROM services WHERE id = ?13), ?14)
                  )",
                 params![
                     t.id,
@@ -387,10 +421,12 @@ impl Db {
                 ],
             )?;
             if inserted == 0 {
-                let client_exists: bool = tx.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM clients WHERE id = ?1)", params![t.client_id], |r| r.get(0),
+                let owner_exists: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM clients WHERE id = ?1) OR EXISTS (SELECT 1 FROM services WHERE id = ?1)",
+                    params![t.client_id],
+                    |r| r.get(0),
                 )?;
-                if client_exists {
+                if owner_exists {
                     return Err(TunnelQuotaExceeded.into());
                 }
                 return Ok(None);
@@ -442,11 +478,13 @@ impl Db {
         .await
     }
 
-    /// Ascending id keyset page; client-owned pages use tunnels_client_id.
-    /// Fetch one extra row so the API can detect whether another page exists.
+    /// Ascending id keyset page; owner-scoped pages use tunnels_client_id.
+    /// `label` matches exactly. Fetch one extra row so the API can detect
+    /// whether another page exists.
     pub async fn list_tunnels_page(
         &self,
         client_id: Option<String>,
+        label: Option<String>,
         cursor: Option<String>,
         limit: u32,
     ) -> anyhow::Result<Vec<TunnelRow>> {
@@ -457,6 +495,10 @@ impl Db {
             if let Some(id) = client_id {
                 values.push(Value::Text(id));
                 predicates.push(format!("client_id = ?{}", values.len()));
+            }
+            if let Some(label) = label {
+                values.push(Value::Text(label));
+                predicates.push(format!("label = ?{}", values.len()));
             }
             if let Some(cursor) = cursor {
                 values.push(Value::Text(cursor));
@@ -496,6 +538,10 @@ impl Db {
                 tx.execute("UPDATE tunnels SET inject_ice = ?2 WHERE id = ?1", params![id, v])?;
             }
             if let Some(mut access) = patch.access {
+                if patch.forbid_public && access.mode == AccessMode::Public && current.access.mode != AccessMode::Public
+                {
+                    return Err(PublicNotAllowed.into());
+                }
                 if patch.keep_password_hash && access.mode == AccessMode::Password {
                     access.password_hash = Some(current.access.password_hash.clone().ok_or(PasswordRequired)?);
                 }
@@ -873,21 +919,153 @@ impl Db {
     /// expiry sweep does. `None` if there is no such client.
     pub async fn delete_client(&self, name: String) -> anyhow::Result<Option<Vec<String>>> {
         self.call(move |c| {
-            let t = now();
             let tx = c.transaction()?;
             let id: Option<String> =
                 tx.query_row("SELECT id FROM clients WHERE name = ?1", params![name], |r| r.get(0)).optional()?;
             let Some(id) = id else {
                 return Ok(None);
             };
-            let tunnels: Vec<String> = {
-                let mut stmt = tx.prepare("SELECT id FROM tunnels WHERE client_id = ?1")?;
-                stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
-            };
-            tx.execute("UPDATE tunnels SET expires_at = MIN(expires_at, ?2) WHERE client_id = ?1", params![id, t - 1])?;
+            let tunnels = expire_owner_tunnels(&tx, &id)?;
             tx.execute("DELETE FROM clients WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(Some(tunnels))
+        })
+        .await
+    }
+
+    // --------------------------------------------------------------- services
+
+    /// New service `name` holding `token_hash`. `None` if the name is taken.
+    pub async fn create_service(
+        &self,
+        id: String,
+        name: String,
+        token_hash: String,
+        max_tunnels: u32,
+    ) -> anyhow::Result<Option<ServiceRow>> {
+        self.call(move |c| {
+            let t = now();
+            let inserted = c.execute(
+                "INSERT INTO services (id, name, token_hash, max_tunnels, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(name) DO NOTHING",
+                params![id, name, token_hash, max_tunnels, t],
+            )?;
+            Ok((inserted == 1).then_some(ServiceRow {
+                name,
+                max_tunnels,
+                created_at: t,
+                last_used_at: None,
+                tunnels: 0,
+            }))
+        })
+        .await
+    }
+
+    /// The service holding `token_hash`, recording use at most once a minute.
+    pub async fn service_by_token_hash(&self, token_hash: String) -> anyhow::Result<Option<(String, String)>> {
+        self.call(move |c| {
+            let t = now();
+            let found: Option<(String, String)> = c
+                .query_row("SELECT id, name FROM services WHERE token_hash = ?1", params![token_hash], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            if let Some((id, _)) = &found {
+                c.execute(
+                    "UPDATE services SET last_used_at = ?2 WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?2 - 60)",
+                    params![id, t],
+                )?;
+            }
+            Ok(found)
+        })
+        .await
+    }
+
+    /// Ascending name keyset page (all services when `limit` is `None`).
+    pub async fn list_services(&self, cursor: Option<String>, limit: Option<u32>) -> anyhow::Result<Vec<ServiceRow>> {
+        self.call(move |c| {
+            let mut values = vec![Value::Integer(now())];
+            let mut sql = "SELECT s.name, s.max_tunnels, s.created_at, s.last_used_at,
+                        (SELECT COUNT(*) FROM tunnels t WHERE t.client_id = s.id AND t.expires_at > ?1)
+                 FROM services s"
+                .to_string();
+            if let Some(cursor) = cursor {
+                values.push(Value::Text(cursor));
+                sql.push_str(&format!(" WHERE s.name > ?{}", values.len()));
+            }
+            sql.push_str(" ORDER BY s.name");
+            if let Some(limit) = limit {
+                values.push(Value::Integer(i64::from(limit) + 1));
+                sql.push_str(&format!(" LIMIT ?{}", values.len()));
+            }
+            let mut stmt = c.prepare(&sql)?;
+            Ok(stmt
+                .query_map(params_from_iter(values), |r| {
+                    Ok(ServiceRow {
+                        name: r.get(0)?,
+                        max_tunnels: r.get(1)?,
+                        created_at: r.get(2)?,
+                        last_used_at: r.get(3)?,
+                        tunnels: r.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// Set a service's live-tunnel quota. Tunnels above a lowered quota keep
+    /// running; new ones are refused until the count drops below it.
+    pub async fn set_service_quota(&self, name: String, max_tunnels: u32) -> anyhow::Result<bool> {
+        self.call(move |c| {
+            Ok(c.execute("UPDATE services SET max_tunnels = ?2 WHERE name = ?1", params![name, max_tunnels])? == 1)
+        })
+        .await
+    }
+
+    /// Replace a service's token; the old one stops working at once.
+    pub async fn rotate_service_token(&self, name: String, token_hash: String) -> anyhow::Result<bool> {
+        self.call(move |c| {
+            Ok(c.execute("UPDATE services SET token_hash = ?2 WHERE name = ?1", params![name, token_hash])? == 1)
+        })
+        .await
+    }
+
+    /// Delete service `name` and expire its tunnels (see [`Db::delete_client`]).
+    pub async fn delete_service(&self, name: String) -> anyhow::Result<Option<Vec<String>>> {
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let id: Option<String> =
+                tx.query_row("SELECT id FROM services WHERE name = ?1", params![name], |r| r.get(0)).optional()?;
+            let Some(id) = id else {
+                return Ok(None);
+            };
+            let tunnels = expire_owner_tunnels(&tx, &id)?;
+            tx.execute("DELETE FROM services WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(Some(tunnels))
+        })
+        .await
+    }
+
+    /// Current token hash and expiry of tunnel `id`; `None` once it is deleted.
+    pub async fn tunnel_token_state(&self, id: String) -> anyhow::Result<Option<(String, i64)>> {
+        self.call(move |c| {
+            Ok(c.query_row("SELECT token_hash, expires_at FROM tunnels WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+        })
+        .await
+    }
+
+    /// Replace an unexpired tunnel's token. `false` if the tunnel is missing or expired.
+    pub async fn rotate_tunnel_token(&self, id: String, token_hash: String) -> anyhow::Result<bool> {
+        self.call(move |c| {
+            Ok(c.execute(
+                "UPDATE tunnels SET token_hash = ?2 WHERE id = ?1 AND expires_at > ?3",
+                params![id, token_hash, now()],
+            )? == 1)
         })
         .await
     }
@@ -1059,6 +1237,20 @@ fn revoke_login_grants(tx: &rusqlite::Transaction<'_>, tunnel_id: &str) -> anyho
     tx.execute("DELETE FROM gate_grant_logins WHERE tunnel_id = ?1", params![tunnel_id])?;
     tx.execute("DELETE FROM gate_sessions WHERE id_hash NOT IN (SELECT session_hash FROM gate_grants)", [])?;
     Ok(())
+}
+
+/// Expire every tunnel owned by `owner_id` so it stops serving at once;
+/// returns their ids.
+fn expire_owner_tunnels(tx: &rusqlite::Transaction<'_>, owner_id: &str) -> anyhow::Result<Vec<String>> {
+    let tunnels: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT id FROM tunnels WHERE client_id = ?1")?;
+        stmt.query_map(params![owner_id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.execute(
+        "UPDATE tunnels SET expires_at = MIN(expires_at, ?2) WHERE client_id = ?1",
+        params![owner_id, now() - 1],
+    )?;
+    Ok(tunnels)
 }
 
 fn tunnel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
@@ -1399,7 +1591,7 @@ mod tests {
         };
         db.create_tunnel(mk("own1aaaaaa", Some("c1")), 20).await.unwrap();
         db.create_tunnel(mk("adm1aaaaaa", None), 20).await.unwrap();
-        assert_eq!(db.list_tunnels_page(Some("c1".into()), None, 500).await.unwrap().len(), 1);
+        assert_eq!(db.list_tunnels_page(Some("c1".into()), None, None, 500).await.unwrap().len(), 1);
         let listed = db.list_clients().await.unwrap();
         let laptop = listed.iter().find(|c| c.name == "laptop").unwrap();
         assert!(laptop.enrolled && laptop.tunnels == 1);
@@ -1508,6 +1700,104 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn service_quota_counts_live_tunnels_and_delete_expires_them() {
+        let (db, path) = temp_db();
+        db.create_service("sv1".into(), "wssp".into(), "svc-hash".into(), 2).await.unwrap().unwrap();
+        assert!(db.create_service("sv2".into(), "wssp".into(), "other".into(), 2).await.unwrap().is_none());
+        assert_eq!(db.service_by_token_hash("svc-hash".into()).await.unwrap(), Some(("sv1".into(), "wssp".into())));
+        // The client default (1 here) does not apply to services.
+        db.create_tunnel(new_tunnel("aaaaaaaaaa", Some("sv1"), now() + 600), 1).await.unwrap().unwrap();
+        db.create_tunnel(new_tunnel("bbbbbbbbbb", Some("sv1"), now() - 1), 1).await.unwrap().unwrap();
+        db.create_tunnel(new_tunnel("cccccccccc", Some("sv1"), now() + 600), 1).await.unwrap().unwrap();
+        let over = db.create_tunnel(new_tunnel("dddddddddd", Some("sv1"), now() + 600), 1).await;
+        assert!(over.unwrap_err().is::<TunnelQuotaExceeded>());
+        assert!(db.set_service_quota("wssp".into(), 3).await.unwrap());
+        db.create_tunnel(new_tunnel("dddddddddd", Some("sv1"), now() + 600), 1).await.unwrap().unwrap();
+        let listed = db.list_services(None, None).await.unwrap();
+        assert_eq!((listed[0].max_tunnels, listed[0].tunnels), (3, 3));
+
+        let mut ended = db.delete_service("wssp".into()).await.unwrap().unwrap();
+        ended.sort();
+        assert_eq!(ended, ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"]);
+        assert!(db.get_tunnel("aaaaaaaaaa".into()).await.unwrap().unwrap().is_expired());
+        assert!(db.service_by_token_hash("svc-hash".into()).await.unwrap().is_none());
+        assert!(db.create_tunnel(new_tunnel("eeeeeeeeee", Some("sv1"), now() + 600), 1).await.unwrap().is_none());
+        assert!(db.delete_service("wssp".into()).await.unwrap().is_none());
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_public_switch_is_checked_in_the_update_transaction() {
+        let (db, path) = temp_db();
+        db.create_tunnel(new_tunnel("aaaaaaaaaa", None, now() + 600), 1).await.unwrap().unwrap();
+        let public = Access { mode: AccessMode::Public, password_user: None, password_hash: None };
+        let patch = |access: Access| TunnelPatch {
+            label: Some("changed".into()),
+            access: Some(access),
+            forbid_public: true,
+            ..TunnelPatch::default()
+        };
+        let refused = db.update_tunnel("aaaaaaaaaa".into(), patch(public.clone())).await;
+        assert!(refused.err().unwrap().is::<PublicNotAllowed>());
+        let row = db.get_tunnel("aaaaaaaaaa".into()).await.unwrap().unwrap();
+        assert_eq!((row.access.mode, row.label), (AccessMode::Link, None), "nothing of a refused patch is applied");
+        // Already public (e.g. switched by the admin meanwhile): stays editable.
+        let admin = TunnelPatch { access: Some(public.clone()), ..TunnelPatch::default() };
+        db.update_tunnel("aaaaaaaaaa".into(), admin).await.unwrap().unwrap();
+        let kept = db.update_tunnel("aaaaaaaaaa".into(), patch(public)).await.unwrap().unwrap();
+        assert_eq!(kept.row.access.mode, AccessMode::Public);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn existing_schema_gains_services_table_and_keeps_data() {
+        let (db, path) = temp_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            // A database written before service credentials existed.
+            conn.execute_batch("DROP TABLE services").unwrap();
+            conn.execute("INSERT INTO clients (id, name, token_hash, created_at) VALUES ('c1', 'laptop', 'h', 1)", [])
+                .unwrap();
+        }
+        drop(db);
+        let reopened = Db::open(&path).unwrap();
+        {
+            let conn = reopened.conn.lock().unwrap();
+            let services: i64 = conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0)).unwrap();
+            assert_eq!(services, 0);
+            let name: String =
+                conn.query_row("SELECT name FROM clients WHERE token_hash = 'h'", [], |r| r.get(0)).unwrap();
+            assert_eq!(name, "laptop");
+        }
+        drop(reopened);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_token_rotates_only_while_unexpired() {
+        let (db, path) = temp_db();
+        db.create_tunnel(new_tunnel("aaaaaaaaaa", None, now() + 600), 1).await.unwrap().unwrap();
+        db.create_tunnel(new_tunnel("bbbbbbbbbb", None, now() - 1), 1).await.unwrap().unwrap();
+        assert!(db.rotate_tunnel_token("aaaaaaaaaa".into(), "new-hash".into()).await.unwrap());
+        assert_eq!(db.tunnel_token_state("aaaaaaaaaa".into()).await.unwrap().unwrap().0, "new-hash");
+        assert!(db.find_tunnel_by_token_hash("hash-aaaaaaaaaa".into()).await.unwrap().is_none());
+        assert!(!db.rotate_tunnel_token("bbbbbbbbbb".into(), "x".into()).await.unwrap());
+        assert!(!db.rotate_tunnel_token("zzzzzzzzzz".into(), "y".into()).await.unwrap());
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     fn new_tunnel(id: &str, client_id: Option<&str>, expires_at: i64) -> NewTunnel {
         NewTunnel {
             id: id.into(),
@@ -1565,7 +1855,7 @@ mod tests {
             }
         }
         assert_eq!(inserted, 3);
-        assert_eq!(db.list_tunnels_page(Some("client".into()), None, 500).await.unwrap().len(), 3);
+        assert_eq!(db.list_tunnels_page(Some("client".into()), None, None, 500).await.unwrap().len(), 3);
         drop(other);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {

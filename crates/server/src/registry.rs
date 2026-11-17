@@ -26,6 +26,9 @@ pub struct LiveTunnel {
     pub streams: AtomicUsize,
     /// Idle origin connections for reuse.
     pub pool: crate::pool::OriginPool,
+    /// Hash of the tunnel token this connection authenticated with; a
+    /// rotation closes connections holding an older one.
+    pub token_hash: String,
 }
 
 impl LiveTunnel {

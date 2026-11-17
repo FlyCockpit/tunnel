@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request as AxumRequest, State};
 use axum::response::{IntoResponse, Response as AxumResponse};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use http::request::Parts;
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 use tunnel_protocol::{
     ACCESS_TOKEN_PREFIX, ADMIN_TOKEN_PREFIX, CLIENT_TOKEN_PREFIX, CloseReason, ENROLL_CODE_PREFIX, IceServer,
-    TUNNEL_TOKEN_PREFIX,
+    SERVICE_TOKEN_PREFIX, TUNNEL_TOKEN_PREFIX,
 };
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
@@ -28,10 +28,11 @@ use utoipa::{Modify, OpenApi, ToSchema};
 use crate::clients;
 use crate::db::{
     Access, AccessMode, ClientRow, DeleteOutcome, HostHeaderMode, NewAccessLink, NewTunnel, PasswordRequired,
-    TunnelPatch, TunnelQuotaExceeded, TunnelRow,
+    PublicNotAllowed, ServiceRow, TunnelPatch, TunnelQuotaExceeded, TunnelRow,
 };
 use crate::ice;
 use crate::password;
+use crate::services;
 use crate::state::AppState;
 use crate::tokens::{self, now};
 use crate::util::{Body, full, json_response};
@@ -73,12 +74,16 @@ fn build_router() -> Router<Arc<AppState>> {
         .route("/v1/openapi.json", get(openapi_json))
         .route("/v1/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/v1/tunnels/{id}", get(get_tunnel).patch(patch_tunnel).delete(delete_tunnel))
+        .route("/v1/tunnels/{id}/token", post(rotate_tunnel_token))
         .route("/v1/tunnels/{id}/access-links", post(create_access_link))
-        .route("/v1/access-links/{id}", delete(delete_access_link))
+        .route("/v1/access-links/{id}", axum::routing::delete(delete_access_link))
         .route("/v1/tunnels/{id}/turn-credentials", post(turn_credentials))
         .route("/v1/clients", post(create_client).get(list_clients))
         .route("/v1/clients/enroll", post(enroll_client))
-        .route("/v1/clients/{name}", delete(delete_client))
+        .route("/v1/clients/{name}", axum::routing::delete(delete_client))
+        .route("/v1/services", post(create_service).get(list_services))
+        .route("/v1/services/{name}", axum::routing::patch(patch_service).delete(delete_service))
+        .route("/v1/services/{name}/token", post(rotate_service_token))
         .fallback(fallback)
 }
 
@@ -155,27 +160,50 @@ type ApiResult<T> = Result<T, ApiError>;
 /// Proof that the request carried the admin token.
 pub struct Admin;
 
-/// Who is calling a tunnel endpoint: the admin token (every tunnel) or an
-/// enrolled client's token (only tunnels that client created).
+/// Who is calling a tunnel endpoint: the admin token (every tunnel), an
+/// enrolled client's token or a service token (only tunnels that owner created).
 #[derive(Debug, Clone)]
 pub enum Caller {
     Admin,
     Client { id: String, name: String },
+    Service { id: String, name: String },
 }
 
 impl Caller {
-    fn client_id(&self) -> Option<&str> {
+    /// Owner id recorded on tunnels this caller creates; `None` for the admin.
+    fn owner_id(&self) -> Option<&str> {
         match self {
             Self::Admin => None,
-            Self::Client { id, .. } => Some(id),
+            Self::Client { id, .. } | Self::Service { id, .. } => Some(id),
         }
     }
 
     fn may_use(&self, row: &TunnelRow) -> bool {
-        match self {
-            Self::Admin => true,
-            Self::Client { id, .. } => row.client_id.as_deref() == Some(id.as_str()),
+        match self.owner_id() {
+            None => true,
+            Some(id) => row.client_id.as_deref() == Some(id),
         }
+    }
+
+    /// For logs: a client and a service may share a name.
+    fn describe(&self) -> String {
+        match self {
+            Self::Admin => "admin".to_string(),
+            Self::Client { name, .. } => format!("client:{name}"),
+            Self::Service { name, .. } => format!("service:{name}"),
+        }
+    }
+
+    /// Public previews need the admin token unless the server allows them for everyone.
+    fn check_public(&self, mode: AccessMode, limits: &crate::config::Limits) -> ApiResult<()> {
+        if mode == AccessMode::Public && self.owner_id().is_some() && !limits.allow_public_for_clients {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "public_not_allowed",
+                "this server allows public previews only for the admin; use access links or password mode",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -205,6 +233,12 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             && let Some((id, name)) = state.db.client_by_token_hash(tokens::hash_token(token)).await?
         {
             return Ok(Self::Client { id, name });
+        }
+        if token.starts_with(SERVICE_TOKEN_PREFIX)
+            && token.len() <= 256
+            && let Some((id, name)) = state.db.service_by_token_hash(tokens::hash_token(token)).await?
+        {
+            return Ok(Self::Service { id, name });
         }
         Err(ApiError::unauthorized())
     }
@@ -431,6 +465,7 @@ pub struct TurnCredentialsResponse {
         get_tunnel,
         patch_tunnel,
         delete_tunnel,
+        rotate_tunnel_token,
         create_access_link,
         delete_access_link,
         turn_credentials,
@@ -438,6 +473,11 @@ pub struct TurnCredentialsResponse {
         list_clients,
         delete_client,
         enroll_client,
+        create_service,
+        list_services,
+        patch_service,
+        rotate_service_token,
+        delete_service,
     ),
     components(schemas(
         Health,
@@ -463,6 +503,12 @@ pub struct TurnCredentialsResponse {
         TurnCredentialsRequest,
         TurnCredentialsResponse,
         HostHeaderMode,
+        TunnelTokenResponse,
+        CreateServiceRequest,
+        ServiceTokenResponse,
+        ServiceView,
+        ServiceList,
+        PatchServiceRequest,
     )),
     modifiers(&BearerAuth),
     security(("admin" = []))
@@ -564,7 +610,8 @@ async fn fallback() -> ApiError {
     responses(
         (status = 201, description = "Tunnel created", body = CreateTunnelResponse),
         (status = 401, body = ErrorBody),
-        (status = 429, description = "Client live-tunnel quota reached; admin tokens are unlimited", body = ErrorBody),
+        (status = 403, description = "Public access requested by a client or service while `allow_public_for_clients` is off", body = ErrorBody),
+        (status = 429, description = "Live-tunnel quota reached (clients: `max_tunnels_per_client`; services: their own `max_tunnels`); admin tokens are unlimited", body = ErrorBody),
         (status = 422, body = ErrorBody),
     )
 )]
@@ -586,6 +633,9 @@ async fn create_tunnel(
         return Err(ApiError::validation(format!("metadata must be at most {MAX_METADATA_BYTES} bytes")));
     }
 
+    if let Some(a) = &req.access {
+        caller.check_public(a.mode, limits)?;
+    }
     let access = match req.access {
         Some(a) => build_access(a, None).await?,
         None => Access::default(),
@@ -607,14 +657,14 @@ async fn create_tunnel(
                 inject_ice: req.inject_ice.unwrap_or(true),
                 expires_at: now() + req.ttl_s as i64,
                 access,
-                client_id: caller.client_id().map(str::to_string),
+                client_id: caller.owner_id().map(str::to_string),
             },
             limits.max_tunnels_per_client,
         )
         .await
         .map_err(|e| {
             if e.is::<TunnelQuotaExceeded>() {
-                ApiError::new(StatusCode::TOO_MANY_REQUESTS, "tunnel_quota", "client live-tunnel quota reached")
+                ApiError::new(StatusCode::TOO_MANY_REQUESTS, "tunnel_quota", "live-tunnel quota reached")
             } else {
                 ApiError::internal(e)
             }
@@ -623,10 +673,7 @@ async fn create_tunnel(
         .ok_or_else(ApiError::unauthorized)?;
     // A cached negative lookup for this id (e.g. a probe) must not hide the new tunnel.
     state.invalidate_tunnel(&row.id);
-    let by = match &caller {
-        Caller::Admin => "admin",
-        Caller::Client { name, .. } => name.as_str(),
-    };
+    let by = caller.describe();
     tracing::info!(tunnel = %row.id, by, max_ports, access = mode.as_str(), expires_at = row.expires_at, "tunnel created");
 
     Ok((
@@ -640,15 +687,28 @@ async fn create_tunnel(
     ))
 }
 
-/// Bounded keyset pagination. Cursors are the last tunnel id or client name.
+/// Bounded keyset pagination. Cursors are the last tunnel id, or client or service name.
 #[derive(Debug, Default, Deserialize)]
 struct Pagination {
     limit: Option<u32>,
     cursor: Option<String>,
 }
 
+/// `GET /v1/tunnels` query: pagination plus an exact label filter.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunnelQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+    label: Option<String>,
+}
+
 fn pagination(query: Result<Query<Pagination>, QueryRejection>, clients: bool) -> ApiResult<(u32, Option<String>)> {
     let Query(query) = query.map_err(|e| ApiError::validation(e.body_text()))?;
+    page_bounds(query, clients)
+}
+
+fn page_bounds(query: Pagination, clients: bool) -> ApiResult<(u32, Option<String>)> {
     let limit = query.limit.unwrap_or(100);
     if !(1..=500).contains(&limit) {
         return Err(ApiError::validation("limit must be within 1..=500"));
@@ -669,16 +729,20 @@ fn pagination(query: Result<Query<Pagination>, QueryRejection>, clients: bool) -
     params(
         ("limit" = Option<u32>, Query, description = "Page size (default 100)", minimum = 1, maximum = 500),
         ("cursor" = Option<String>, Query, description = "Opaque next_cursor returned by the previous page"),
+        ("label" = Option<String>, Query, description = "Only tunnels whose label is exactly this value"),
     ),
     responses((status = 200, body = TunnelList), (status = 401, body = ErrorBody), (status = 422, body = ErrorBody))
 )]
 async fn list_tunnels(
     State(state): State<Arc<AppState>>,
     caller: Caller,
-    query: Result<Query<Pagination>, QueryRejection>,
+    query: Result<Query<TunnelQuery>, QueryRejection>,
 ) -> ApiResult<Json<TunnelList>> {
-    let (limit, cursor) = pagination(query, false)?;
-    let mut rows = state.db.list_tunnels_page(caller.client_id().map(str::to_string), cursor, limit).await?;
+    let Query(query) = query.map_err(|e| ApiError::validation(e.body_text()))?;
+    validate_label(query.label.as_deref())?;
+    let (limit, cursor) = page_bounds(Pagination { limit: query.limit, cursor: query.cursor }, false)?;
+    let mut rows =
+        state.db.list_tunnels_page(caller.owner_id().map(str::to_string), query.label, cursor, limit).await?;
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next_cursor = if has_more { rows.last().map(|row| row.id.clone()) } else { None };
@@ -709,6 +773,7 @@ async fn get_tunnel(
     responses(
         (status = 200, body = TunnelView),
         (status = 401, body = ErrorBody),
+        (status = 403, description = "Switch to public access by a client or service while `allow_public_for_clients` is off", body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 409, body = ErrorBody),
         (status = 422, body = ErrorBody),
@@ -740,9 +805,18 @@ async fn patch_tunnel(
         inject_ice: req.inject_ice,
         access,
         keep_password_hash,
+        // Only a switch into public is refused (checked against the row in the
+        // update transaction), so a tunnel that is already public stays editable.
+        forbid_public: caller.check_public(AccessMode::Public, &state.config.limits).is_err(),
     };
     let updated = state.db.update_tunnel(id.clone(), patch).await.map_err(|e| {
-        if e.is::<PasswordRequired>() { ApiError::validation(e.to_string()) } else { ApiError::internal(e) }
+        if e.is::<PasswordRequired>() {
+            ApiError::validation(e.to_string())
+        } else if e.is::<PublicNotAllowed>() {
+            caller.check_public(AccessMode::Public, &state.config.limits).unwrap_err()
+        } else {
+            ApiError::internal(e)
+        }
     })?;
     let updated = updated.ok_or_else(|| ApiError::not_found("tunnel"))?;
     let row = updated.row;
@@ -776,8 +850,8 @@ async fn delete_tunnel(
     if !tokens::is_valid_tunnel_id(&id) {
         return Err(ApiError::not_found("tunnel"));
     }
-    if matches!(caller, Caller::Client { .. }) {
-        // Clients may delete only their own live rows (tombstones have no owner).
+    if caller.owner_id().is_some() {
+        // Clients and services may delete only their own live rows (tombstones have no owner).
         find_tunnel(&state, &caller, &id).await?;
     }
     match state.delete_tunnel(&id, CloseReason::Deleted).await? {
@@ -788,6 +862,65 @@ async fn delete_tunnel(
         DeleteOutcome::AlreadyTombstoned => Ok(StatusCode::NO_CONTENT),
         DeleteOutcome::NotFound => Err(ApiError::not_found("tunnel")),
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TunnelTokenResponse {
+    pub id: String,
+    /// The new tunnel token, returned once. The previous token no longer
+    /// connects, and a live connection made with it is closed (`replaced`).
+    pub tunnel_token: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/tunnels/{id}/token",
+    params(("id" = String, Path, description = "Tunnel id")),
+    responses(
+        (status = 200, body = TunnelTokenResponse),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 409, body = ErrorBody),
+    )
+)]
+async fn rotate_tunnel_token(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TunnelTokenResponse>> {
+    let tunnel = active_tunnel(&state, &caller, &id).await?;
+    let token = tokens::random_token(TUNNEL_TOKEN_PREFIX);
+    let hash = tokens::hash_token(&token);
+    // Registration takes the same lock and checks the current token, so under
+    // it `hash` is the newest token: only older holders are closed, and no
+    // handshake that started with an older token can register later. A
+    // detached task keeps the update and the close under the lock even if the
+    // request is dropped mid-way.
+    let rotated = tokio::spawn({
+        let state = state.clone();
+        let id = tunnel.id.clone();
+        async move {
+            let _guard = state.token_lock(&id).lock().await;
+            if !state.db.rotate_tunnel_token(id.clone(), hash.clone()).await? {
+                return Ok::<_, anyhow::Error>(false);
+            }
+            if let Some(live) = state.registry.get(&id)
+                && !tokens::hashes_equal(&live.token_hash, &hash)
+            {
+                live.close(CloseReason::Replaced);
+            }
+            state.invalidate_tunnel(&id);
+            Ok(true)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.into()))??;
+    if !rotated {
+        // Expired or deleted since the check above.
+        return Err(ApiError::expired());
+    }
+    tracing::info!(tunnel = %tunnel.id, by = caller.describe(), "tunnel token rotated");
+    Ok(Json(TunnelTokenResponse { id: tunnel.id, tunnel_token: token }))
 }
 
 #[utoipa::path(
@@ -873,7 +1006,7 @@ async fn delete_access_link(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let tunnel = state.db.access_link_tunnel(id.clone()).await?.ok_or_else(|| ApiError::not_found("access link"))?;
-    if matches!(caller, Caller::Client { .. }) && find_tunnel(&state, &caller, &tunnel).await.is_err() {
+    if caller.owner_id().is_some() && find_tunnel(&state, &caller, &tunnel).await.is_err() {
         return Err(ApiError::not_found("access link"));
     }
     if !state.db.delete_access_link(id.clone()).await? {
@@ -1113,6 +1246,208 @@ async fn enroll_client(
         }
         None => Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "invalid, used, or expired login code")),
     }
+}
+
+// ---------------------------------------------------------------- services
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateServiceRequest {
+    /// 1..=64 characters: letters, digits, `.`, `_`, `-`.
+    pub name: String,
+    /// Live tunnels this service may own at once (1..=10000).
+    pub max_tunnels: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceTokenResponse {
+    pub name: String,
+    /// Service token (`tnsvc_…`), shown once; only its hash is stored. Use it
+    /// as the bearer token for `/v1/tunnels` and `/v1/access-links`.
+    pub token: String,
+    /// `https://<api host>`
+    pub api: String,
+    /// `wss://<tunnel host>`
+    pub server: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceView {
+    pub name: String,
+    pub max_tunnels: u32,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    /// Unexpired tunnels this service owns.
+    pub tunnels: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceList {
+    pub services: Vec<ServiceView>,
+    /// Pass as `cursor` to fetch the next page; absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PatchServiceRequest {
+    /// New live-tunnel quota (1..=10000). Tunnels above a lowered quota keep
+    /// running; new ones are refused until the count is below it.
+    pub max_tunnels: u32,
+}
+
+impl From<ServiceRow> for ServiceView {
+    fn from(s: ServiceRow) -> Self {
+        Self {
+            name: s.name,
+            max_tunnels: s.max_tunnels,
+            created_at: s.created_at,
+            last_used_at: s.last_used_at,
+            tunnels: s.tunnels,
+        }
+    }
+}
+
+impl From<services::Error> for ApiError {
+    fn from(e: services::Error) -> Self {
+        match e {
+            services::Error::Invalid(m) => ApiError::validation(m),
+            services::Error::Taken => ApiError::new(
+                StatusCode::CONFLICT,
+                "service_exists",
+                "a service with this name exists; delete it or rotate its token",
+            ),
+            services::Error::NotFound => ApiError::not_found("service"),
+            services::Error::Other(e) => ApiError::internal(e),
+        }
+    }
+}
+
+fn service_token_response(state: &AppState, name: String, token: String) -> ServiceTokenResponse {
+    ServiceTokenResponse {
+        name,
+        token,
+        api: format!("https://{}", state.config.api_host),
+        server: format!("wss://{}", state.config.tunnel_host),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/services",
+    request_body = CreateServiceRequest,
+    responses(
+        (status = 201, body = ServiceTokenResponse),
+        (status = 401, body = ErrorBody),
+        (status = 409, body = ErrorBody),
+        (status = 422, body = ErrorBody),
+    )
+)]
+async fn create_service(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    ApiJson(req): ApiJson<CreateServiceRequest>,
+) -> ApiResult<(StatusCode, Json<ServiceTokenResponse>)> {
+    let token = services::new_token();
+    let row = services::add(&state.db, &req.name, req.max_tunnels, &token).await?;
+    tracing::info!(service = %row.name, max_tunnels = row.max_tunnels, "service created");
+    Ok((StatusCode::CREATED, Json(service_token_response(&state, row.name, token))))
+}
+
+#[utoipa::path(
+    get, path = "/v1/services",
+    params(
+        ("limit" = Option<u32>, Query, description = "Page size (default 100)", minimum = 1, maximum = 500),
+        ("cursor" = Option<String>, Query, description = "Opaque next_cursor returned by the previous page"),
+    ),
+    responses((status = 200, body = ServiceList), (status = 401, body = ErrorBody), (status = 422, body = ErrorBody))
+)]
+async fn list_services(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    query: Result<Query<Pagination>, QueryRejection>,
+) -> ApiResult<Json<ServiceList>> {
+    let (limit, cursor) = pagination(query, true)?;
+    let mut rows = state.db.list_services(cursor, Some(limit)).await?;
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next_cursor = if has_more { rows.last().map(|row| row.name.clone()) } else { None };
+    Ok(Json(ServiceList { services: rows.into_iter().map(ServiceView::from).collect(), next_cursor }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/services/{name}",
+    params(("name" = String, Path, description = "Service name")),
+    request_body = PatchServiceRequest,
+    responses(
+        (status = 200, body = ServiceView),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 422, body = ErrorBody),
+    )
+)]
+async fn patch_service(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+    ApiJson(req): ApiJson<PatchServiceRequest>,
+) -> ApiResult<Json<ServiceView>> {
+    services::set_quota(&state.db, &name, req.max_tunnels).await?;
+    tracing::info!(service = %name, max_tunnels = req.max_tunnels, "service quota changed");
+    let row = state
+        .db
+        .list_services(None, None)
+        .await?
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| ApiError::not_found("service"))?;
+    Ok(Json(row.into()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/services/{name}/token",
+    params(("name" = String, Path, description = "Service name")),
+    responses(
+        (status = 200, body = ServiceTokenResponse, description = "New token; the old one stops working at once"),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+    )
+)]
+async fn rotate_service_token(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+) -> ApiResult<Json<ServiceTokenResponse>> {
+    let token = services::new_token();
+    services::rotate(&state.db, &name, &token).await?;
+    tracing::info!(service = %name, "service token rotated");
+    Ok(Json(service_token_response(&state, name, token)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/services/{name}",
+    params(("name" = String, Path, description = "Service name")),
+    responses(
+        (status = 204, description = "Deleted; its token stops working and its tunnels close"),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+    )
+)]
+async fn delete_service(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    let tunnels = state.db.delete_service(name.clone()).await?.ok_or_else(|| ApiError::not_found("service"))?;
+    for id in &tunnels {
+        state.delete_tunnel(id, CloseReason::Deleted).await?;
+    }
+    tracing::info!(service = %name, tunnels = tunnels.len(), "service deleted");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Validate an access request; hashes a new password. `current` is the stored
@@ -1506,6 +1841,10 @@ mod tests {
             ("/v1/clients", vec!["get", "post"]),
             ("/v1/clients/{name}", vec!["delete"]),
             ("/v1/clients/enroll", vec!["post"]),
+            ("/v1/tunnels/{id}/token", vec!["post"]),
+            ("/v1/services", vec!["get", "post"]),
+            ("/v1/services/{name}", vec!["patch", "delete"]),
+            ("/v1/services/{name}/token", vec!["post"]),
         ];
         assert_eq!(doc["paths"].as_object().unwrap().len(), expected.len());
         for (path, methods) in expected {
@@ -1518,7 +1857,11 @@ mod tests {
         assert!(doc["components"]["schemas"]["AccessLinkResponse"]["properties"].get("url_path").is_none());
         assert!(doc["components"]["schemas"]["Health"]["required"].as_array().unwrap().iter().all(|v| v != "version"));
         assert!(doc["paths"]["/v1/tunnels"]["post"]["responses"]["429"].is_object());
-        for path in ["/v1/tunnels", "/v1/clients"] {
+        assert!(doc["paths"]["/v1/tunnels"]["post"]["responses"]["403"].is_object());
+        assert!(
+            doc["paths"]["/v1/tunnels"]["get"]["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "label")
+        );
+        for path in ["/v1/tunnels", "/v1/clients", "/v1/services"] {
             let params = doc["paths"][path]["get"]["parameters"].as_array().unwrap();
             assert!(
                 params
@@ -1528,5 +1871,415 @@ mod tests {
             assert!(params.iter().any(|p| p["name"] == "cursor"));
             assert!(doc["paths"][path]["get"]["responses"]["422"].is_object());
         }
+    }
+
+    async fn add_service(state: &Arc<AppState>, name: &str, max_tunnels: u32) -> String {
+        let (status, body) = request(
+            state,
+            "POST",
+            "/v1/services",
+            Some(ADMIN_CREDENTIAL),
+            Some(serde_json::json!({"name": name, "max_tunnels": max_tunnels})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["name"], name);
+        assert_eq!(body["api"], "https://api.example.com");
+        assert_eq!(body["server"], "wss://tunnel.example.com");
+        let token = body["token"].as_str().unwrap().to_string();
+        assert!(token.starts_with(SERVICE_TOKEN_PREFIX));
+        token
+    }
+
+    async fn create(
+        state: &Arc<AppState>,
+        credential: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        request(state, "POST", "/v1/tunnels", Some(credential), Some(body)).await
+    }
+
+    #[tokio::test]
+    async fn service_owns_only_its_tunnels_within_its_quota() {
+        let state = test_state(false, 1);
+        enroll_test_client(&state, "c1", "one").await;
+        let svc = add_service(&state, "wssp", 3).await;
+
+        // Its own quota, not the client default of 1.
+        for expected in [StatusCode::CREATED, StatusCode::CREATED, StatusCode::CREATED, StatusCode::TOO_MANY_REQUESTS] {
+            let (status, body) = create(&state, &svc, serde_json::json!({"ttl_s": 600, "label": "sbx"})).await;
+            assert_eq!(status, expected);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(body["error"]["code"], "tunnel_quota");
+            }
+        }
+        let (status, mine) = request(&state, "GET", "/v1/tunnels", Some(&svc), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let mine: Vec<String> =
+            mine["tunnels"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(mine.len(), 3);
+
+        // Other owners' tunnels and links are invisible to the service, and its tunnels to them.
+        let (_, client_tunnel) = create(&state, CLIENT_CREDENTIAL, serde_json::json!({"ttl_s": 600})).await;
+        let (_, admin_tunnel) = create(&state, ADMIN_CREDENTIAL, serde_json::json!({"ttl_s": 600})).await;
+        for other in [&client_tunnel, &admin_tunnel] {
+            let id = other["id"].as_str().unwrap();
+            let (status, link) = request(
+                &state,
+                "POST",
+                &format!("/v1/tunnels/{id}/access-links"),
+                Some(ADMIN_CREDENTIAL),
+                Some(serde_json::json!({"ttl_s": 60})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let link = link["id"].as_str().unwrap();
+            for (method, uri) in [
+                ("GET", format!("/v1/tunnels/{id}")),
+                ("PATCH", format!("/v1/tunnels/{id}")),
+                ("DELETE", format!("/v1/tunnels/{id}")),
+                ("POST", format!("/v1/tunnels/{id}/token")),
+                ("POST", format!("/v1/tunnels/{id}/access-links")),
+                ("DELETE", format!("/v1/access-links/{link}")),
+            ] {
+                let body = (method != "DELETE" && !uri.ends_with("/token")).then(|| serde_json::json!({"ttl_s": 60}));
+                let (status, _) = request(&state, method, &uri, Some(&svc), body).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            }
+            assert!(state.db.get_tunnel(id.to_string()).await.unwrap().is_some(), "service deleted {id}");
+        }
+        let (_, client_list) = request(&state, "GET", "/v1/tunnels", Some(CLIENT_CREDENTIAL), None).await;
+        assert_eq!(client_list["tunnels"].as_array().unwrap().len(), 1);
+
+        // No client or service management.
+        for (method, uri) in [
+            ("GET", "/v1/clients"),
+            ("POST", "/v1/clients"),
+            ("DELETE", "/v1/clients/one"),
+            ("GET", "/v1/services"),
+            ("POST", "/v1/services"),
+            ("PATCH", "/v1/services/wssp"),
+            ("POST", "/v1/services/wssp/token"),
+            ("DELETE", "/v1/services/wssp"),
+            ("GET", "/v1/openapi.json"),
+        ] {
+            let body = matches!(method, "POST" | "PATCH").then(|| serde_json::json!({"name": "x", "max_tunnels": 9}));
+            let (status, _) = request(&state, method, uri, Some(&svc), body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+
+        // The admin raises the quota; the listing shows it and the usage.
+        let (status, view) = request(
+            &state,
+            "PATCH",
+            "/v1/services/wssp",
+            Some(ADMIN_CREDENTIAL),
+            Some(serde_json::json!({"max_tunnels": 4})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["max_tunnels"], 4);
+        assert_eq!(view["tunnels"], 3);
+        assert_eq!(create(&state, &svc, serde_json::json!({"ttl_s": 600})).await.0, StatusCode::CREATED);
+        let (_, list) = request(&state, "GET", "/v1/services", Some(ADMIN_CREDENTIAL), None).await;
+        assert_eq!(list["services"][0]["name"], "wssp");
+        assert_eq!(list["services"][0]["tunnels"], 4);
+        assert!(list["services"][0]["last_used_at"].is_i64());
+
+        // Own tunnels: delete works.
+        let (status, _) = request(&state, "DELETE", &format!("/v1/tunnels/{}", mine[0]), Some(&svc), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Deleting the service ends its tunnels and its token.
+        let (status, _) = request(&state, "DELETE", "/v1/services/wssp", Some(ADMIN_CREDENTIAL), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(request(&state, "GET", "/v1/tunnels", Some(&svc), None).await.0, StatusCode::UNAUTHORIZED);
+        for id in &mine[1..] {
+            assert!(state.db.get_tunnel(id.clone()).await.unwrap().is_none(), "{id} survived its service");
+        }
+        assert!(state.db.get_tunnel(client_tunnel["id"].as_str().unwrap().into()).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn service_admin_validation_and_token_rotation() {
+        let state = test_state(false, 20);
+        for body in [
+            serde_json::json!({"name": "bad name", "max_tunnels": 5}),
+            serde_json::json!({"name": "ok", "max_tunnels": 0}),
+            serde_json::json!({"name": "ok", "max_tunnels": 10_001}),
+            serde_json::json!({"name": "ok"}),
+        ] {
+            let (status, _) = request(&state, "POST", "/v1/services", Some(ADMIN_CREDENTIAL), Some(body)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let old = add_service(&state, "wssp", 5).await;
+        let (status, body) = request(
+            &state,
+            "POST",
+            "/v1/services",
+            Some(ADMIN_CREDENTIAL),
+            Some(serde_json::json!({"name": "wssp", "max_tunnels": 5})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "service_exists");
+        let (status, body) = request(&state, "POST", "/v1/services/wssp/token", Some(ADMIN_CREDENTIAL), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let new = body["token"].as_str().unwrap();
+        assert_ne!(new, old);
+        assert_eq!(request(&state, "GET", "/v1/tunnels", Some(&old), None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(request(&state, "GET", "/v1/tunnels", Some(new), None).await.0, StatusCode::OK);
+        for (method, uri) in [("POST", "/v1/services/nope/token"), ("DELETE", "/v1/services/nope")] {
+            assert_eq!(request(&state, method, uri, Some(ADMIN_CREDENTIAL), None).await.0, StatusCode::NOT_FOUND);
+        }
+        let (status, _) = request(
+            &state,
+            "PATCH",
+            "/v1/services/nope",
+            Some(ADMIN_CREDENTIAL),
+            Some(serde_json::json!({"max_tunnels": 3})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_previews_need_the_admin_unless_allowed() {
+        let state = test_state(false, 20);
+        enroll_test_client(&state, "c1", "one").await;
+        let svc = add_service(&state, "wssp", 5).await;
+        let public = serde_json::json!({"ttl_s": 600, "access": {"mode": "public"}});
+        for credential in [CLIENT_CREDENTIAL, svc.as_str()] {
+            let (status, body) = create(&state, credential, public.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"]["code"], "public_not_allowed");
+            // Links and password mode stay available.
+            assert_eq!(create(&state, credential, serde_json::json!({"ttl_s": 600})).await.0, StatusCode::CREATED);
+            let (status, created) = create(
+                &state,
+                credential,
+                serde_json::json!({"ttl_s": 600, "access": {"mode": "password", "username": "u", "password": "long-enough-pw"}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let id = created["id"].as_str().unwrap();
+            let (status, body) = request(
+                &state,
+                "PATCH",
+                &format!("/v1/tunnels/{id}"),
+                Some(credential),
+                Some(serde_json::json!({"access": {"mode": "public"}})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"]["code"], "public_not_allowed");
+        }
+        assert_eq!(create(&state, ADMIN_CREDENTIAL, public.clone()).await.0, StatusCode::CREATED);
+
+        // A tunnel that is already public (made while the setting was on) stays editable.
+        let (status, created) = {
+            let mut config = state.config.clone();
+            config.limits.allow_public_for_clients = true;
+            let allowed = AppState::new(config, state.db.clone(), state.certs.clone());
+            create(&allowed, &svc, public.clone()).await
+        };
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap();
+        let (status, _) = request(
+            &state,
+            "PATCH",
+            &format!("/v1/tunnels/{id}"),
+            Some(&svc),
+            Some(serde_json::json!({"label": "x", "access": {"mode": "public"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tunnel_list_filters_by_exact_label_within_owner() {
+        let state = test_state(false, 20);
+        let svc = add_service(&state, "wssp", 10).await;
+        for (credential, label) in
+            [(svc.as_str(), "sbx-1"), (svc.as_str(), "sbx-1"), (svc.as_str(), "sbx-10"), (ADMIN_CREDENTIAL, "sbx-1")]
+        {
+            let (status, _) = create(&state, credential, serde_json::json!({"ttl_s": 600, "label": label})).await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        for (credential, label, n) in [
+            (svc.as_str(), "sbx-1", 2),
+            (svc.as_str(), "sbx-10", 1),
+            (svc.as_str(), "sbx", 0),
+            (ADMIN_CREDENTIAL, "sbx-1", 3),
+        ] {
+            let (status, body) =
+                request(&state, "GET", &format!("/v1/tunnels?label={label}"), Some(credential), None).await;
+            assert_eq!(status, StatusCode::OK);
+            let rows = body["tunnels"].as_array().unwrap();
+            assert_eq!(rows.len(), n, "{label}");
+            assert!(rows.iter().all(|t| t["label"] == label));
+        }
+        // A misspelt filter must not silently list everything.
+        let (status, _) = request(&state, "GET", "/v1/tunnels?labels=sbx-1", Some(&svc), None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    type Live = (
+        Arc<crate::registry::LiveTunnel>,
+        tokio::sync::mpsc::Receiver<tunnel_protocol::ServerMsg>,
+        tunnel_protocol::mux::Session,
+    );
+
+    fn live_tunnel(id: &str, token_hash: String) -> Live {
+        let (transport, _peer) = tokio::io::duplex(64);
+        let session = tunnel_protocol::mux::Session::new_server(transport);
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(1);
+        let live = Arc::new(crate::registry::LiveTunnel {
+            conn_id: 1,
+            tunnel_id: id.into(),
+            control: session.control(),
+            ports: Default::default(),
+            ctrl_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            connected_at: now(),
+            streams: Default::default(),
+            pool: Default::default(),
+            token_hash,
+        });
+        (live, ctrl_rx, session)
+    }
+
+    fn closed_as(rx: &mut tokio::sync::mpsc::Receiver<tunnel_protocol::ServerMsg>) -> Option<CloseReason> {
+        match rx.try_recv() {
+            Ok(tunnel_protocol::ServerMsg::Close { reason }) => Some(reason),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_token_rotation_replaces_the_old_host() {
+        let state = test_state(false, 20);
+        let svc = add_service(&state, "wssp", 10).await;
+        let (_, created) = create(&state, &svc, serde_json::json!({"ttl_s": 600})).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let old = created["tunnel_token"].as_str().unwrap().to_string();
+        let (live, mut live_rx, _session) = live_tunnel(&id, tokens::hash_token(&old));
+        state.registry.insert(live.clone());
+
+        let (status, body) = request(&state, "POST", &format!("/v1/tunnels/{id}/token"), Some(&svc), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], id);
+        let new = body["tunnel_token"].as_str().unwrap();
+        assert!(new.starts_with(TUNNEL_TOKEN_PREFIX));
+        assert_ne!(new, old);
+        assert_eq!(closed_as(&mut live_rx), Some(CloseReason::Replaced), "the old host's connection must close");
+        assert!(state.db.find_tunnel_by_token_hash(tokens::hash_token(&old)).await.unwrap().is_none());
+        let row = state.db.find_tunnel_by_token_hash(tokens::hash_token(new)).await.unwrap().unwrap();
+        assert_eq!(row.id, id);
+
+        // A host already holding the newest token is left alone.
+        let (status, body) = request(&state, "POST", &format!("/v1/tunnels/{id}/token"), Some(&svc), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let newest = body["tunnel_token"].as_str().unwrap();
+        let (current, mut current_rx, _session2) = live_tunnel(&id, tokens::hash_token(newest));
+        state.registry.insert(current.clone());
+        crate::control::recheck(&state, &current).await;
+        assert_eq!(closed_as(&mut current_rx), None);
+        // A connection that authenticated with a superseded token closes on recheck.
+        let (stale, mut stale_rx, _session3) = live_tunnel(&id, tokens::hash_token(new));
+        crate::control::recheck(&state, &stale).await;
+        assert_eq!(closed_as(&mut stale_rx), Some(CloseReason::Replaced));
+
+        // Admin may rotate any tunnel; an expired one cannot be rotated.
+        assert_eq!(
+            request(&state, "POST", &format!("/v1/tunnels/{id}/token"), Some(ADMIN_CREDENTIAL), None).await.0,
+            StatusCode::OK
+        );
+        state
+            .db
+            .call({
+                let id = id.clone();
+                move |c| Ok(c.execute("UPDATE tunnels SET expires_at = 1 WHERE id = ?1", rusqlite::params![id])?)
+            })
+            .await
+            .unwrap();
+        let (status, body) = request(&state, "POST", &format!("/v1/tunnels/{id}/token"), Some(&svc), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "tunnel_expired");
+    }
+
+    #[tokio::test]
+    async fn stale_handshake_cannot_evict_the_host_with_the_new_token() {
+        let state = test_state(false, 20);
+        let svc = add_service(&state, "wssp", 10).await;
+        let (_, created) = create(&state, &svc, serde_json::json!({"ttl_s": 600})).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let old = created["tunnel_token"].as_str().unwrap().to_string();
+        let (_, body) = request(&state, "POST", &format!("/v1/tunnels/{id}/token"), Some(&svc), None).await;
+        let new = body["tunnel_token"].as_str().unwrap().to_string();
+
+        let (host, mut host_rx, _s1) = live_tunnel(&id, tokens::hash_token(&new));
+        assert_eq!(crate::control::register(&state, &host).await.unwrap(), None);
+        // A connection that authenticated with the old token before the
+        // rotation finishes its handshake now.
+        let (stale, mut stale_rx, _s2) = live_tunnel(&id, tokens::hash_token(&old));
+        let mut stale = stale;
+        Arc::get_mut(&mut stale).unwrap().conn_id = 2;
+        assert_eq!(crate::control::register(&state, &stale).await.unwrap(), Some(CloseReason::Replaced));
+        assert_eq!(closed_as(&mut stale_rx), None, "the session loop sends the reason, not register");
+        assert_eq!(closed_as(&mut host_rx), None, "the current host must stay connected");
+        assert_eq!(state.registry.get(&id).unwrap().conn_id, host.conn_id);
+    }
+
+    #[tokio::test]
+    async fn rotation_waits_for_registration_in_progress() {
+        let state = test_state(false, 20);
+        let svc = add_service(&state, "wssp", 10).await;
+        let (_, created) = create(&state, &svc, serde_json::json!({"ttl_s": 600})).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let held = state.token_lock(&id).lock().await;
+        let rotation = tokio::spawn({
+            let state = state.clone();
+            let uri = format!("/v1/tunnels/{id}/token");
+            async move { request(&state, "POST", &uri, Some(&svc), None).await.0 }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!rotation.is_finished(), "rotation must not interleave with a registration");
+        assert!(
+            state
+                .db
+                .find_tunnel_by_token_hash(tokens::hash_token(created["tunnel_token"].as_str().unwrap()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(held);
+        assert_eq!(rotation.await.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dropped_rotation_request_still_completes_under_the_lock() {
+        let state = test_state(false, 20);
+        let svc = add_service(&state, "wssp", 10).await;
+        let (_, created) = create(&state, &svc, serde_json::json!({"ttl_s": 600})).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let old = created["tunnel_token"].as_str().unwrap().to_string();
+        let (host, mut host_rx, _s) = live_tunnel(&id, tokens::hash_token(&old));
+        state.registry.insert(host);
+
+        let held = state.token_lock(&id).lock().await;
+        let request_task = tokio::spawn({
+            let state = state.clone();
+            let uri = format!("/v1/tunnels/{id}/token");
+            async move { request(&state, "POST", &uri, Some(&svc), None).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        request_task.abort(); // The client went away mid-rotation.
+        let _ = request_task.await;
+        drop(held);
+        // The detached rotation finishes on its own: the old host is told and the old token is gone.
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(5), host_rx.recv()).await.unwrap();
+        assert_eq!(reason, Some(tunnel_protocol::ServerMsg::Close { reason: CloseReason::Replaced }));
+        assert!(state.db.find_tunnel_by_token_hash(tokens::hash_token(&old)).await.unwrap().is_none());
     }
 }

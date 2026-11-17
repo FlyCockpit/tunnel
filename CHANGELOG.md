@@ -20,5 +20,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   health checks and Prometheus metrics.
 - A REST management API with OpenAPI and scoped per-machine client logins,
   sharing commands and access links.
+- Service credentials (`tnsvc_`) for platforms that manage tunnels on behalf of
+  others, each with its own live-tunnel quota; tunnel-token rotation; a
+  `label` filter on the tunnel list; public previews limited to the admin
+  unless `limits.allow_public_for_clients` is set.
 - GitHub Release binaries for Linux and macOS clients, static Linux servers,
   signed SHA-256 checksums, installer and third-party license notices.

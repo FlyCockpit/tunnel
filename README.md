@@ -223,8 +223,9 @@ TURN connections are closed if they do not authenticate promptly.
 ### Administration
 
 Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
-`cert renew [--force]`, and `client add <name> | list | delete <name>` (root only
-for a root install).
+`cert renew [--force]`, `client add <name> | list | delete <name>`, and
+`service add <name> --max-tunnels <n> | list | set <name> --max-tunnels <n> | rotate <name> | delete <name>`
+(root only for a root install).
 
 Health check: `GET https://<host>/healthz` returns JSON (`status`, `database`,
 `certificate_days_left`): 200 when healthy, 503 when the database does not answer
@@ -246,8 +247,11 @@ accepts only databases written by Tunnel 1.0.0 or later.
 
 `POST /v1/tunnels` and `PATCH /v1/tunnels/{id}` take
 `access: {mode: "link" | "password" | "public", username, password}`. The creator
-(admin or client token) chooses the mode and can change it; a tunnel token
-cannot change access settings.
+(admin, client or service token) chooses the mode and can change it; a tunnel token
+cannot change access settings. Only the admin token may make a tunnel public
+unless `limits.allow_public_for_clients = true`; client and service tokens
+otherwise get HTTP 403 `public_not_allowed` when creating a public tunnel or
+switching one to public (link and password mode stay available).
 
 - **Link** (default): visitors need an access link to establish a gate session.
 - **Password**: visitors sign in with the configured username and password;
@@ -278,8 +282,14 @@ count), and requests without an `Origin` (non-browser clients). Top-level form
 submissions from unrelated sites (for example an OAuth `form_post` callback) are
 also allowed. Everything else, including other previews, gets a 403.
 
-Tunnel and client list endpoints accept `limit` (default 100, range 1–500) and
-`cursor` for pagination. Pass the response's `next_cursor` as the next request's
+`POST /v1/tunnels/{id}/token` replaces the tunnel token and returns the new one
+once. The old token can no longer connect, and a connection made with it is
+closed with `replaced` (the client exits with code 4). Use it when the tunnel
+moves to another host. Expired tunnels return 409.
+
+Tunnel, client and service list endpoints accept `limit` (default 100, range 1–500) and
+`cursor` for pagination. `GET /v1/tunnels` also takes `label` (exact match), and
+rejects unknown query parameters. Pass the response's `next_cursor` as the next request's
 `cursor`; `next_cursor` is omitted on the last page. Invalid parameters return 422.
 
 ### Logged-in machines
@@ -302,6 +312,27 @@ access links. It may own at most `limits.max_tunnels_per_client` tunnels
 `error.code: "tunnel_quota"`. Admin tokens are exempt. `client list` shows enrolled machines; `client delete <name>`
 revokes the token, cancels pending codes and stops its tunnels. `logout` only
 forgets the local login.
+
+### Service credentials
+
+A service (for example a sandbox platform that creates one tunnel per sandbox)
+gets an API-only `tnsvc_` token from the admin:
+
+```sh
+tunnel-server service add wssp --max-tunnels 200 --token-file ./wssp.token  # or omit --token-file to print it once
+```
+
+The admin API offers the same: `POST /v1/services {name, max_tunnels}` returns
+the token once; `GET /v1/services`, `PATCH /v1/services/{name} {max_tunnels}`,
+`POST /v1/services/{name}/token` (rotate) and `DELETE /v1/services/{name}`.
+
+A service token works like a client token on `/v1/tunnels` and
+`/v1/access-links`: it sees, changes and deletes only the tunnels it created and
+their links, and cannot manage clients or services. It may own at most its
+own `max_tunnels` live tunnels (HTTP 429 `tunnel_quota` beyond that); lowering
+the quota keeps existing tunnels. Hand each host only its tunnel's `tntun_` token,
+and rotate that token when the tunnel moves. Deleting a service revokes its token
+and stops its tunnels.
 
 ### Sandbox client
 

@@ -373,6 +373,7 @@ mod tests {
             connected_at: now(),
             streams: Default::default(),
             pool: Default::default(),
+            token_hash: String::new(),
         }));
         (state, session)
     }

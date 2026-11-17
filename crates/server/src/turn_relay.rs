@@ -1796,6 +1796,7 @@ mod tests {
             connected_at: crate::tokens::now(),
             streams: AtomicUsize::new(0),
             pool: crate::pool::OriginPool::default(),
+            token_hash: String::new(),
         }));
         let gate_epoch = state.registry.gate_epoch("abcdefghij");
         let (release, blocker) = block_database(&state).await;
@@ -1849,6 +1850,7 @@ mod tests {
             connected_at: crate::tokens::now(),
             streams: AtomicUsize::new(0),
             pool: crate::pool::OriginPool::default(),
+            token_hash: String::new(),
         }));
         let server = relay.udp.lock().unwrap().clone().unwrap();
         let commands = server.commands.lock().await;

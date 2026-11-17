@@ -142,6 +142,11 @@ pub struct Limits {
     pub max_tunnel_ttl_s: u64,
     #[serde(default = "default_tombstone_retention")]
     pub tombstone_retention_s: u64,
+    /// Let machine clients and services create public previews (access mode
+    /// `public`). Off: they may use access links and password mode only; the
+    /// admin token is not restricted.
+    #[serde(default)]
+    pub allow_public_for_clients: bool,
 }
 
 impl Default for Limits {
@@ -154,6 +159,7 @@ impl Default for Limits {
             default_session_ttl_s: default_session_ttl(),
             max_tunnel_ttl_s: default_max_tunnel_ttl(),
             tombstone_retention_s: default_tombstone_retention(),
+            allow_public_for_clients: false,
         }
     }
 }
@@ -332,6 +338,9 @@ api_token = "public-test-placeholder"
         assert_eq!(cfg.limits.max_tunnels_per_client, 20);
         let limits: Limits = toml::from_str("max_tunnels_per_client = 7").unwrap();
         assert_eq!(limits.max_tunnels_per_client, 7);
+        assert!(!limits.allow_public_for_clients);
+        let limits: Limits = toml::from_str("allow_public_for_clients = true").unwrap();
+        assert!(limits.allow_public_for_clients);
     }
 
     #[test]
