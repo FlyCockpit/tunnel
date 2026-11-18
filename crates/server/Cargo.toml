@@ -62,4 +62,5 @@ x509-parser = "0.18.1"
 stun = "0.17.3"
 
 [dev-dependencies]
+h2 = "0.4"
 tokio = { workspace = true, features = ["test-util"] }

@@ -2454,6 +2454,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "h2",
  "hex",
  "hmac",
  "http",

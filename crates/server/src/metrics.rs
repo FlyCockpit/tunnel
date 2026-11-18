@@ -28,6 +28,8 @@ pub struct Metrics {
     pub gate_denials: AtomicU64,
     /// Visitor lookups answered 503 because the lookup slots were full.
     pub lookups_shed: AtomicU64,
+    /// Proxied exchanges cut in flight because their access was lost.
+    pub access_cuts: AtomicU64,
     /// Built-in TURN relay gauges.
     pub turn: Arc<crate::turn_relay::MetricsRef>,
     pub access_redemptions: AtomicU64,
@@ -65,6 +67,8 @@ impl Metrics {
         let _ = writeln!(out, "tunnel_gate_denials_total {}", self.gate_denials.load(Ordering::Relaxed));
         let _ = writeln!(out, "# TYPE tunnel_lookups_shed_total counter");
         let _ = writeln!(out, "tunnel_lookups_shed_total {}", self.lookups_shed.load(Ordering::Relaxed));
+        let _ = writeln!(out, "# TYPE tunnel_access_cuts_total counter");
+        let _ = writeln!(out, "tunnel_access_cuts_total {}", self.access_cuts.load(Ordering::Relaxed));
         let _ = writeln!(out, "# TYPE tunnel_turn_allocations gauge");
         let _ = writeln!(out, "tunnel_turn_allocations {}", self.turn.allocations.load(Ordering::Relaxed));
         let _ = writeln!(out, "# TYPE tunnel_access_redemptions_total counter");

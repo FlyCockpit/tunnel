@@ -490,4 +490,594 @@ zone = "example.com"
             }
         }
     }
+
+    /// What the streaming sandbox hands the test for each origin request: the
+    /// path, the sender feeding that response's body, and the request body.
+    type OriginStream = (String, tokio::sync::mpsc::Sender<bytes::Bytes>, Incoming);
+
+    /// A sandbox whose responses stream whatever the test pushes: `/events` as
+    /// SSE (chunked), `/download` as a large fixed-length file.
+    async fn streaming_sandbox(
+        state: &AppState,
+    ) -> (tunnel_protocol::mux::Session, tokio::sync::mpsc::UnboundedReceiver<OriginStream>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tunnel_protocol::mux::Session;
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let server = Session::new_server(server_io);
+        let mut client = Session::new_client(client_io);
+        let (origin_tx, origin_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(mut stream) = client.next().await {
+                let origin_tx = origin_tx.clone();
+                tokio::spawn(async move {
+                    let mut port = [0; 2];
+                    stream.read_exact(&mut port).await.unwrap();
+                    stream.write_all(&[tunnel_protocol::STREAM_OK]).await.unwrap();
+                    stream.flush().await.unwrap();
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let path = req.uri().path().to_string();
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+                        let _ = origin_tx.send((path.clone(), tx, req.into_body()));
+                        async move {
+                            // `/hold` sends its headers only once the test pushes a chunk.
+                            if path == "/hold" && rx.recv().await.is_none() {
+                                return Err("held response abandoned");
+                            }
+                            let body =
+                                http_body_util::StreamBody::new(futures_util::stream::unfold(rx, |mut rx| async {
+                                    let chunk = rx.recv().await?;
+                                    Some((Ok::<_, crate::util::BoxError>(http_body::Frame::data(chunk)), rx))
+                                }))
+                                .boxed();
+                            if path == "/accept" {
+                                // Answer at once with an empty body; the upload goes on.
+                                return Ok(Response::new(empty()));
+                            }
+                            let response = if path == "/download" {
+                                Response::builder()
+                                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                                    .header(header::CONTENT_LENGTH, "1000000")
+                            } else {
+                                Response::builder().header(header::CONTENT_TYPE, "text/event-stream")
+                            };
+                            Ok::<_, &str>(response.body(body).unwrap())
+                        }
+                    });
+                    let _ =
+                        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+                });
+            }
+        });
+        let (ctrl_tx, _) = tokio::sync::mpsc::channel(1);
+        state.registry.insert(Arc::new(crate::registry::LiveTunnel {
+            conn_id: 1,
+            tunnel_id: ID.into(),
+            control: server.control(),
+            ports: std::sync::RwLock::new([3000].into_iter().collect()),
+            ctrl_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            connected_at: crate::tokens::now(),
+            streams: AtomicUsize::new(0),
+            pool: crate::pool::OriginPool::default(),
+            token_hash: String::new(),
+        }));
+        (server, origin_rx)
+    }
+
+    /// One streaming visitor request through the edge on its own HTTP/1.1
+    /// connection, with the origin's body sender for it.
+    struct Visitor {
+        body: Incoming,
+        origin: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        /// The visitor's request body as the origin receives it.
+        upload: Incoming,
+    }
+
+    impl Visitor {
+        async fn open(
+            state: &Arc<AppState>,
+            origins: &mut tokio::sync::mpsc::UnboundedReceiver<OriginStream>,
+            path: &str,
+            cookie: Option<&str>,
+        ) -> Self {
+            Self::open_with(state, origins, Method::GET, path, cookie, empty()).await
+        }
+
+        async fn open_with(
+            state: &Arc<AppState>,
+            origins: &mut tokio::sync::mpsc::UnboundedReceiver<OriginStream>,
+            method: Method,
+            path: &str,
+            cookie: Option<&str>,
+            upload: Body,
+        ) -> Self {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let service_state = state.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| {
+                    let state = service_state.clone();
+                    let hosts = Hosts::new(&state);
+                    async move { Ok::<_, Infallible>(route(state, &hosts, "127.0.0.1:1234".parse().unwrap(), req).await) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), svc).await;
+            });
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client)).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut req = Request::builder().method(method).uri(path).header(header::HOST, PREVIEW);
+            if let Some(cookie) = cookie {
+                req = req.header(header::COOKIE, cookie);
+            }
+            let response = sender.send_request(req.body(upload).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let (seen, origin, upload) = origins.recv().await.unwrap();
+            assert_eq!(seen, path);
+            Self { body: response.into_body(), origin, upload }
+        }
+
+        /// The origin's next chunk reaches the visitor.
+        async fn relays(&mut self, chunk: &'static str) {
+            self.origin.send(bytes::Bytes::from_static(chunk.as_bytes())).await.unwrap();
+            let frame = self.body.frame().await.expect("stream open").expect("stream intact");
+            assert_eq!(frame.into_data().unwrap(), chunk.as_bytes());
+        }
+
+        /// The visitor's response fails (cut, not completed) and the origin's
+        /// stream is released.
+        async fn assert_cut(mut self) {
+            let next = tokio::time::timeout(Duration::from_secs(5), self.body.frame()).await.expect("cut promptly");
+            assert!(matches!(next, Some(Err(_))), "a cut stream must not look complete");
+            tokio::time::timeout(Duration::from_secs(5), self.origin.closed()).await.expect("origin released");
+        }
+    }
+
+    async fn link_session(state: &AppState, link: &str) -> String {
+        state
+            .db
+            .create_access_link(crate::db::NewAccessLink {
+                id: link.into(),
+                tunnel_id: ID.into(),
+                token_hash: format!("{link}-placeholder"),
+                single_use: false,
+                label: None,
+                session_ttl_s: 3600,
+                expires_at: crate::tokens::now() + 3600,
+            })
+            .await
+            .unwrap();
+        let crate::db::Redemption::Granted { session_id, .. } =
+            state.db.redeem_access_link(ID.into(), format!("{link}-placeholder"), vec![]).await.unwrap()
+        else {
+            panic!("test link denied")
+        };
+        format!("{}={session_id}", tunnel_protocol::GATE_COOKIE)
+    }
+
+    fn live_streams(state: &AppState) -> usize {
+        state.metrics.live_streams.load(Ordering::SeqCst) as usize
+    }
+
+    #[tokio::test]
+    async fn revoking_a_link_cuts_its_streaming_responses_only() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let revoked = link_session(&state, "link-revoked").await;
+        let kept = link_session(&state, "link-kept").await;
+        let mut events = Visitor::open(&state, &mut origins, "/events", Some(&revoked)).await;
+        let mut download = Visitor::open(&state, &mut origins, "/download", Some(&revoked)).await;
+        let mut other = Visitor::open(&state, &mut origins, "/events", Some(&kept)).await;
+        for visitor in [&mut events, &mut download, &mut other] {
+            visitor.relays("data: one\n\n").await;
+        }
+        assert_eq!(live_streams(&state), 3);
+
+        // Exactly what `DELETE /v1/access-links/{id}` does after the delete.
+        assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+        state.invalidate_sessions();
+        state.registry.rotate_gate_epoch(ID);
+        events.assert_cut().await;
+        download.assert_cut().await;
+        other.relays("data: two\n\n").await;
+        assert_eq!(live_streams(&state), 1, "cut requests must release their registration");
+
+        // Closing the tunnel cuts what is left.
+        state.registry.remove(ID);
+        other.assert_cut().await;
+        assert_eq!(live_streams(&state), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_expiry_cuts_its_streaming_responses_only() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Password).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let login = |ttl| {
+            let state = state.clone();
+            async move {
+                let grant =
+                    state.db.login_grant(ID.into(), "unused-password-hash".into(), ttl, vec![]).await.unwrap().unwrap();
+                let crate::db::Redemption::Granted { session_id, .. } = grant else { panic!("test grant denied") };
+                format!("{}={session_id}", tunnel_protocol::GATE_COOKIE)
+            }
+        };
+        let short = login(60).await;
+        let long = login(7200).await;
+        let mut events = Visitor::open(&state, &mut origins, "/events", Some(&short)).await;
+        // Only the short session is cached now, so this request is admitted on
+        // it; at its expiry the recheck must find the long one it also presented.
+        let both = format!("{short}; {long}");
+        let mut both = Visitor::open(&state, &mut origins, "/events", Some(&both)).await;
+        let mut download = Visitor::open(&state, &mut origins, "/download", Some(&short)).await;
+        let mut other = Visitor::open(&state, &mut origins, "/events", Some(&long)).await;
+        for visitor in [&mut events, &mut both, &mut download, &mut other] {
+            visitor.relays("data: one\n\n").await;
+        }
+
+        // Wall-clock seconds may tick during setup: the deadline is 59-60 s out.
+        tokio::time::advance(Duration::from_secs(55)).await;
+        events.relays("data: still\n\n").await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        events.assert_cut().await;
+        download.assert_cut().await;
+        both.relays("data: two\n\n").await;
+        other.relays("data: two\n\n").await;
+        assert_eq!(live_streams(&state), 2);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_relayed_while_a_revocation_is_rechecked() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let revoked = link_session(&state, "link-revoked").await;
+        let kept = link_session(&state, "link-kept").await;
+        let mut events = Visitor::open(&state, &mut origins, "/events", Some(&revoked)).await;
+        let mut other = Visitor::open(&state, &mut origins, "/events", Some(&kept)).await;
+        events.relays("data: one\n\n").await;
+        other.relays("data: one\n\n").await;
+        assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+        state.invalidate_sessions();
+
+        // Hold the database so both rechecks stay pending.
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let db_state = state.clone();
+        let held = tokio::spawn(async move {
+            db_state
+                .db
+                .call(move |_| {
+                    let _ = locked_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+        });
+        locked_rx.await.unwrap();
+        state.registry.rotate_gate_epoch(ID);
+        for visitor in [&mut events, &mut other] {
+            visitor.origin.send(bytes::Bytes::from_static(b"data: during\n\n")).await.unwrap();
+        }
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        for visitor in [&mut events, &mut other] {
+            assert!(futures_util::poll!(visitor.body.frame()).is_pending(), "relayed during the recheck");
+        }
+
+        release_tx.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        // The revoked stream never sees the chunk sent during the recheck.
+        events.assert_cut().await;
+        let frame = other.body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), &b"data: during\n\n"[..]);
+        other.relays("data: after\n\n").await;
+    }
+
+    #[tokio::test]
+    async fn revoking_a_link_ends_a_request_still_waiting_for_the_origin() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let cookie = link_session(&state, "link-revoked").await;
+        let waiting = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                request(&state, PREVIEW, "/hold", Method::GET, &[("cookie", cookie.as_str())]).await.status()
+            })
+        };
+        let (path, origin, _) = origins.recv().await.unwrap();
+        assert_eq!(path, "/hold");
+        assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+        state.invalidate_sessions();
+        state.registry.rotate_gate_epoch(ID);
+        assert_eq!(waiting.await.unwrap(), StatusCode::UNAUTHORIZED);
+        tokio::time::timeout(Duration::from_secs(5), origin.closed()).await.expect("origin released");
+        assert_eq!(live_streams(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn a_visitor_that_stops_reading_cannot_hold_a_revoked_exchange_open() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let cookie = link_session(&state, "link-revoked").await;
+        let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        let upload = http_body_util::StreamBody::new(futures_util::stream::unfold(upload_rx, |mut rx| async {
+            let chunk = rx.recv().await?;
+            Some((Ok::<_, crate::util::BoxError>(http_body::Frame::data(chunk)), rx))
+        }))
+        .boxed();
+        let mut visitor =
+            Visitor::open_with(&state, &mut origins, Method::POST, "/events", Some(&cookie), upload).await;
+        upload_tx.send(bytes::Bytes::from_static(b"part one")).await.unwrap();
+        assert_eq!(visitor.upload.frame().await.unwrap().unwrap().into_data().unwrap(), &b"part one"[..]);
+
+        // Fill every buffer toward the visitor, which never reads again.
+        let chunk = bytes::Bytes::from(vec![b'x'; 64 * 1024]);
+        let mut stalled = 0;
+        while stalled < 200 {
+            match visitor.origin.try_send(chunk.clone()) {
+                Ok(()) => stalled = 0,
+                Err(_) => {
+                    stalled += 1;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+        state.invalidate_sessions();
+        state.registry.rotate_gate_epoch(ID);
+        // The origin side ends without the visitor reading anything.
+        tokio::time::timeout(Duration::from_secs(5), visitor.origin.closed()).await.expect("origin released");
+        let upload_end =
+            tokio::time::timeout(Duration::from_secs(5), visitor.upload.frame()).await.expect("upload cut");
+        assert!(!matches!(upload_end, Some(Ok(_))), "no upload data after the revocation");
+        // Hyper still holds the visitor's connection, so its slot counts on.
+        assert_eq!(live_streams(&state), 1);
+        // Reading again, the visitor gets what was already buffered, then a
+        // failure: never a clean end.
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match visitor.body.frame().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return true,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .expect("cut, not stalled");
+        assert!(drained, "a cut response must not end cleanly");
+        streams_drop_to(&state, 0, "slot released once hyper let go of the visitor").await;
+        drop(upload_tx);
+    }
+
+    /// Waits until `live_streams` is `n`.
+    async fn streams_drop_to(state: &AppState, n: usize, why: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_streams(state) != n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(why);
+    }
+
+    #[tokio::test]
+    async fn a_revocation_tears_down_an_origin_that_stopped_reading_the_upload() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let cookie = link_session(&state, "link-revoked").await;
+        let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        let upload = http_body_util::StreamBody::new(futures_util::stream::unfold(upload_rx, |mut rx| async {
+            let chunk = rx.recv().await?;
+            Some((Ok::<_, crate::util::BoxError>(http_body::Frame::data(chunk)), rx))
+        }))
+        .boxed();
+        // The origin answers at once and never reads the upload.
+        let mut visitor =
+            Visitor::open_with(&state, &mut origins, Method::POST, "/accept", Some(&cookie), upload).await;
+        assert!(visitor.body.frame().await.is_none(), "the empty response is complete");
+        let chunk = bytes::Bytes::from(vec![b'u'; 64 * 1024]);
+        let mut stalled = 0;
+        while stalled < 200 {
+            match upload_tx.try_send(chunk.clone()) {
+                Ok(()) => stalled = 0,
+                Err(_) => {
+                    stalled += 1;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+        state.invalidate_sessions();
+        state.registry.rotate_gate_epoch(ID);
+        // With the origin still not reading, the exchange ends on both sides.
+        tokio::time::timeout(Duration::from_secs(5), upload_tx.closed()).await.expect("visitor's upload cut");
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match visitor.upload.frame().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return true,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .expect("origin connection torn down");
+        assert!(ended, "a cut upload must not look complete to the origin");
+        assert_eq!(live_streams(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn an_upload_is_cut_even_after_its_response_is_done() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let cookie = link_session(&state, "link-revoked").await;
+        let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        let upload = http_body_util::StreamBody::new(futures_util::stream::unfold(upload_rx, |mut rx| async {
+            let chunk = rx.recv().await?;
+            Some((Ok::<_, crate::util::BoxError>(http_body::Frame::data(chunk)), rx))
+        }))
+        .boxed();
+        let mut visitor =
+            Visitor::open_with(&state, &mut origins, Method::POST, "/accept", Some(&cookie), upload).await;
+        assert!(visitor.body.frame().await.is_none(), "the empty response is complete");
+        upload_tx.send(bytes::Bytes::from_static(b"part one")).await.unwrap();
+        assert_eq!(visitor.upload.frame().await.unwrap().unwrap().into_data().unwrap(), &b"part one"[..]);
+
+        assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+        state.invalidate_sessions();
+        state.registry.rotate_gate_epoch(ID);
+        // Offered after the revocation, this part must never reach the origin.
+        let _ = upload_tx.try_send(bytes::Bytes::from_static(b"late part"));
+        let next = tokio::time::timeout(Duration::from_secs(5), visitor.upload.frame()).await.expect("upload cut");
+        assert!(!matches!(next, Some(Ok(_))), "upload data reached the origin after the revocation");
+    }
+
+    #[tokio::test]
+    async fn a_visitor_leaving_an_idle_stream_releases_the_origin() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Public).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let mut events = Visitor::open(&state, &mut origins, "/events", None).await;
+        events.relays("data: one\n\n").await;
+        let Visitor { body, origin, .. } = events;
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(5), origin.closed()).await.expect("origin released");
+        assert_eq!(live_streams(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn a_finished_origin_keeps_the_slot_and_the_watch_until_the_visitor_is_served() {
+        for revoke in [false, true] {
+            h2_zero_window_visitor(revoke).await;
+        }
+    }
+
+    /// An HTTP/2 visitor granting no flow-control window: the origin finishes,
+    /// nothing reaches the visitor, and its slot counts on, also once `revoke`
+    /// cut the exchange (hyper may hold a frame for it). Once the visitor
+    /// grants credit, the stream ends: cleanly, or, if revoked, with a reset.
+    async fn h2_zero_window_visitor(revoke: bool) {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let cookie = link_session(&state, "link-revoked").await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let service_state = state.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req| {
+                let state = service_state.clone();
+                let hosts = Hosts::new(&state);
+                async move { Ok::<_, Infallible>(route(state, &hosts, "127.0.0.1:1234".parse().unwrap(), req).await) }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(server), svc)
+                .await;
+        });
+        // A visitor that grants no flow-control window until told to.
+        let (sender, mut connection) =
+            h2::client::Builder::new().initial_window_size(0).handshake::<_, bytes::Bytes>(client).await.unwrap();
+        let (grant_tx, grant_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut grant = Some(grant_rx);
+            std::future::poll_fn(|cx| {
+                if let Some(rx) = grant.as_mut()
+                    && std::pin::Pin::new(rx).poll(cx).is_ready()
+                {
+                    grant = None;
+                    connection.set_initial_window_size(65_535).unwrap();
+                }
+                std::pin::Pin::new(&mut connection).poll(cx)
+            })
+            .await
+        });
+        let mut sender = sender.ready().await.unwrap();
+        let req = Request::builder()
+            .uri(format!("https://{PREVIEW}/events"))
+            .header(header::COOKIE, cookie)
+            .body(())
+            .unwrap();
+        let (response, _) = sender.send_request(req, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, origin, _) = origins.recv().await.unwrap();
+        origin.send(bytes::Bytes::from_static(b"data: last\n\n")).await.unwrap();
+        drop(origin);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(live_streams(&state), 1, "the response is still owed to the visitor");
+        if revoke {
+            // The origin is long done; the watch must still act, and the
+            // stream hyper still holds keeps counting against the tunnel.
+            assert!(state.db.delete_access_link("link-revoked".into()).await.unwrap());
+            state.invalidate_sessions();
+            state.registry.rotate_gate_epoch(ID);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.metrics.access_cuts.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cut at the revocation");
+            assert_eq!(live_streams(&state), 1, "a stream hyper still holds must keep its slot");
+        }
+        grant_tx.send(()).unwrap();
+        let mut body = response.into_body();
+        let clean = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match body.data().await {
+                    Some(Ok(data)) => {
+                        // Only bytes sent before any revocation can arrive
+                        // (or the empty frame carrying END_STREAM).
+                        assert!(data.is_empty() || data == b"data: last\n\n"[..], "{data:?}");
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                    }
+                    Some(Err(_)) => return false,
+                    None => return true,
+                }
+            }
+        })
+        .await
+        .expect("stream ends once the visitor grants credit");
+        assert_eq!(clean, !revoke, "only an unrevoked stream ends cleanly");
+        streams_drop_to(&state, 0, "slot released once the stream ended").await;
+    }
+
+    #[tokio::test]
+    async fn protecting_a_public_tunnel_cuts_its_streaming_responses() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Public).await;
+        let (_session, mut origins) = streaming_sandbox(&state).await;
+        let mut events = Visitor::open(&state, &mut origins, "/events", None).await;
+        events.relays("data: one\n\n").await;
+        // A rotation that keeps the tunnel public keeps the stream.
+        state.registry.rotate_gate_epoch(ID);
+        events.relays("data: two\n\n").await;
+        state
+            .db
+            .update_tunnel(
+                ID.into(),
+                crate::db::TunnelPatch {
+                    access: Some(Access { mode: AccessMode::Link, ..Default::default() }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        state.invalidate_tunnel(ID);
+        state.invalidate_sessions();
+        state.registry.rotate_gate_epoch(ID);
+        events.assert_cut().await;
+        assert_eq!(live_streams(&state), 0);
+    }
 }

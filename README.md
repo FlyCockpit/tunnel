@@ -265,6 +265,32 @@ expiry. Redeeming one grants a cookie session for every port of that tunnel;
 revoking the link revokes the sessions derived from it. Mint single-use links
 when a visitor clicks to open a preview so link scanners cannot consume them early.
 
+Revocation and expiry also end what is already running. When a link is revoked,
+the access mode or password changes, or the tunnel is deleted, gets a new token
+or disconnects, every request and WebSocket still in progress on that tunnel
+stops relaying at once, in either direction, and is rechecked (normally within
+milliseconds; a recheck that cannot reach the database within 10 seconds counts
+as lost). When a gate session expires, only the requests admitted with it are
+rechecked, at that moment. The one exception is the CORS preflight a protected
+tunnel lets through without a session (an `OPTIONS` stripped of cookies and
+body): it holds no access to lose and is not watched.
+
+A request admitted with a gate session keeps going if any session it presented
+is still valid; one admitted while the tunnel was public keeps going only while
+the tunnel stays public. The ones that lost their access end within moments,
+whether or not the visitor is still reading: a response still streaming (SSE, a
+long download, a chunked body) is aborted mid-body, so the visitor sees a broken
+transfer rather than a complete one (an HTTP/1.0 client reading a response
+without a length can tell only from the connection closing early); an upload is
+cut and the origin connection closed, even if the origin stopped reading it; a
+request still waiting for the origin gets a 401; a WebSocket is closed. A cut
+exchange still counts against the tunnel's stream limit until the visitor's
+connection lets go of it, as any slow visitor does. `tunnel_access_cuts_total`
+on the metrics endpoint counts these cuts. A tunnel that reaches its own expiry
+is ended the same way by the expiry sweep, within 15 seconds. Bytes already
+handed to the connection before the revocation may still reach a slow reader
+before it sees the failure; nothing the origin sends later does.
+
 Sign-in lives only on the zone host: `/__access/...` for links and `/__login`
 for passwords. These routes are absent on preview hosts, keeping preview service
 workers away from access tokens and passwords. The gate cookie is Secure,

@@ -28,5 +28,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   address instead of loopback, `--state-dir` / `TUNNEL_STATE_DIR` with a
   documented foreground `tunnel daemon` for supervisors, the forwarding target
   in `status --json`, and a non-dumpable daemon on Linux.
+- Revoking an access link, a gate session expiring, an access change and
+  closing the tunnel now also end proxied HTTP responses that are already
+  streaming (SSE, long downloads) and uploads, not only WebSockets and new
+  requests; `tunnel_access_cuts_total` counts them.
 - GitHub Release binaries for Linux and macOS clients, static Linux servers,
   signed SHA-256 checksums, installer and third-party license notices.

@@ -18,18 +18,19 @@ use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tunnel_protocol::mux::Stream as StreamHandle;
 use tunnel_protocol::{STREAM_OK, STREAM_REFUSED, encode_preamble};
 
 use crate::db::{HostHeaderMode, TunnelRow};
+use crate::gate::{Rechecking, Side};
 use crate::headers::{self, ResponseCtx};
 use crate::ice;
 use crate::inject::{self, Injector};
 use crate::metrics::TunnelBytes;
 use crate::pages;
+use crate::pool::OriginConn;
 use crate::registry::LiveTunnel;
 use crate::state::AppState;
 use crate::util::{Body, BoxError, empty, header_str, incoming, text_response};
@@ -56,7 +57,19 @@ enum WsKind {
 /// passed the gate (or the CORS-preflight exception) and checked that `live`
 /// declares `port`. `cookie` is the visitor's `Cookie` minus gate cookies;
 /// `session_subject` (gate-session hash prefix) is set for gated requests and
-/// enables ICE injection.
+/// enables ICE injection. `authorization` (absent only for the credential-free
+/// CORS preflight) is watched by a task of its own ([`spawn_watch`]) for as
+/// long as any part of the exchange lives. From a gate-epoch rotation until
+/// [`gate::watch`] has a verdict, nothing more is relayed in either direction
+/// (opening the origin connection, waiting for its headers, both bodies and
+/// the WebSocket splice pause). Once it reports the authorization lost, the
+/// origin stream and connection are released at once and both bodies fail,
+/// which aborts the visitor's connection (HTTP/1.1) or stream (HTTP/2); a
+/// request still waiting for the origin gets a 401 and a WebSocket closes.
+/// The stream slot is released when hyper drops the response body, as for
+/// any slow visitor.
+///
+/// [`gate::watch`]: crate::gate::watch
 #[allow(clippy::too_many_arguments)]
 pub async fn forward(
     state: &Arc<AppState>,
@@ -80,6 +93,11 @@ pub async fn forward(
         tunnel.inject_ice && cfg.webrtc.enabled && *req.method() == Method::GET && is_navigation(req.headers())
     });
 
+    // The watch runs in its own task for as long as any part of the exchange
+    // holds an `Alive` (this future, either body, a splice).
+    let exchange = Arc::new(Exchange::default());
+    let alive = authorization.map(|grant| spawn_watch(state, &tunnel.id, grant, exchange.clone()));
+
     let public_host = state.preview_host(port, &tunnel.id);
     let (parts, body) = req.into_parts();
     let headers = origin_request_headers(
@@ -101,7 +119,14 @@ pub async fn forward(
         drop(body);
         empty()
     } else {
-        Counted { inner: incoming(body), bytes: bytes.clone(), outbound: false, _guard: None }.boxed()
+        let counted = Counted { inner: incoming(body), bytes: bytes.clone(), outbound: false, _guard: None }.boxed();
+        match &alive {
+            Some(alive) => {
+                Revocable { inner: Some(counted), held: None, exchange: exchange.clone(), _alive: alive.clone() }
+                    .boxed()
+            }
+            None => counted,
+        }
     };
     let path = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let mut out = Request::new(req_body);
@@ -117,12 +142,19 @@ pub async fn forward(
     // Ordinary requests reuse an idle origin connection when one is ready.
     let pooled = if ws.is_none() { live.pool.checkout(port) } else { None };
     let reused = pooled.is_some();
-    let mut sender = match pooled {
-        Some(s) => s,
-        None => match origin_conn(&live, port, &tunnel.id).await {
-            Ok(s) => s,
-            Err(page) => return page,
-        },
+    let opened = guarded(&exchange, async {
+        match pooled {
+            Some(s) => Ok(s),
+            None => origin_conn(&live, port, &tunnel.id).await,
+        }
+    });
+    let mut sender = match opened.await {
+        Some(Ok(conn)) => exchange.hold_origin(conn),
+        Some(Err(page)) => return page,
+        None => {
+            tracing::debug!(tunnel = %tunnel.id, port, "access ended before the origin was reached");
+            return pages::unauthorized();
+        }
     };
 
     let sent = tokio::time::timeout(RESPONSE_HEADER_TIMEOUT, async {
@@ -132,13 +164,17 @@ pub async fn forward(
             // origin's keep-alive ran out): retry once on a new connection.
             Err(mut e) if reused && e.message().is_some() => {
                 let req = e.take_message().expect("checked above");
-                sender = origin_conn(&live, port, &tunnel.id).await.map_err(SendFail::Page)?;
+                let conn = origin_conn(&live, port, &tunnel.id).await.map_err(SendFail::Page)?;
+                sender = exchange.hold_origin(conn);
                 sender.send_request(req).await.map_err(SendFail::Origin)
             }
             Err(e) => Err(SendFail::Origin(e.into_error())),
         }
-    })
-    .await;
+    });
+    let Some(sent) = guarded(&exchange, sent).await else {
+        tracing::debug!(tunnel = %tunnel.id, port, "access ended before the origin responded");
+        return pages::unauthorized();
+    };
     let mut resp = match sent {
         Ok(Ok(r)) => r,
         Ok(Err(SendFail::Page(page))) => return page,
@@ -153,13 +189,16 @@ pub async fn forward(
     };
     if ws.is_none() {
         // Back to the pool once this response's body has been read (hyper
-        // reports ready only for a keep-alive connection).
+        // reports ready only for a keep-alive connection), unless a loss
+        // aborted it first; once pooled, a loss no longer touches it.
         let weak = Arc::downgrade(&live);
+        let exchange = exchange.clone();
         tokio::spawn(async move {
             if sender.ready().await.is_ok()
+                && let Some(driver) = exchange.release_origin()
                 && let Some(live) = weak.upgrade().filter(|l| l.has_port(port))
             {
-                live.pool.put(port, sender);
+                live.pool.put(port, OriginConn { sender, driver });
             }
         });
     }
@@ -169,9 +208,11 @@ pub async fn forward(
             let origin_upgrade = hyper::upgrade::on(&mut resp);
             let reply = upgrade_response(kind, resp.headers());
             let splice_tunnel = tunnel.id.clone();
-            let state = state.clone();
+            let exchange = exchange.clone();
+            let alive = alive.clone();
             tokio::spawn(async move {
                 let _guard = guard;
+                let _alive = alive;
                 let splice = async {
                     let (visitor, origin) = match tokio::try_join!(visitor_upgrade, origin_upgrade) {
                         Ok(pair) => pair,
@@ -180,8 +221,8 @@ pub async fn forward(
                             return;
                         }
                     };
-                    let mut visitor = TokioIo::new(visitor);
-                    let mut origin = TokioIo::new(origin);
+                    let mut visitor = Gated { io: TokioIo::new(visitor), exchange: &exchange, side: Side::ToVisitor };
+                    let mut origin = Gated { io: TokioIo::new(origin), exchange: &exchange, side: Side::ToOrigin };
                     match tokio::io::copy_bidirectional(&mut visitor, &mut origin).await {
                         Ok((to_origin, to_visitor)) => {
                             bytes.bytes_in.fetch_add(to_origin, Ordering::Relaxed);
@@ -190,10 +231,8 @@ pub async fn forward(
                         Err(e) => tracing::debug!(tunnel = %splice_tunnel, error = %e, "websocket splice ended"),
                     }
                 };
-                if let Some(grant) = authorization {
-                    splice_with_authorization(&state, &splice_tunnel, grant, splice).await;
-                } else {
-                    splice.await;
+                if guarded(&exchange, splice).await.is_none() {
+                    tracing::debug!(tunnel = %splice_tunnel, "access ended; closing websocket");
                 }
             });
             return reply;
@@ -215,7 +254,12 @@ pub async fn forward(
     let ctx = ResponseCtx { zone: &cfg.preview_zone, tunnel_id: &tunnel.id, frame_ancestors: &cfg.frame_ancestors };
     headers::rewrite_response(&mut parts.headers, &ctx, hash.as_deref());
 
-    let counted = Counted { inner: incoming(body), bytes, outbound: true, _guard: Some(guard) }.boxed();
+    let origin_body = incoming(body);
+    // An empty body has nothing left to cut; anything else is relayed under
+    // the watch, the slot kept in the exchange until hyper drops the body.
+    let watched = alive.as_ref().filter(|_| !origin_body.is_end_stream());
+    let (body_guard, relay_guard) = if watched.is_some() { (None, Some(guard)) } else { (Some(guard), None) };
+    let counted = Counted { inner: origin_body, bytes, outbound: true, _guard: body_guard }.boxed();
     let body = match script {
         Some(s) => {
             parts.headers.remove(header::CONTENT_LENGTH);
@@ -228,41 +272,94 @@ pub async fn forward(
         }
         None => counted,
     };
+    // Outermost, so nothing buffered upstream (the injector's look-ahead
+    // included) reaches the visitor while the watch rechecks.
+    let body = match watched {
+        Some(alive) => {
+            let mut slot = exchange.lock_response();
+            // Checked under the slot's lock: a loss either happened before
+            // (and is answered here) or takes what is stored now.
+            if exchange.cut.is_cancelled() {
+                return pages::unauthorized();
+            }
+            *slot = Relaying { body: Some(body), _guard: relay_guard };
+            drop(slot);
+            Relayed { exchange: exchange.clone(), done: false, held: None, _alive: alive.clone() }.boxed()
+        }
+        None => body,
+    };
     Response::from_parts(parts, body)
 }
 
-async fn splice_with_authorization(
-    state: &AppState,
-    tunnel_id: &str,
-    mut grant: crate::gate::Authorization,
-    splice: impl std::future::Future<Output = ()>,
-) {
-    tokio::pin!(splice);
-    loop {
-        let expiry = async {
-            match grant.expires_at {
-                Some(expires_at) => {
-                    let remaining = expires_at.saturating_sub(crate::tokens::now()).max(0) as u64;
-                    tokio::time::sleep(Duration::from_secs(remaining)).await;
-                }
-                None => std::future::pending::<()>().await,
+/// Run `inner` as part of `exchange`: paused while its watch rechecks,
+/// abandoned (`None`) once access is lost. Unwatched, just `inner`. Its
+/// output is checked again once it is ready, so a rotation during that poll
+/// holds it until the verdict.
+async fn guarded<F: std::future::Future>(exchange: &Exchange, inner: F) -> Option<F::Output> {
+    tokio::pin!(inner);
+    let mut output = None;
+    std::future::poll_fn(|cx| {
+        loop {
+            if exchange.rechecking.poll_idle(Side::Driver, cx).is_pending() {
+                return Poll::Pending;
             }
-        };
-        tokio::select! {
-            biased;
-            _ = grant.cancel.cancelled() => {
-                match crate::gate::reauthorize(state, tunnel_id, grant.session_hash.as_deref()).await {
-                    Ok(Some(current)) => grant = current,
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!(tunnel = tunnel_id, error = %e, "websocket reauthorization failed");
-                        break;
-                    }
-                }
+            if exchange.cut.is_cancelled() {
+                return Poll::Ready(None);
             }
-            _ = expiry => break,
-            _ = &mut splice => break,
+            if output.is_some() {
+                return Poll::Ready(output.take());
+            }
+            output = Some(std::task::ready!(inner.as_mut().poll(cx)));
         }
+    })
+    .await
+}
+
+/// One direction of a WebSocket splice: every write (and the final
+/// shutdown) waits for the watch's verdict and fails once access is lost, so
+/// bytes read before a rotation are not written after it.
+struct Gated<'a, T> {
+    io: T,
+    exchange: &'a Exchange,
+    /// The side whose waker this writer registers.
+    side: Side,
+}
+
+impl<T: Unpin> Gated<'_, T> {
+    fn poll_gate(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.exchange.rechecking.poll_idle(self.side, cx).is_pending() {
+            return Poll::Pending;
+        }
+        if self.exchange.cut.is_cancelled() {
+            return Poll::Ready(Err(std::io::Error::other(ACCESS_ENDED)));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Gated<'_, T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Gated<'_, T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        std::task::ready!(self.poll_gate(cx))?;
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        std::task::ready!(self.poll_gate(cx))?;
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
@@ -419,7 +516,7 @@ enum SendFail {
 // The error is an HTTP response returned directly to the visitor; boxing would
 // allocate only to immediately unbox it at the call site.
 #[allow(clippy::result_large_err)]
-async fn origin_conn(live: &LiveTunnel, port: u16, tunnel_id: &str) -> Result<SendRequest<Body>, Response<Body>> {
+async fn origin_conn(live: &LiveTunnel, port: u16, tunnel_id: &str) -> Result<OriginConn, Response<Body>> {
     let stream = match tokio::time::timeout(STREAM_OPEN_TIMEOUT, open_stream(live, port)).await {
         Ok(Opened::Ready(s)) => s,
         Ok(Opened::Refused) => return Err(pages::app_not_running(port)),
@@ -433,12 +530,13 @@ async fn origin_conn(live: &LiveTunnel, port: u16, tunnel_id: &str) -> Result<Se
         }
     };
     let conn_tunnel = tunnel_id.to_string();
-    tokio::spawn(async move {
+    let driver = tokio::spawn(async move {
         if let Err(e) = conn.with_upgrades().await {
             tracing::debug!(tunnel = %conn_tunnel, error = %e, "origin connection error");
         }
-    });
-    Ok(sender)
+    })
+    .abort_handle();
+    Ok(OriginConn { sender, driver })
 }
 
 enum Opened {
@@ -487,6 +585,266 @@ impl Drop for StreamGuard {
     fn drop(&mut self) {
         self.0.metrics.live_streams.fetch_sub(1, Ordering::Relaxed);
         self.1.streams.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+const ACCESS_ENDED: &str = "visitor access ended";
+
+/// What one proxied exchange shares with its watch task (see [`forward`]).
+#[derive(Default)]
+struct Exchange {
+    /// Cancelled at a loss, before `rechecking` ends and wakes every side.
+    cut: tokio_util::sync::CancellationToken,
+    rechecking: Rechecking,
+    /// The response body and stream slot while [`Relayed`] owes them to the
+    /// visitor; the watch takes the body at a loss.
+    response: std::sync::Mutex<Relaying>,
+    /// The task driving this exchange's origin connection until it is back
+    /// in the pool; aborted at a loss, which drops the origin stream and the
+    /// request body even when the origin stopped reading the upload.
+    origin: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+#[derive(Default)]
+struct Relaying {
+    body: Option<Body>,
+    /// Released with the slot when hyper drops [`Relayed`], also after a loss:
+    /// hyper may still hold a frame for a visitor that grants no window, and
+    /// such lingering streams stay bounded by [`MAX_STREAMS_PER_TUNNEL`].
+    _guard: Option<StreamGuard>,
+}
+
+impl Exchange {
+    fn lock_response(&self) -> std::sync::MutexGuard<'_, Relaying> {
+        self.response.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_origin(&self) -> std::sync::MutexGuard<'_, Option<tokio::task::AbortHandle>> {
+        self.origin.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Make `conn` this exchange's origin connection (aborted at once if
+    /// access is already lost) and hand back its sender.
+    fn hold_origin(&self, conn: OriginConn) -> hyper::client::conn::http1::SendRequest<Body> {
+        let mut origin = self.lock_origin();
+        // Checked under the lock `lose` takes after cancelling `cut`.
+        if self.cut.is_cancelled() {
+            conn.driver.abort();
+        } else if let Some(previous) = origin.replace(conn.driver) {
+            previous.abort();
+        }
+        conn.sender
+    }
+
+    /// The origin connection's driver, for pooling; `None` once a loss
+    /// aborted it.
+    fn release_origin(&self) -> Option<tokio::task::AbortHandle> {
+        self.lock_origin().take()
+    }
+
+    /// Access is lost: mark it, release the origin stream and connection now
+    /// (whether or not the visitor is reading or the origin reading the
+    /// upload), then wake every side. The slot stays until hyper drops
+    /// [`Relayed`].
+    fn lose(&self) {
+        self.cut.cancel();
+        let released = self.lock_response().body.take();
+        drop(released);
+        if let Some(driver) = self.release_origin() {
+            driver.abort();
+        }
+        self.rechecking.finish_lost();
+    }
+}
+
+/// Keeps an exchange's watch task running; it ends once every clone is gone.
+type Alive = tokio::sync::mpsc::Sender<()>;
+
+/// Watch `grant` in a task of its own, so enforcement never depends on the
+/// visitor reading or the origin sending. It lives as long as any part of the
+/// exchange holds the returned [`Alive`], so a finished response cannot leave
+/// an upload unwatched, and nothing outlives the exchange.
+fn spawn_watch(
+    state: &Arc<AppState>,
+    tunnel_id: &str,
+    grant: crate::gate::Authorization,
+    exchange: Arc<Exchange>,
+) -> Alive {
+    let (alive, mut gone) = tokio::sync::mpsc::channel::<()>(1);
+    // Before the task first runs, so a rotation right now already pauses.
+    exchange.rechecking.follow(&grant.cancel);
+    let state = state.clone();
+    let tunnel_id = tunnel_id.to_string();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = crate::gate::watch(&state, &tunnel_id, grant, &exchange.rechecking) => {
+                exchange.lose();
+                crate::metrics::Metrics::inc(&state.metrics.access_cuts);
+            }
+            // Nothing is ever sent: `None` once every `Alive` is dropped.
+            _ = gone.recv() => {}
+        }
+    });
+    alive
+}
+
+/// The visitor's request body: paused while the watch rechecks, failing once
+/// access is lost, which aborts the origin exchange so the sandbox can tell a
+/// cut upload from a complete one.
+struct Revocable {
+    inner: Option<Body>,
+    /// A result polled while a rotation landed, held until the verdict.
+    held: Option<Option<Result<Frame<Bytes>, BoxError>>>,
+    exchange: Arc<Exchange>,
+    _alive: Alive,
+}
+
+impl HttpBody for Revocable {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        loop {
+            if this.inner.is_none() {
+                return Poll::Ready(None);
+            }
+            // Registered on every poll, so a loss wakes this side even while
+            // it waits on the visitor.
+            if this.exchange.rechecking.poll_idle(Side::ToOrigin, cx).is_pending() {
+                return Poll::Pending;
+            }
+            if this.exchange.cut.is_cancelled() {
+                this.inner = None;
+                this.held = None;
+                return Poll::Ready(Some(Err(ACCESS_ENDED.into())));
+            }
+            // Checked again after the poll that produced it (the loop).
+            if let Some(polled) = this.held.take() {
+                if polled.is_none() {
+                    this.inner = None;
+                }
+                return Poll::Ready(polled);
+            }
+            let inner = this.inner.as_mut().expect("checked above");
+            this.held = Some(std::task::ready!(Pin::new(inner).poll_frame(cx)));
+        }
+    }
+
+    /// Hyper may finish the upload on this alone, without polling again, so
+    /// an end counts only while the grant stands (as a polled one does).
+    fn is_end_stream(&self) -> bool {
+        match &self.inner {
+            None => true,
+            Some(inner) => {
+                self.held.is_none()
+                    && inner.is_end_stream()
+                    && !self.exchange.cut.is_cancelled()
+                    && self.exchange.rechecking.is_settled()
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.inner {
+            Some(inner) => with_held(inner.size_hint(), &self.held),
+            None => SizeHint::with_exact(0),
+        }
+    }
+}
+
+/// `hint` for what is still to be polled, plus a data frame `held` back.
+fn with_held(mut hint: SizeHint, held: &Option<Option<Result<Frame<Bytes>, BoxError>>>) -> SizeHint {
+    if let Some(Some(Ok(frame))) = held
+        && let Some(data) = frame.data_ref()
+    {
+        let len = data.len() as u64;
+        // Upper first, so the bounds never cross.
+        if let Some(upper) = hint.upper() {
+            hint.set_upper(upper.saturating_add(len));
+        }
+        hint.set_lower(hint.lower().saturating_add(len));
+    }
+    hint
+}
+
+/// The response body toward the visitor, read from the exchange's slot. It
+/// relays nothing while the watch rechecks and fails (aborting the visitor's
+/// connection or stream) instead of ending cleanly once access is lost; the
+/// watch has then already released the origin stream. Either way it keeps the
+/// slot until hyper drops it, as an unwatched body would.
+struct Relayed {
+    exchange: Arc<Exchange>,
+    done: bool,
+    /// A result polled while a rotation landed, held until the verdict.
+    held: Option<Option<Result<Frame<Bytes>, BoxError>>>,
+    _alive: Alive,
+}
+
+impl HttpBody for Relayed {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        loop {
+            if this.done {
+                return Poll::Ready(None);
+            }
+            if this.exchange.rechecking.poll_idle(Side::ToVisitor, cx).is_pending() {
+                return Poll::Pending;
+            }
+            // `lose` cancels `cut` before it empties the slot.
+            if this.exchange.cut.is_cancelled() {
+                this.done = true;
+                this.held = None;
+                return Poll::Ready(Some(Err(ACCESS_ENDED.into())));
+            }
+            // Checked again after the poll that produced it (the loop), so a
+            // rotation during that poll holds the frame or the end.
+            if let Some(polled) = this.held.take() {
+                match &polled {
+                    None => {
+                        this.done = true;
+                        // The origin stream is finished; the slot stays until drop.
+                        let finished = this.exchange.lock_response().body.take();
+                        drop(finished);
+                    }
+                    Some(Err(_)) => this.done = true,
+                    Some(Ok(_)) => {}
+                }
+                return Poll::Ready(polled);
+            }
+            let mut slot = this.exchange.lock_response();
+            let Some(body) = slot.body.as_mut() else {
+                this.done = true;
+                return Poll::Ready(Some(Err(ACCESS_ENDED.into())));
+            };
+            let polled = std::task::ready!(Pin::new(body).poll_frame(cx));
+            drop(slot);
+            this.held = Some(polled);
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.done {
+            return SizeHint::with_exact(0);
+        }
+        // Unknown once a loss took the body: hyper must not encode a cut
+        // response as a complete empty one (`Content-Length: 0`).
+        let hint = self.exchange.lock_response().body.as_ref().map(HttpBody::size_hint).unwrap_or_default();
+        with_held(hint, &self.held)
+    }
+}
+
+impl Drop for Relayed {
+    fn drop(&mut self) {
+        let released = std::mem::take(&mut *self.exchange.lock_response());
+        drop(released);
     }
 }
 
@@ -559,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_splice_watches_rotated_epochs_until_access_becomes_protected() {
+    async fn public_watch_follows_rotated_epochs_until_access_becomes_protected() {
         use crate::db::{Access, AccessMode, TunnelPatch};
         use crate::gate::Authorization;
 
@@ -582,14 +940,24 @@ mod tests {
                 token_hash: String::new(),
             }));
             state.tunnel(&tunnel.id).await.unwrap();
-            let grant =
-                Authorization { session_hash: None, expires_at: None, cancel: state.registry.gate_epoch(&tunnel.id) };
+            let grant = Authorization {
+                session_hash: None,
+                candidates: Default::default(),
+                expires_at: None,
+                cancel: state.registry.gate_epoch(&tunnel.id),
+            };
             let (mut visitor, mut origin) = tokio::io::duplex(64);
             let splice = async move {
                 let mut byte = [0];
                 let _ = origin.read(&mut byte).await;
             };
-            let watched = splice_with_authorization(&state, &tunnel.id, grant, splice);
+            let rechecking = Rechecking::default();
+            let watched = async {
+                tokio::select! {
+                    () = crate::gate::watch(&state, &tunnel.id, grant, &rechecking) => {}
+                    () = splice => {}
+                }
+            };
             tokio::pin!(watched);
             assert!(futures_util::poll!(&mut watched).is_pending());
             // A rotation that leaves the tunnel public must retain the splice
@@ -624,6 +992,321 @@ mod tests {
                 0
             );
         }
+    }
+
+    fn data(frame: Option<Result<Frame<Bytes>, BoxError>>) -> Bytes {
+        frame.expect("a frame").expect("not an error").into_data().expect("data")
+    }
+
+    /// A body fed by the returned sender, one chunk per frame.
+    fn fed() -> (tokio::sync::mpsc::Sender<Bytes>, Body) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let body = http_body_util::StreamBody::new(futures_util::stream::unfold(rx, |mut rx| async {
+            let chunk = rx.recv().await?;
+            Some((Ok::<_, BoxError>(Frame::data(chunk)), rx))
+        }))
+        .boxed();
+        (tx, body)
+    }
+
+    #[tokio::test]
+    async fn relayed_pauses_during_a_recheck_and_never_fakes_an_end() {
+        let relayed = |body| {
+            let exchange = Arc::new(Exchange::default());
+            *exchange.lock_response() = Relaying { body: Some(body), _guard: None };
+            let (alive, _) = tokio::sync::mpsc::channel(1);
+            (exchange.clone(), Relayed { exchange, done: false, held: None, _alive: alive })
+        };
+        let (tx, body) = fed();
+        let (exchange, mut body) = relayed(body);
+        tx.send(Bytes::from_static(b"one")).await.unwrap();
+        assert_eq!(data(body.frame().await), &b"one"[..]);
+        tx.send(Bytes::from_static(b"ready")).await.unwrap();
+        exchange.rechecking.start();
+        assert!(futures_util::poll!(body.frame()).is_pending(), "relayed during the recheck");
+        exchange.rechecking.end();
+        assert_eq!(data(body.frame().await), &b"ready"[..]);
+
+        // Waiting on the origin, then lost: woken, and a failure, not an end.
+        tx.send(Bytes::from_static(b"late")).await.unwrap();
+        let waiting = tokio::spawn(async move {
+            let first = body.frame().await.map(|f| f.is_err());
+            (first, body.frame().await.is_none(), body)
+        });
+        exchange.rechecking.start();
+        tokio::task::yield_now().await;
+        exchange.lose();
+        let (first, then_none, body) =
+            tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("woken at the loss").unwrap();
+        assert_eq!(first, Some(true), "the frame ready at the loss must not be relayed");
+        assert!(then_none);
+        assert!(exchange.lock_response().body.is_none(), "the loss releases the origin body");
+        assert!(tx.is_closed());
+        drop(body);
+
+        // A rotated epoch pauses at once, before any recheck has started.
+        let (tx, body) = fed();
+        let (exchange, mut body) = relayed(body);
+        let epoch = tokio_util::sync::CancellationToken::new();
+        exchange.rechecking.follow(&epoch);
+        tx.send(Bytes::from_static(b"rotated")).await.unwrap();
+        epoch.cancel();
+        assert!(futures_util::poll!(body.frame()).is_pending(), "relayed after the rotation, before a verdict");
+        exchange.rechecking.follow(&tokio_util::sync::CancellationToken::new());
+        exchange.rechecking.end();
+        assert_eq!(data(body.frame().await), &b"rotated"[..]);
+        drop(body);
+
+        // Only the origin's own end is clean.
+        let (tx, body) = fed();
+        let (exchange, mut body) = relayed(body);
+        drop(tx);
+        assert!(body.frame().await.is_none());
+        drop(body);
+        assert!(exchange.lock_response().body.is_none(), "dropping the body empties the slot");
+    }
+
+    /// Rotates `epoch` while producing its one result, as a revocation on
+    /// another worker can in the middle of a poll.
+    struct RotatingBody(tokio_util::sync::CancellationToken, Option<Option<Result<Frame<Bytes>, BoxError>>>);
+
+    impl HttpBody for RotatingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            self.0.cancel();
+            Poll::Ready(self.1.take().unwrap_or(None))
+        }
+
+        // A fixed length: what is left to produce.
+        fn size_hint(&self) -> SizeHint {
+            let left = match &self.1 {
+                Some(Some(Ok(frame))) => frame.data_ref().map_or(0, |d| d.len() as u64),
+                _ => 0,
+            };
+            SizeHint::with_exact(left)
+        }
+    }
+
+    /// The verdict after a rotation: kept (a new epoch, recheck passed) or lost.
+    fn settle(exchange: &Exchange, keep: bool) {
+        if keep {
+            exchange.rechecking.follow(&tokio_util::sync::CancellationToken::new());
+            exchange.rechecking.end();
+        } else {
+            exchange.lose();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_during_a_poll_holds_its_result_until_the_verdict() {
+        for keep in [true, false] {
+            for end in [false, true] {
+                let result = || if end { None } else { Some(Ok(Frame::data(Bytes::from_static(b"x")))) };
+                let check = |got: Option<Result<Frame<Bytes>, BoxError>>| match (keep, end, got) {
+                    (true, true, None) => {}
+                    (true, false, Some(Ok(f))) => assert_eq!(f.into_data().unwrap(), &b"x"[..]),
+                    (false, _, Some(Err(_))) => {}
+                    (keep, end, got) => panic!("keep={keep} end={end}: {:?}", got.map(|r| r.is_ok())),
+                };
+
+                // Toward the visitor.
+                let exchange = Arc::new(Exchange::default());
+                let epoch = tokio_util::sync::CancellationToken::new();
+                exchange.rechecking.follow(&epoch);
+                *exchange.lock_response() =
+                    Relaying { body: Some(RotatingBody(epoch, Some(result())).boxed()), _guard: None };
+                let (alive, _) = tokio::sync::mpsc::channel(1);
+                let mut body = Relayed { exchange: exchange.clone(), done: false, held: None, _alive: alive };
+                assert!(futures_util::poll!(body.frame()).is_pending(), "relayed what a rotation's poll produced");
+                assert_eq!(body.size_hint().exact(), Some(u64::from(!end)), "a held frame is still owed");
+                settle(&exchange, keep);
+                check(body.frame().await);
+
+                // Toward the origin.
+                let exchange = Arc::new(Exchange::default());
+                let epoch = tokio_util::sync::CancellationToken::new();
+                exchange.rechecking.follow(&epoch);
+                let (alive, _) = tokio::sync::mpsc::channel(1);
+                let inner = RotatingBody(epoch, Some(result())).boxed();
+                let mut body = Revocable { inner: Some(inner), held: None, exchange: exchange.clone(), _alive: alive };
+                assert!(futures_util::poll!(body.frame()).is_pending(), "uploaded what a rotation's poll produced");
+                assert!(!body.is_end_stream(), "a held result is not the end yet");
+                assert_eq!(body.size_hint().exact(), Some(u64::from(!end)), "a held frame is still owed");
+                settle(&exchange, keep);
+                check(body.frame().await);
+            }
+
+            // The request driver (origin connect, headers).
+            let exchange = Arc::new(Exchange::default());
+            let epoch = tokio_util::sync::CancellationToken::new();
+            exchange.rechecking.follow(&epoch);
+            let mut driven = Box::pin(guarded(&exchange, async {
+                epoch.cancel();
+                7
+            }));
+            assert!(futures_util::poll!(driven.as_mut()).is_pending(), "answered from a rotation's poll");
+            settle(&exchange, keep);
+            assert_eq!(driven.await, keep.then_some(7));
+
+            // A WebSocket direction: read before a rotation, never written after it.
+            let exchange = Arc::new(Exchange::default());
+            let epoch = tokio_util::sync::CancellationToken::new();
+            exchange.rechecking.follow(&epoch);
+            let (mut far, near) = tokio::io::duplex(64);
+            let source = futures_util::stream::once(async {
+                epoch.cancel();
+                Ok::<_, std::io::Error>(Bytes::from_static(b"x"))
+            });
+            let mut source = tokio_util::io::StreamReader::new(Box::pin(source));
+            let mut dest = Gated { io: near, exchange: &exchange, side: Side::ToVisitor };
+            let mut copy = Box::pin(tokio::io::copy(&mut source, &mut dest));
+            assert!(futures_util::poll!(copy.as_mut()).is_pending());
+            settle(&exchange, keep);
+            assert_eq!(copy.await.is_ok(), keep);
+            drop(dest);
+            let mut seen = Vec::new();
+            far.read_to_end(&mut seen).await.unwrap();
+            assert_eq!(seen, if keep { &b"x"[..] } else { &b""[..] }, "keep={keep}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upload_end_is_not_reported_while_a_rotation_awaits_its_verdict() {
+        for keep in [true, false] {
+            let exchange = Arc::new(Exchange::default());
+            let epoch = tokio_util::sync::CancellationToken::new();
+            exchange.rechecking.follow(&epoch);
+            let (alive, _) = tokio::sync::mpsc::channel(1);
+            let inner = http_body_util::Full::new(Bytes::from_static(b"last")).map_err(BoxError::from).boxed();
+            let mut body = Revocable { inner: Some(inner), held: None, exchange: exchange.clone(), _alive: alive };
+            assert_eq!(data(body.frame().await), &b"last"[..]);
+            assert!(body.is_end_stream(), "an upload whose grant stands ends with its last frame");
+            // Rotated after the last frame went out, before hyper asks.
+            epoch.cancel();
+            assert!(!body.is_end_stream(), "upload end reported before the verdict");
+            settle(&exchange, keep);
+            if keep {
+                assert!(body.is_end_stream());
+                assert!(body.frame().await.is_none());
+            } else {
+                assert!(!body.is_end_stream());
+                assert!(matches!(body.frame().await, Some(Err(_))), "a cut upload must not end cleanly");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_lost_before_its_head_is_encoded_never_looks_complete() {
+        // Lost between `forward` installing the body and hyper encoding the
+        // response head.
+        let lost = || {
+            let exchange = Arc::new(Exchange::default());
+            let (_tx, body) = fed();
+            *exchange.lock_response() = Relaying { body: Some(body), _guard: None };
+            exchange.lose();
+            let (alive, _) = tokio::sync::mpsc::channel(1);
+            Relayed { exchange, done: false, held: None, _alive: alive }
+        };
+        let body = lost();
+        assert_eq!(body.size_hint().exact(), None, "a cut body has no known length");
+        assert!(!body.is_end_stream());
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |_req| {
+                let body = lost().boxed();
+                async move { Ok::<_, std::convert::Infallible>(Response::new(body)) }
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), svc).await;
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client)).await.unwrap();
+        tokio::spawn(connection);
+        let complete = match sender.send_request(Request::new(empty())).await {
+            Err(_) => false,
+            Ok(resp) => {
+                assert_ne!(resp.headers().get(header::CONTENT_LENGTH).map(|v| v.as_bytes()), Some(&b"0"[..]));
+                tokio::time::timeout(Duration::from_secs(5), resp.into_body().collect()).await.expect("ends").is_ok()
+            }
+        };
+        assert!(!complete, "a cut response must not reach the visitor as a complete empty one");
+    }
+
+    #[tokio::test]
+    async fn revocable_upload_pauses_during_a_recheck_and_wakes_to_fail_at_a_loss() {
+        let (tx, inner) = fed();
+        let exchange = Arc::new(Exchange::default());
+        let (alive, _) = tokio::sync::mpsc::channel(1);
+        let mut body = Revocable { inner: Some(inner), held: None, exchange: exchange.clone(), _alive: alive };
+        tx.send(Bytes::from_static(b"one")).await.unwrap();
+        assert_eq!(data(body.frame().await), &b"one"[..]);
+        tx.send(Bytes::from_static(b"during")).await.unwrap();
+        exchange.rechecking.start();
+        assert!(futures_util::poll!(body.frame()).is_pending(), "upload relayed during the recheck");
+        exchange.rechecking.end();
+        assert_eq!(data(body.frame().await), &b"during"[..]);
+
+        // Idle (waiting on the visitor), then lost: it must wake and fail.
+        let waiting = tokio::spawn(async move { body.frame().await.map(|f| f.is_err()) });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished());
+        exchange.lose();
+        let ended = tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("woken at the loss").unwrap();
+        assert_eq!(ended, Some(true));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn watch_task_lives_exactly_as_long_as_the_exchange() {
+        let state = crate::listener::tests::test_state(&[]);
+        let tunnel = crate::listener::tests::create_tunnel(&state, crate::db::AccessMode::Public).await;
+        let (transport, _peer) = tokio::io::duplex(64);
+        let session = tunnel_protocol::mux::Session::new_server(transport);
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel(1);
+        state.registry.insert(Arc::new(LiveTunnel {
+            conn_id: 1,
+            tunnel_id: tunnel.id.clone(),
+            control: session.control(),
+            ports: Default::default(),
+            ctrl_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            connected_at: crate::tokens::now(),
+            streams: Default::default(),
+            pool: Default::default(),
+            token_hash: String::new(),
+        }));
+        let grant = || crate::gate::Authorization {
+            session_hash: None,
+            candidates: Default::default(),
+            expires_at: None,
+            cancel: state.registry.gate_epoch(&tunnel.id),
+        };
+        // Every holder gone: the task ends without a loss.
+        let exchange = Arc::new(Exchange::default());
+        let alive = spawn_watch(&state, &tunnel.id, grant(), exchange.clone());
+        let held = alive.clone();
+        drop(alive);
+        tokio::task::yield_now().await;
+        assert!(!held.is_closed(), "a holder keeps the watch running");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&exchange) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch task ended with its exchange");
+        assert!(!exchange.cut.is_cancelled());
+
+        // A loss while held: cut, and the task ends.
+        let exchange = Arc::new(Exchange::default());
+        let alive = spawn_watch(&state, &tunnel.id, grant(), exchange.clone());
+        state.registry.remove(&tunnel.id);
+        tokio::time::timeout(Duration::from_secs(5), exchange.cut.cancelled()).await.expect("lost");
+        tokio::time::timeout(Duration::from_secs(5), alive.closed()).await.expect("watch task ended at the loss");
     }
 
     #[test]

@@ -3,7 +3,12 @@
 //! `gatehost`), never on a preview origin a preview app could control.
 
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
+use futures_util::task::AtomicWaker;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Response, StatusCode};
 use tunnel_protocol::{ACCESS_TOKEN_PREFIX, GATE_COOKIE};
@@ -83,8 +88,13 @@ fn session_hashes(values: &[String]) -> Vec<String> {
 
 /// A gate grant or public access, with the epoch captured before its lookup.
 pub struct Authorization {
-    /// An upgrade's original session, retained if the tunnel becomes public.
+    /// The session granting access (or, for an upgrade, its original session,
+    /// retained if the tunnel becomes public).
     pub session_hash: Option<String>,
+    /// Every plausible session the request presented (hashed). A recheck
+    /// accepts any of them, so losing one session does not end a request that
+    /// another presented session still authorizes. Empty for public access.
+    pub candidates: Arc<[String]>,
     /// Public access has no session deadline.
     pub expires_at: Option<i64>,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -100,25 +110,26 @@ pub async fn authorize(
     upgrade: bool,
 ) -> anyhow::Result<Option<Authorization>> {
     let cancel = state.registry.gate_epoch(tunnel_id);
-    let hashes = session_hashes(values);
+    let hashes: Arc<[String]> = session_hashes(values).into();
     if hashes.is_empty() {
         return Ok(None);
     }
     let (hits, misses) = state.cached_session_grants(&hashes);
-    if !upgrade && let Some(cached) = longest_authorization(tunnel_id, hits.iter().cloned(), cancel.clone()) {
+    if !upgrade && let Some(cached) = longest_authorization(tunnel_id, hits.iter().cloned(), &hashes, cancel.clone()) {
         return Ok(Some(cached));
     }
     let loaded = state.load_session_grants(misses).await?;
-    Ok(longest_authorization(tunnel_id, hits.into_iter().chain(loaded), cancel))
+    Ok(longest_authorization(tunnel_id, hits.into_iter().chain(loaded), &hashes, cancel))
 }
 
-/// Recheck the current access mode, then this upgrade's own session after a
-/// gate epoch rotation. Public access needs no session or expiry. Loading
-/// grants directly bypasses cached sessions and captures concurrent rotations.
+/// Recheck the current access mode, then the sessions `previous` presented,
+/// after a gate epoch rotation or at its expiry. Public access needs no session
+/// or expiry. Loading grants directly bypasses cached sessions and captures
+/// concurrent rotations.
 pub async fn reauthorize(
     state: &AppState,
     tunnel_id: &str,
-    session_hash: Option<&str>,
+    previous: &Authorization,
 ) -> anyhow::Result<Option<Authorization>> {
     let cancel = state.registry.gate_epoch(tunnel_id);
     if cancel.is_cancelled() {
@@ -132,18 +143,190 @@ pub async fn reauthorize(
         return Ok(None);
     }
     if tunnel.access.mode == crate::db::AccessMode::Public {
-        return Ok(Some(Authorization { session_hash: session_hash.map(str::to_string), expires_at: None, cancel }));
+        return Ok(Some(Authorization {
+            session_hash: previous.session_hash.clone(),
+            candidates: previous.candidates.clone(),
+            expires_at: None,
+            cancel,
+        }));
     }
-    let Some(session_hash) = session_hash else {
-        return Ok(None);
-    };
-    let grants = state.load_session_grants(vec![session_hash.to_string()]).await?;
-    Ok(longest_authorization(tunnel_id, grants, cancel))
+    let grants = state.load_session_grants(previous.candidates.to_vec()).await?;
+    Ok(longest_authorization(tunnel_id, grants, &previous.candidates, cancel))
+}
+
+/// Whether a [`watch`] has a verdict for its grant. What the watch guards
+/// relays nothing while a recheck runs, and already from the moment the
+/// grant's gate epoch is rotated (before the watch task gets to run), so a
+/// revocation pauses every side at once. Each side registers a waker to
+/// resume when the recheck passes or the grant is lost.
+#[derive(Default)]
+pub struct Rechecking {
+    active: AtomicBool,
+    lost: AtomicBool,
+    /// The epoch of the grant currently in force.
+    epoch: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    to_visitor: AtomicWaker,
+    to_origin: AtomicWaker,
+    driver: AtomicWaker,
+}
+
+/// Which part of an exchange waits for a recheck to end. Each is polled by
+/// one task at a time.
+#[derive(Clone, Copy)]
+pub enum Side {
+    /// The response body toward the visitor.
+    ToVisitor,
+    /// The request body toward the origin.
+    ToOrigin,
+    /// The request itself until the origin answers, then a WebSocket splice.
+    Driver,
+}
+
+impl Rechecking {
+    /// No verdict is pending: no recheck runs and the grant's epoch stands.
+    pub(crate) fn is_settled(&self) -> bool {
+        if self.active.load(Ordering::Acquire) {
+            return false;
+        }
+        let epoch = self.epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        !epoch.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+
+    pub(crate) fn start(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// The grant in force now has this epoch.
+    pub(crate) fn follow(&self, epoch: &tokio_util::sync::CancellationToken) {
+        *self.epoch.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(epoch.clone());
+    }
+
+    fn wake_all(&self) {
+        self.to_visitor.wake();
+        self.to_origin.wake();
+        self.driver.wake();
+    }
+
+    /// A recheck passed: resume every side.
+    pub(crate) fn end(&self) {
+        self.active.store(false, Ordering::Release);
+        self.wake_all();
+    }
+
+    /// Access is lost: release every side (to fail) for good. The caller
+    /// marks the loss itself first.
+    pub fn finish_lost(&self) {
+        self.lost.store(true, Ordering::Release);
+        self.active.store(false, Ordering::Release);
+        self.wake_all();
+    }
+
+    /// Ready when a side may proceed: the grant stands, or it is lost (the
+    /// side then fails). `side` is registered on every poll, so it is woken
+    /// both when a recheck passes and at a loss.
+    pub fn poll_idle(&self, side: Side, cx: &mut Context<'_>) -> Poll<()> {
+        match side {
+            Side::ToVisitor => self.to_visitor.register(cx.waker()),
+            Side::ToOrigin => self.to_origin.register(cx.waker()),
+            Side::Driver => self.driver.register(cx.waker()),
+        }
+        // Checked after registering so a wake in between is not missed.
+        if self.lost.load(Ordering::Acquire) || self.is_settled() { Poll::Ready(()) } else { Poll::Pending }
+    }
+}
+
+/// Upper bound for one recheck; a recheck that cannot finish fails closed.
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause before retrying a recheck whose lookup was shed.
+const RECHECK_RETRY: Duration = Duration::from_millis(50);
+
+/// Resolves once `grant` no longer authorizes its holder: its gate epoch was
+/// rotated (a link or session revoked, access changed, the tunnel closed,
+/// deleted or replaced) and a recheck of the sessions it presented failed, or
+/// its grant expired without the recheck finding a later one. Every proxied
+/// request and WebSocket races its stream against this, so revocation and
+/// expiry end responses that are already streaming, not only new requests.
+///
+/// `rechecking` holds the verdict state; what the watch guards must not relay
+/// anything until a verdict follows a rotation (see `proxy`), so a revoked
+/// visitor receives nothing new after the revocation. On loss it returns with
+/// the recheck pending; the caller marks the loss and then calls
+/// [`Rechecking::finish_lost`]. The
+/// expiry deadline is taken on tokio's clock when a grant is (re)loaded, so
+/// paused-time tests reach it deterministically.
+pub async fn watch(state: &AppState, tunnel_id: &str, mut grant: Authorization, rechecking: &Rechecking) {
+    rechecking.follow(&grant.cancel);
+    let mut deadline = expiry_deadline(grant.expires_at);
+    loop {
+        let expiry = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let expired = tokio::select! {
+            biased;
+            _ = grant.cancel.cancelled() => false,
+            _ = expiry => true,
+        };
+        rechecking.start();
+        // Lookups shed under load are retried: a busy server must not cut a
+        // visitor who is still authorized, and the timeout still fails closed.
+        let recheck = async {
+            loop {
+                match reauthorize(state, tunnel_id, &grant).await {
+                    Err(e) if e.is::<crate::state::LookupsBusy>() => {
+                        tokio::time::sleep(RECHECK_RETRY).await;
+                    }
+                    other => return other,
+                }
+            }
+        };
+        let current = match tokio::time::timeout(RECHECK_TIMEOUT, recheck).await {
+            Ok(Ok(Some(current))) => current,
+            Ok(Ok(None)) => return,
+            Ok(Err(e)) => {
+                tracing::debug!(tunnel = tunnel_id, error = %e, "stream reauthorization failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(tunnel = tunnel_id, "stream reauthorization timed out");
+                return;
+            }
+        };
+        // At its deadline a grant survives only if its session now lasts longer.
+        if expired && !later(current.expires_at, grant.expires_at) {
+            return;
+        }
+        if current.expires_at != grant.expires_at {
+            deadline = expiry_deadline(current.expires_at);
+        }
+        grant = current;
+        rechecking.follow(&grant.cancel);
+        rechecking.end();
+    }
+}
+
+fn expiry_deadline(expires_at: Option<i64>) -> Option<tokio::time::Instant> {
+    expires_at.map(|at| {
+        let remaining = at.saturating_sub(now()).max(0) as u64;
+        tokio::time::Instant::now() + Duration::from_secs(remaining)
+    })
+}
+
+/// `None` (public) outlasts any session expiry.
+fn later(current: Option<i64>, previous: Option<i64>) -> bool {
+    match (current, previous) {
+        (None, Some(_)) => true,
+        (Some(c), Some(p)) => c > p,
+        (_, None) => false,
+    }
 }
 
 fn longest_authorization(
     tunnel_id: &str,
     sessions: impl IntoIterator<Item = (String, crate::state::Grants)>,
+    candidates: &Arc<[String]>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Option<Authorization> {
     let t = now();
@@ -153,6 +336,7 @@ fn longest_authorization(
             grants.iter().filter(|(id, expiry)| id == tunnel_id && *expiry > t).map(|(_, expiry)| *expiry).max().map(
                 |expires_at| Authorization {
                     session_hash: Some(hash),
+                    candidates: candidates.clone(),
                     expires_at: Some(expires_at),
                     cancel: cancel.clone(),
                 },
@@ -378,6 +562,16 @@ mod tests {
         (state, session)
     }
 
+    /// An authorization that presented only `hash`.
+    fn held(hash: &str) -> Authorization {
+        Authorization {
+            session_hash: Some(hash.to_string()),
+            candidates: [hash.to_string()].into(),
+            expires_at: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     async fn password_session(state: &AppState, ttl: i64) -> String {
         match state.db.login_grant("abcdefghij".into(), "test-placeholder".into(), ttl, vec![]).await.unwrap() {
             Some(Redemption::Granted { session_id, .. }) => session_id,
@@ -453,13 +647,13 @@ mod tests {
         assert!(old.cancel.is_cancelled());
         // Leaving password mode revoked this session, but public access wins.
         assert!(state.load_session_grants(vec![old.session_hash.clone().unwrap()]).await.unwrap().is_empty());
-        let public = reauthorize(&state, "abcdefghij", old.session_hash.as_deref()).await.unwrap().unwrap();
+        let public = reauthorize(&state, "abcdefghij", &old).await.unwrap().unwrap();
         assert_eq!(public.session_hash, old.session_hash);
         assert_eq!(public.expires_at, None);
         assert!(!public.cancel.is_cancelled());
         state.registry.rotate_gate_epoch("abcdefghij");
         assert!(public.cancel.is_cancelled());
-        let current = reauthorize(&state, "abcdefghij", public.session_hash.as_deref()).await.unwrap().unwrap();
+        let current = reauthorize(&state, "abcdefghij", &public).await.unwrap().unwrap();
         assert!(current.expires_at.is_none());
         assert!(!current.cancel.is_cancelled());
     }
@@ -494,8 +688,8 @@ mod tests {
         state.registry.rotate_gate_epoch("abcdefghij");
         assert!(old.cancel.is_cancelled());
         // Deliberately leave the session cache populated to verify the bypass.
-        assert!(reauthorize(&state, "abcdefghij", Some(&linked_hash)).await.unwrap().is_none());
-        let current = reauthorize(&state, "abcdefghij", Some(&login_hash)).await.unwrap().unwrap();
+        assert!(reauthorize(&state, "abcdefghij", &held(&linked_hash)).await.unwrap().is_none());
+        let current = reauthorize(&state, "abcdefghij", &held(&login_hash)).await.unwrap().unwrap();
         assert_eq!(current.session_hash.as_deref(), Some(login_hash.as_str()));
         assert_eq!(current.expires_at, old.expires_at);
         assert!(!current.cancel.is_cancelled());
@@ -515,11 +709,11 @@ mod tests {
             .unwrap();
         state.registry.rotate_gate_epoch("abcdefghij");
         assert_eq!(
-            reauthorize(&state, "abcdefghij", Some(&login_hash)).await.unwrap().unwrap().expires_at,
+            reauthorize(&state, "abcdefghij", &held(&login_hash)).await.unwrap().unwrap().expires_at,
             Some(expiry)
         );
         state.registry.remove("abcdefghij");
-        assert!(reauthorize(&state, "abcdefghij", Some(&login_hash)).await.unwrap().is_none());
+        assert!(reauthorize(&state, "abcdefghij", &held(&login_hash)).await.unwrap().is_none());
     }
 
     #[test]

@@ -26,8 +26,15 @@ const MAX_IDLE_TOTAL: usize = 64;
 /// sent and is retried on a new connection (see `proxy`).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// A client connection to an origin: the sender, and the task driving it,
+/// which an exchange that loses access aborts (see `proxy`).
+pub struct OriginConn {
+    pub sender: SendRequest<Body>,
+    pub driver: tokio::task::AbortHandle,
+}
+
 struct Idle {
-    sender: SendRequest<Body>,
+    conn: OriginConn,
     since: Instant,
 }
 
@@ -38,33 +45,33 @@ pub struct OriginPool {
 
 impl OriginPool {
     /// The most recently idle live connection for `port`, if any.
-    pub fn checkout(&self, port: u16) -> Option<SendRequest<Body>> {
+    pub fn checkout(&self, port: u16) -> Option<OriginConn> {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         let list = idle.get_mut(&port)?;
         while let Some(c) = list.pop() {
-            if c.since.elapsed() < IDLE_TIMEOUT && c.sender.is_ready() {
-                return Some(c.sender);
+            if c.since.elapsed() < IDLE_TIMEOUT && c.conn.sender.is_ready() {
+                return Some(c.conn);
             }
         }
         None
     }
 
-    /// Keep `sender` for reuse (it must be ready for its next request).
-    pub fn put(&self, port: u16, sender: SendRequest<Body>) {
-        if !sender.is_ready() {
+    /// Keep `conn` for reuse (it must be ready for its next request).
+    pub fn put(&self, port: u16, conn: OriginConn) {
+        if !conn.sender.is_ready() {
             return;
         }
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         // Prune every port (at most MAX_IDLE_TOTAL entries), so stale entries
         // elsewhere cannot hold the total at its cap and stop pooling.
         idle.retain(|_, list| {
-            list.retain(|c| c.since.elapsed() < IDLE_TIMEOUT && !c.sender.is_closed());
+            list.retain(|c| c.since.elapsed() < IDLE_TIMEOUT && !c.conn.sender.is_closed());
             !list.is_empty()
         });
         let total: usize = idle.values().map(Vec::len).sum();
         let list = idle.entry(port).or_default();
         if list.len() < MAX_IDLE_PER_PORT && total < MAX_IDLE_TOTAL {
-            list.push(Idle { sender, since: Instant::now() });
+            list.push(Idle { conn, since: Instant::now() });
         }
     }
 
@@ -87,7 +94,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
 
     /// A client connection to an in-memory HTTP/1.1 server that answers "ok".
-    async fn conn() -> SendRequest<Body> {
+    async fn conn() -> OriginConn {
         let (a, b) = tokio::io::duplex(1 << 16);
         tokio::spawn(async move {
             let svc = service_fn(|_req| async {
@@ -96,8 +103,8 @@ mod tests {
             let _ = server_http1::Builder::new().serve_connection(TokioIo::new(b), svc).await;
         });
         let (sender, c) = hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(a)).await.unwrap();
-        tokio::spawn(c);
-        sender
+        let driver = tokio::spawn(c).abort_handle();
+        OriginConn { sender, driver }
     }
 
     async fn get(sender: &mut SendRequest<Body>) {
@@ -110,13 +117,13 @@ mod tests {
     async fn reuses_a_ready_connection() {
         let pool = OriginPool::default();
         let mut s = conn().await;
-        get(&mut s).await;
-        s.ready().await.unwrap();
+        get(&mut s.sender).await;
+        s.sender.ready().await.unwrap();
         pool.put(3000, s);
         assert_eq!(pool.idle_count(3000), 1);
         assert!(pool.checkout(5173).is_none());
         let mut again = pool.checkout(3000).expect("pooled");
-        get(&mut again).await;
+        get(&mut again.sender).await;
         assert_eq!(pool.idle_count(3000), 0);
     }
 
@@ -125,7 +132,7 @@ mod tests {
         let pool = OriginPool::default();
         for _ in 0..MAX_IDLE_PER_PORT + 3 {
             let mut s = conn().await;
-            s.ready().await.unwrap();
+            s.sender.ready().await.unwrap();
             pool.put(3000, s);
         }
         assert_eq!(pool.idle_count(3000), MAX_IDLE_PER_PORT);
@@ -137,7 +144,7 @@ mod tests {
     async fn expired_connections_are_not_reused() {
         let pool = OriginPool::default();
         let mut s = conn().await;
-        s.ready().await.unwrap();
+        s.sender.ready().await.unwrap();
         pool.put(3000, s);
         assert_eq!(pool.idle_count(3000), 1);
         tokio::time::advance(IDLE_TIMEOUT + Duration::from_millis(10)).await;

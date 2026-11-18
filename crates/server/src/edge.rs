@@ -83,9 +83,9 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
     }
 
     // Capture before reading the access mode so a concurrent PATCH cannot
-    // leave an upgrade watching an epoch newer than the public row it read.
-    let upgrade_epoch = proxy::is_websocket(&req).then(|| state.registry.gate_epoch(id));
-    let upgrade = upgrade_epoch.is_some();
+    // leave a public request watching an epoch newer than the row it read.
+    let public_epoch = state.registry.gate_epoch(id);
+    let upgrade = proxy::is_websocket(&req);
     let lookup = match state.tunnel(id).await {
         Ok(l) => l,
         Err(e) => return internal_error(id, e),
@@ -100,7 +100,12 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
     // Public tunnels have no gate or cookie-granted authority, so presented
     // cookies need no lookup and the authenticated-origin check does not apply.
     let authorization = if mode == AccessMode::Public {
-        upgrade_epoch.map(|cancel| gate::Authorization { session_hash: None, expires_at: None, cancel })
+        Some(gate::Authorization {
+            session_hash: None,
+            candidates: Default::default(),
+            expires_at: None,
+            cancel: public_epoch,
+        })
     } else {
         match gate::authorize(state, id, &cookies.values, upgrade).await {
             Ok(s) => s,
