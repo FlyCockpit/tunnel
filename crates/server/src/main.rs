@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod control;
 mod db;
+mod device;
 mod dns;
 mod edge;
 mod gate;
@@ -12,6 +13,7 @@ mod gatehost;
 mod headers;
 mod ice;
 mod inject;
+mod install;
 mod listener;
 mod metrics;
 mod mode;
@@ -29,6 +31,7 @@ mod state;
 mod tls;
 mod tokens;
 mod turn_relay;
+mod ui;
 mod util;
 
 use std::path::PathBuf;
@@ -51,7 +54,7 @@ enum Cmd {
     /// Run the server (used by the systemd unit).
     Serve,
     /// Install or reconfigure (as root: system install; as another user: rootless install).
-    Setup(setup::SetupArgs),
+    Setup(Box<setup::SetupArgs>),
     /// Admin token management.
     Token {
         #[command(subcommand)]
@@ -73,6 +76,17 @@ enum Cmd {
     Cert {
         #[command(subcommand)]
         cmd: CertCmd,
+    },
+    /// Web UI owner account: `admin link` prints a one-time link to create
+    /// the owner (first run) or reset the owner's password and two-factor sign-in.
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+    /// Web UI accounts.
+    User {
+        #[command(subcommand)]
+        cmd: UserCmd,
     },
     /// Machines that may create tunnels with their own token (`tunnel login`).
     Client {
@@ -119,9 +133,26 @@ enum ServiceCmd {
 }
 
 #[derive(Subcommand)]
+enum AdminCmd {
+    /// Print a one-time link (15 minutes) to create or recover the owner account.
+    Link,
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// List accounts, their roles, machines and tunnels.
+    List,
+}
+
+#[derive(Subcommand)]
 enum ClientCmd {
     /// Register a machine and print the one-time login command to run on it.
-    Add { name: String },
+    Add {
+        name: String,
+        /// The account that owns the machine (default: the owner).
+        #[arg(long)]
+        user: Option<String>,
+    },
     /// List machines, when they were last used, and their open tunnels.
     List,
     /// Remove a machine: its token stops working and its tunnels close.
@@ -170,14 +201,18 @@ async fn main() -> anyhow::Result<()> {
     };
     match cli.cmd {
         Cmd::Serve => commands::serve(&config).await,
-        Cmd::Setup(args) => setup::run(&config, args).await,
+        Cmd::Setup(args) => setup::run(&config, *args).await,
         Cmd::Token { cmd: TokenCmd::Rotate } => commands::token_rotate(&config).await,
         Cmd::HealthToken { cmd } => commands::health_token(&config, matches!(cmd, HealthTokenCmd::Set)).await,
         Cmd::Status => commands::status(&config).await,
         Cmd::Backup { path } => commands::backup(&config, &path).await,
         Cmd::Restore { path } => commands::restore(&config, &path).await,
         Cmd::Cert { cmd: CertCmd::Renew { force } } => commands::cert_renew(&config, force).await,
-        Cmd::Client { cmd: ClientCmd::Add { name } } => commands::client_add(&config, &name).await,
+        Cmd::Admin { cmd: AdminCmd::Link } => commands::admin_link(&config, false).await,
+        Cmd::User { cmd: UserCmd::List } => commands::user_list(&config).await,
+        Cmd::Client { cmd: ClientCmd::Add { name, user } } => {
+            commands::client_add(&config, &name, user.as_deref()).await
+        }
         Cmd::Client { cmd: ClientCmd::List } => commands::client_list(&config).await,
         Cmd::Client { cmd: ClientCmd::Delete { name } } => commands::client_delete(&config, &name).await,
         Cmd::Service { cmd: ServiceCmd::Add { name, max_tunnels, token_file } } => {

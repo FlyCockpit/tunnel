@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags: ['v*']
-  # Manual runs build and validate artifacts without signing or publishing.
+  # Manual runs build and validate artifacts without attesting or publishing.
   workflow_dispatch:
 
 permissions:
@@ -58,6 +58,10 @@ jobs:
         run: |
           nice -n 10 cargo install --locked --features cli cargo-about@0.9.3
           nice -n 10 cargo about generate --locked about.hbs -o dist/THIRD_PARTY_LICENSES.html
+          # The web UI embedded in every server is its own workspace (wasm32).
+          nice -n 10 cargo about generate --locked --manifest-path crates/web/Cargo.toml -c crates/web/about.toml \
+            about.hbs -o dist/THIRD_PARTY_LICENSES_WEB_UI.html
+          cp crates/web/static/ROBOTO-LICENSE.txt dist/THIRD_PARTY_LICENSES_WEB_UI_FONT.txt
           cp install.sh dist/install.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -65,8 +69,11 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  web:
+    uses: ./.github/workflows/web.yml
+
   build:
-    needs: prepare
+    needs: [prepare, web]
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +102,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
+      - name: Fetch the web UI build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: crates/web/dist
       - name: Install musl toolchain
         if: runner.os == 'Linux'
         run: |
@@ -109,7 +121,9 @@ jobs:
             export "CC_${TARGET//-/_}=musl-gcc"
             linker_target=${TARGET//-/_}
             export "CARGO_TARGET_${linker_target^^}_LINKER=musl-gcc"
-            nice -n 10 cargo build --release --locked --target "$TARGET" -p tunnel-server -p tunnel-client
+            # Every server embeds the same web UI bytes, built once by the web job.
+            nice -n 10 cargo build --release --locked --target "$TARGET" -p tunnel-server --features tunnel-server/ui
+            nice -n 10 cargo build --release --locked --target "$TARGET" -p tunnel-client
             cp "target/$TARGET/release/tunnel-server" "dist/tunnel-server-$TARGET"
             # Both distributed Linux binaries must be statically linked.
             for binary in tunnel-server tunnel; do
@@ -121,7 +135,12 @@ jobs:
           else
             nice -n 10 cargo build --release --locked --target "$TARGET" -p tunnel-client
           fi
-          cp "target/$TARGET/release/tunnel" "dist/tunnel-$TARGET"
+          # The client ships as tunnel-<target>.tar.xz holding tunnel-<target>/tunnel,
+          # which the server-served /install.sh and the Homebrew formula unpack.
+          mkdir -p "pkg/tunnel-$TARGET"
+          cp "target/$TARGET/release/tunnel" "pkg/tunnel-$TARGET/tunnel"
+          cp LICENSE "pkg/tunnel-$TARGET/LICENSE"
+          tar -C pkg -cJf "dist/tunnel-$TARGET.tar.xz" "tunnel-$TARGET"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-${{ matrix.target }}
@@ -132,51 +151,60 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    # contents to upload the release; id-token and attestations to sign build
+    # provenance (keyless, no repository secret).
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-assets-*
           path: dist
           merge-multiple: true
-      - name: Install minisign
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes minisign
-      - name: Check assets, checksum and sign
+      # /install.sh (repo and server-served) verify downloads against
+      # sha256.sum and refuse to install without a matching entry; refuse to
+      # publish a release that lacks any of them.
+      - name: Check assets and write sha256.sum
         working-directory: dist
         env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          if grep -q '^MINISIGN_PUBKEY="REPLACE_WITH_MINISIGN_PUBLIC_KEY"' install.sh; then
-            echo 'Replace the installer minisign public key before the first release.' >&2
-            exit 1
-          fi
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             test -s "tunnel-server-$target"
-            test -s "tunnel-$target"
           done
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            test -s "tunnel-$target"
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
+            test -s "tunnel-$target.tar.xz"
           done
           test -s install.sh
           test -s THIRD_PARTY_LICENSES.html
+          test -s THIRD_PARTY_LICENSES_WEB_UI.html
+          test -s THIRD_PARTY_LICENSES_WEB_UI_FONT.txt
           mv release-notes.md "$RUNNER_TEMP/release-notes.md"
-          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
-          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
-          test -n "$MINISIGN_SECRET_KEY"
-          umask 077
-          signing_key=$(mktemp "$RUNNER_TEMP/minisign.XXXXXX")
-          trap 'rm -f "$signing_key"' EXIT
-          chmod 0600 "$signing_key"
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
-          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$signing_key" -m SHA256SUMS -x SHA256SUMS.minisig
-          minisign_pubkey=$(sed -n 's/^MINISIGN_PUBKEY="\([^"]*\)"$/\1/p' install.sh)
-          minisign -V -q -P "$minisign_pubkey" -m SHA256SUMS -x SHA256SUMS.minisig
+          # The Homebrew formula pins each archive's checksum; it is written
+          # first so that sha256.sum covers it too.
+          sha256sum -- tunnel-*.tar.xz > "$RUNNER_TEMP/archives.sum"
+          ../packaging/homebrew/formula.sh "$VERSION" "$RUNNER_TEMP/archives.sum" > tunnel.rb
+          ruby -c tunnel.rb
+          sha256sum -- * > "$RUNNER_TEMP/sha256.sum"
+          mv "$RUNNER_TEMP/sha256.sum" sha256.sum
+          sha256sum --check --strict sha256.sum
+      # Signed SLSA build provenance for every binary, archive and the checksum
+      # file. Verify with `gh attestation verify <file> --repo FlyCockpit/tunnel`.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/tunnel-*.tar.xz
+            dist/tunnel-server-*
+            dist/tunnel.rb
+            dist/sha256.sum
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,6 +1,7 @@
-//! Fixed-window per-IP rate limiter.
+//! Fixed-window rate limiters, per IP or per any key (e.g. a username).
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -13,28 +14,37 @@ const PRUNE_EVERY: Duration = Duration::from_secs(10);
 /// addresses are refused (fail closed) rather than growing without bound.
 const MAX_TRACKED: usize = 100_000;
 
-pub struct RateLimiter {
+/// Per-IP limiter (IPv6 per /64).
+pub type RateLimiter = Limiter<IpAddr>;
+
+pub struct Limiter<K> {
     per_min: u32,
-    windows: Mutex<Windows>,
+    windows: Mutex<Windows<K>>,
 }
 
-struct Windows {
-    map: HashMap<IpAddr, (Instant, u32)>,
+struct Windows<K> {
+    map: HashMap<K, (Instant, u32)>,
     last_prune: Instant,
 }
 
 impl RateLimiter {
+    /// Count one attempt from `ip`; `false` if it exceeds the per-minute budget.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        self.check_key(bucket(ip))
+    }
+}
+
+impl<K: Hash + Eq> Limiter<K> {
     /// `per_min == 0` disables limiting.
     pub fn new(per_min: u32) -> Self {
         Self { per_min, windows: Mutex::new(Windows { map: HashMap::new(), last_prune: Instant::now() }) }
     }
 
-    /// Count one attempt from `ip`; `false` if it exceeds the per-minute budget.
-    pub fn check(&self, ip: IpAddr) -> bool {
+    /// Count one attempt for `key`; `false` if it exceeds the per-minute budget.
+    pub fn check_key(&self, key: K) -> bool {
         if self.per_min == 0 {
             return true;
         }
-        let key = bucket(ip);
         let now = Instant::now();
         let mut guard = self.windows.lock().expect("ratelimit lock");
         let w = &mut *guard;

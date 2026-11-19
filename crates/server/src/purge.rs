@@ -60,5 +60,9 @@ async fn purge_once(state: &AppState) -> anyhow::Result<()> {
     if stats.access_links > 0 || stats.sessions > 0 || stats.grants > 0 {
         state.invalidate_sessions();
     }
+    let accounts = state.db.purge_accounts().await?;
+    if accounts > 0 {
+        tracing::info!(rows = accounts, "purge removed expired UI sessions, logins, invites and old audit entries");
+    }
     Ok(())
 }

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use tunnel_protocol::ADMIN_TOKEN_PREFIX;
 
-use crate::config::{Config, DnsProviderKind, SERVICE_NAME, SERVICE_USER};
+use crate::config::{Config, DnsConfig, DnsProviderKind, SERVICE_NAME, SERVICE_USER};
 use crate::mode::{self, Mode};
 use crate::{acme, dns, tls, tokens, util};
 
@@ -42,6 +42,29 @@ pub struct SetupArgs {
     /// Override the TURN hostname (default: turn.<host>).
     #[arg(long)]
     pub turn_host: Option<String>,
+    /// Web UI hostname (sign-in, machines, users), or `none` for no web UI.
+    /// Never the preview zone or a name under it.
+    #[arg(long)]
+    pub ui_host: Option<String>,
+    /// Whether people other than you will use this server (true or false).
+    /// Then previews must be on a separate registrable domain from the UI.
+    #[arg(long)]
+    pub multi_user: Option<bool>,
+    /// DNS provider of the preview zone, when it is not in the server's DNS zone.
+    #[arg(long)]
+    pub preview_dns_provider: Option<String>,
+    /// DNS zone holding the preview zone (detected automatically for Cloudflare).
+    #[arg(long)]
+    pub preview_dns_zone: Option<String>,
+    /// File holding the API token for the preview zone's DNS provider.
+    #[arg(long)]
+    pub preview_dns_token_file: Option<PathBuf>,
+    /// Bring your own certificate (true or false): setup and the server never
+    /// issue or renew one; put fullchain.pem and privkey.pem covering every
+    /// name into the data directory's certs/ (combine with --skip-dns for a
+    /// fully manual DNS setup).
+    #[arg(long)]
+    pub own_certificate: Option<bool>,
     /// ACME (Let's Encrypt) contact email.
     #[arg(long)]
     pub email: Option<String>,
@@ -112,6 +135,12 @@ pub async fn run(config_path: &Path, args: SetupArgs) -> anyhow::Result<()> {
         return Err(e);
     }
     finish(&cfg, mode, new_token.as_deref());
+    if cfg.ui_host.is_some() && !args.skip_self_test {
+        // First run with the UI: the one-time link that creates the owner account.
+        if let Err(e) = crate::commands::admin_link(config_path, true).await {
+            eprintln!("Could not create the owner sign-up link ({e:#}); run `tunnel-server admin link`.");
+        }
+    }
     Ok(())
 }
 
@@ -143,12 +172,16 @@ async fn configure(
     }
 
     step("Checking DNS provider access");
-    let provider = dns::Provider::from_config(cfg)?;
-    provider
-        .check_write(&cfg.tunnel_host)
-        .await
-        .context("the DNS token cannot create records in this zone (it needs DNS edit permission)")?;
-    println!("Token can edit records in {}", cfg.dns.zone);
+    if !args.skip_dns || !cfg.acme.own_certificate {
+        for zone in std::iter::once(&cfg.dns).chain(&cfg.extra_dns) {
+            dns::Provider::from_dns(zone)?.check_write(&zone.zone).await.with_context(|| {
+                format!("the DNS token cannot create records in {} (it needs DNS edit permission)", zone.zone)
+            })?;
+            println!("Token can edit records in {}", zone.zone);
+        }
+    } else {
+        println!("Not checking DNS provider access (--skip-dns and an own certificate)");
+    }
 
     // Before DNS so the answers are persisted even if DNS verification times out.
     step("Creating directories");
@@ -170,7 +203,7 @@ async fn configure(
         println!("Not creating DNS records (--skip-dns)");
     } else {
         step("Configuring DNS");
-        configure_dns(cfg, &provider).await?;
+        configure_dns(cfg).await?;
     }
     verify_dns(cfg, v4, v6).await?;
 
@@ -482,9 +515,27 @@ async fn ask_config(ask: &Ask, existing: Option<&Config>, args: &SetupArgs, mode
         &cfg.tunnel_host,
         parse_host,
     )?;
+    // 1b. Who uses it. With others, previews (code anyone wrote) must not be
+    //     same-site with the UI, so they need their own registrable domain.
+    let multi_user = ask.bool(
+        args.multi_user,
+        "Will people other than you use this server (invited friends or colleagues)?",
+        existing.is_some_and(|c| c.ui_host.is_some() && !c.ui_same_site_as_previews()),
+    )?;
     let preview_zone = match &args.preview_zone {
         Some(z) => parse_host(z).map_err(|e| anyhow::anyhow!("--preview-zone: {e}"))?,
-        None if existing.is_some_and(|c| c.tunnel_host == host) => cfg.preview_zone.clone(),
+        None if existing.is_some_and(|c| c.tunnel_host == host)
+            && !(multi_user && crate::config::registrable(&cfg.preview_zone) == crate::config::registrable(&host)) =>
+        {
+            cfg.preview_zone.clone()
+        }
+        None if multi_user => ask.text(
+            None,
+            "preview-zone",
+            "Preview domain on a separate registrable domain (previews are *.<this>), e.g. previews.example-previews.com",
+            "",
+            parse_host,
+        )?,
         None => host.clone(),
     };
     let turn_host = match &args.turn_host {
@@ -497,6 +548,22 @@ async fn ask_config(ask: &Ask, existing: Option<&Config>, args: &SetupArgs, mode
     cfg.tunnel_host = host.clone();
     cfg.preview_zone = preview_zone;
     cfg.turn_host = turn_host;
+
+    // 1c. The web UI's own host (never under the preview zone).
+    let ui_default = match (&cfg.ui_host, existing) {
+        (Some(h), _) => h.clone(),
+        // Re-running setup keeps a server without the UI that way unless asked.
+        (None, Some(_)) if !multi_user => "none".to_string(),
+        _ => default_ui_host(&cfg.tunnel_host, &cfg.preview_zone),
+    };
+    cfg.ui_host = ask.text(
+        args.ui_host.as_deref(),
+        "ui-host",
+        "Web UI hostname (sign-in, machines, users; not under the preview zone), or none",
+        &ui_default,
+        parse_ui_host,
+    )?;
+    check_hosts(&cfg, multi_user)?;
 
     // 2. Who may frame previews.
     cfg.normalize_frame_ancestors();
@@ -513,77 +580,211 @@ async fn ask_config(ask: &Ask, existing: Option<&Config>, args: &SetupArgs, mode
     cfg.acme.email = ask.text(args.email.as_deref(), "email", "ACME contact email", &cfg.acme.email, parse_email)?;
     cfg.acme.staging = args.staging;
 
-    // 4. DNS provider, credentials, and zone (checked right away).
-    let current = PROVIDERS.iter().position(|(k, _)| *k == cfg.dns.provider).unwrap_or(0);
-    let provider = match args.dns_provider.as_deref() {
-        Some(name) => PROVIDERS
-            .iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
-            .map(|(k, _)| *k)
-            .with_context(|| format!("--dns-provider: unknown provider '{name}'"))?,
-        None if ask.yes => PROVIDERS[current].0,
-        None => {
-            let names: Vec<&str> = PROVIDERS.iter().map(|(_, n)| *n).collect();
-            PROVIDERS[prompt::ask_choice("DNS provider", &names, current)?].0
+    // A provider setup does not support: records by hand (--skip-dns) and the
+    // operator's own certificate. Then no DNS credentials are needed at all.
+    let own_certificate = args.own_certificate.unwrap_or(cfg.acme.own_certificate);
+    let manual_dns = args.skip_dns && own_certificate;
+    if manual_dns {
+        if cfg.dns.zone.is_empty() {
+            cfg.dns.zone = parent_domain(&cfg.tunnel_host);
         }
-    };
-    // Credentials of a different provider are dropped, not carried over.
-    if existing.map(|c| c.dns.provider) != Some(provider) {
-        cfg.dns.api_token = None;
-        cfg.dns.aws_access_key_id = None;
-        cfg.dns.aws_secret_access_key = None;
-        cfg.dns.route53_hosted_zone_id = None;
-    }
-    cfg.dns.provider = provider;
-    match provider {
-        DnsProviderKind::Route53 => {
-            let key_id = cfg.dns.aws_access_key_id.clone().unwrap_or_default();
-            cfg.dns.aws_access_key_id =
-                Some(ask.text(None, "aws-access-key-id (config)", "AWS access key id", &key_id, non_empty)?);
-            cfg.dns.aws_secret_access_key = Some(ask.secret(
-                args.dns_token_file.as_deref(),
-                "dns-token-file",
-                "AWS secret access key",
-                cfg.dns.aws_secret_access_key.as_deref(),
-            )?);
-            let zone_id = cfg.dns.route53_hosted_zone_id.clone().unwrap_or_default();
-            cfg.dns.route53_hosted_zone_id = Some(ask.text(
-                None,
-                "route53-hosted-zone-id (config)",
-                "Route53 hosted zone id",
-                &zone_id,
-                non_empty,
-            )?);
+        println!("Manual DNS and your own certificate: no DNS provider settings are needed.");
+    } else {
+        // 4. DNS provider, credentials, and zone (checked right away).
+        let current = PROVIDERS.iter().position(|(k, _)| *k == cfg.dns.provider).unwrap_or(0);
+        let provider = match args.dns_provider.as_deref() {
+            Some(name) => PROVIDERS
+                .iter()
+                .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
+                .map(|(k, _)| *k)
+                .with_context(|| format!("--dns-provider: unknown provider '{name}'"))?,
+            None if ask.yes => PROVIDERS[current].0,
+            None => {
+                let names: Vec<&str> = PROVIDERS.iter().map(|(_, n)| *n).collect();
+                PROVIDERS[prompt::ask_choice("DNS provider", &names, current)?].0
+            }
+        };
+        // Credentials of a different provider are dropped, not carried over.
+        if existing.map(|c| c.dns.provider) != Some(provider) {
             cfg.dns.api_token = None;
-        }
-        _ => {
-            let hint = match provider {
-                DnsProviderKind::Cloudflare => {
-                    "Cloudflare API token (Zone → DNS → Edit AND Zone → Zone → Read, limited to this zone)"
-                }
-                DnsProviderKind::Hetzner => "Hetzner DNS API token",
-                _ => "DigitalOcean API token (domain read/write)",
-            };
-            cfg.dns.api_token = Some(ask.secret(
-                args.dns_token_file.as_deref(),
-                "dns-token-file",
-                hint,
-                cfg.dns.api_token.as_deref(),
-            )?);
             cfg.dns.aws_access_key_id = None;
             cfg.dns.aws_secret_access_key = None;
             cfg.dns.route53_hosted_zone_id = None;
         }
+        cfg.dns.provider = provider;
+        match provider {
+            DnsProviderKind::Route53 => {
+                let key_id = cfg.dns.aws_access_key_id.clone().unwrap_or_default();
+                cfg.dns.aws_access_key_id =
+                    Some(ask.text(None, "aws-access-key-id (config)", "AWS access key id", &key_id, non_empty)?);
+                cfg.dns.aws_secret_access_key = Some(ask.secret(
+                    args.dns_token_file.as_deref(),
+                    "dns-token-file",
+                    "AWS secret access key",
+                    cfg.dns.aws_secret_access_key.as_deref(),
+                )?);
+                let zone_id = cfg.dns.route53_hosted_zone_id.clone().unwrap_or_default();
+                cfg.dns.route53_hosted_zone_id = Some(ask.text(
+                    None,
+                    "route53-hosted-zone-id (config)",
+                    "Route53 hosted zone id",
+                    &zone_id,
+                    non_empty,
+                )?);
+                cfg.dns.api_token = None;
+            }
+            _ => {
+                let hint = match provider {
+                    DnsProviderKind::Cloudflare => {
+                        "Cloudflare API token (Zone → DNS → Edit AND Zone → Zone → Read, limited to this zone)"
+                    }
+                    DnsProviderKind::Hetzner => "Hetzner DNS API token",
+                    _ => "DigitalOcean API token (domain read/write)",
+                };
+                cfg.dns.api_token = Some(ask.secret(
+                    args.dns_token_file.as_deref(),
+                    "dns-token-file",
+                    hint,
+                    cfg.dns.api_token.as_deref(),
+                )?);
+                cfg.dns.aws_access_key_id = None;
+                cfg.dns.aws_secret_access_key = None;
+                cfg.dns.route53_hosted_zone_id = None;
+            }
+        }
+        cfg.dns.zone = choose_zone(ask, &cfg, args).await?;
+        // 4b. Names outside that zone (a separate preview domain) need their own zone.
+        //     Explicit --preview-dns-* flags replace the settings of an existing one.
+        let hosts = record_hosts(&cfg);
+        cfg.extra_dns.retain(|d| hosts.iter().any(|h| in_zone(h, &d.zone)));
+        let overrides = args.preview_dns_provider.is_some()
+            || args.preview_dns_zone.is_some()
+            || args.preview_dns_token_file.is_some();
+        let outside = hosts.iter().map(|h| h.trim_start_matches("*.")).find(|h| !in_zone(h, &cfg.dns.zone));
+        if let Some(outside) = outside {
+            let current = cfg.extra_dns.iter().position(|d| in_zone(outside, &d.zone));
+            if current.is_none() || overrides {
+                let zone = ask_extra_zone(ask, &cfg, args, outside, current.map(|i| &cfg.extra_dns[i])).await?;
+                if let Some(i) = current {
+                    cfg.extra_dns.remove(i);
+                }
+                cfg.extra_dns.push(zone);
+            }
+        }
     }
-    cfg.dns.zone = choose_zone(ask, &cfg, args).await?;
+    cfg.acme.own_certificate = own_certificate;
 
     // 5. WebRTC.
     cfg.webrtc.enabled = ask.bool(args.webrtc, "Enable WebRTC (built-in STUN/TURN relay)?", cfg.webrtc.enabled)?;
 
-    check_names(&cfg)?;
+    if !manual_dns {
+        check_names(&cfg)?;
+    }
     print_layout(&cfg, before.as_ref());
     anyhow::ensure!(ask.confirm("Continue with this layout?")?, "stopped; nothing was changed");
     Ok(cfg)
+}
+
+/// `host` is the zone or inside it.
+fn in_zone(host: &str, zone: &str) -> bool {
+    let host = host.trim_start_matches("*.");
+    host == zone || host.ends_with(&format!(".{zone}"))
+}
+
+/// The UI next to the API when previews have their own domain; otherwise a
+/// sibling of the server name (`tunnel.example.com` → `tunnel-ui.example.com`),
+/// since names under the preview zone are previews.
+fn default_ui_host(host: &str, preview_zone: &str) -> String {
+    if host != preview_zone && !host.ends_with(&format!(".{preview_zone}")) {
+        return host.to_string();
+    }
+    match host.split_once('.') {
+        Some((first, rest)) if rest.contains('.') => format!("{first}-ui.{rest}"),
+        _ => format!("tunnel-ui.{host}"),
+    }
+}
+
+fn parse_ui_host(input: &str) -> Result<Option<String>, String> {
+    if input.trim().eq_ignore_ascii_case("none") { Ok(None) } else { parse_host(input).map(Some) }
+}
+
+/// The UI never under the preview zone; with other users, previews never
+/// same-site with it (a separate registrable domain); alone, only a warning.
+fn check_hosts(cfg: &Config, multi_user: bool) -> anyhow::Result<()> {
+    if let Some(ui) = &cfg.ui_host {
+        anyhow::ensure!(
+            ui != &cfg.preview_zone && !ui.ends_with(&format!(".{}", cfg.preview_zone)),
+            "the web UI ({ui}) must not be the preview zone or a name under it: previews there could read or forge its requests"
+        );
+    }
+    if multi_user {
+        let ui = cfg.ui_host.as_deref().context("a server for several people needs the web UI (invites, sign-in)")?;
+        anyhow::ensure!(
+            crate::config::registrable(ui) != crate::config::registrable(&cfg.preview_zone),
+            "with other users, previews must be on a separate registrable domain from the UI ({ui}): their \
+             code would otherwise be same-site with it. Use e.g. --preview-zone previews.example-previews.com"
+        );
+    }
+    Ok(())
+}
+
+/// DNS settings for the zone holding `host` when it is outside the server's
+/// zone (typically a separate preview domain), possibly at another provider.
+async fn ask_extra_zone(
+    ask: &Ask,
+    cfg: &Config,
+    args: &SetupArgs,
+    host: &str,
+    existing: Option<&DnsConfig>,
+) -> anyhow::Result<DnsConfig> {
+    println!("{host} is not in the DNS zone {}; it needs its own zone settings.", cfg.dns.zone);
+    let provider = match args.preview_dns_provider.as_deref() {
+        Some(name) => PROVIDERS
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
+            .map(|(k, _)| *k)
+            .with_context(|| format!("--preview-dns-provider: unknown provider '{name}'"))?,
+        None if existing.is_some() => existing.map(|e| e.provider).expect("checked"),
+        None if ask.yes => bail!("--preview-dns-provider is required with --yes for {host}"),
+        None => {
+            let names: Vec<&str> = PROVIDERS.iter().map(|(_, n)| *n).collect();
+            PROVIDERS[prompt::ask_choice(&format!("DNS provider for {host}"), &names, 0)?].0
+        }
+    };
+    anyhow::ensure!(
+        provider != DnsProviderKind::Route53,
+        "Route53 is supported for the server's main zone only; use another provider for {host} or put it in that zone"
+    );
+    // A different provider's token never carries over.
+    let same_provider = existing.filter(|e| e.provider == provider);
+    let token = ask.secret(
+        args.preview_dns_token_file.as_deref(),
+        "preview-dns-token-file",
+        &format!("API token for the DNS zone of {host}"),
+        same_provider.and_then(|e| e.api_token.as_deref()),
+    )?;
+    let zone = match &args.preview_dns_zone {
+        Some(z) => parse_host(z).map_err(|e| anyhow::anyhow!("--preview-dns-zone: {e}"))?,
+        None if same_provider.is_some() => same_provider.map(|e| e.zone.clone()).expect("checked"),
+        None if provider == DnsProviderKind::Cloudflare => {
+            let zones =
+                dns::cloudflare_zones(&token).await.context("checking the Cloudflare token for the preview zone")?;
+            dns::pick_zone(host, &zones)
+                .with_context(|| format!("that Cloudflare token cannot see a zone holding {host}"))?
+        }
+        None => {
+            ask.text(None, "preview-dns-zone", &format!("DNS zone holding {host}"), &parent_domain(host), parse_host)?
+        }
+    };
+    anyhow::ensure!(in_zone(host, &zone), "{host} is not inside the DNS zone {zone}");
+    Ok(DnsConfig {
+        provider,
+        zone,
+        api_token: Some(token),
+        aws_access_key_id: None,
+        aws_secret_access_key: None,
+        route53_hosted_zone_id: None,
+    })
 }
 
 /// Cloudflare: the zones the token can see decide (the token is checked here).
@@ -636,6 +837,7 @@ type Layout = Vec<(&'static str, String)>;
 
 fn layout(cfg: &Config) -> Layout {
     let mut rows = vec![
+        ("Web UI", cfg.ui_host.as_ref().map(|h| format!("https://{h}")).unwrap_or_else(|| "none".into())),
         ("API", format!("https://{}", cfg.api_host)),
         ("Sandbox tunnel", format!("wss://{}", cfg.tunnel_host)),
         ("Previews", format!("https://{{port}}-{{id}}.{}", cfg.preview_zone)),
@@ -644,6 +846,12 @@ fn layout(cfg: &Config) -> Layout {
         rows.push(("TURN", cfg.turn_host.clone()));
     }
     rows.push(("DNS zone", format!("{} ({:?})", cfg.dns.zone, cfg.dns.provider).to_lowercase()));
+    for extra in &cfg.extra_dns {
+        rows.push(("DNS zone", format!("{} ({:?})", extra.zone, extra.provider).to_lowercase()));
+    }
+    if cfg.acme.own_certificate {
+        rows.push(("Certificate", "your own (not issued or renewed)".into()));
+    }
     let parents = if cfg.frame_ancestors.iter().any(|s| s == "*") {
         "any site".to_string()
     } else if cfg.frame_ancestors.is_empty() {
@@ -664,6 +872,13 @@ fn print_layout(cfg: &Config, before: Option<&Layout>) {
             _ => println!("  {name:<15} {value}"),
         }
     }
+    if cfg.ui_same_site_as_previews() {
+        println!(
+            "\nNote: previews share the web UI's registrable domain ({}). Fine for a server only you use; \
+             for others, use a separate preview domain (see the README's \"Hosts and domains\").",
+            crate::config::registrable(&cfg.preview_zone)
+        );
+    }
     println!("\nDNS records (each pointing at this server; setup creates them unless --skip-dns):");
     for host in record_hosts(cfg) {
         println!("  {host}");
@@ -677,16 +892,17 @@ fn print_layout(cfg: &Config, before: Option<&Layout>) {
     println!();
 }
 
-/// Every record setup creates must live inside the provider zone.
+/// Every record setup creates must live inside a configured zone.
 fn check_names(cfg: &Config) -> anyhow::Result<()> {
-    let zone = &cfg.dns.zone;
-    let inside = |host: &str| host == zone.as_str() || host.ends_with(&format!(".{zone}"));
     let mut hosts = vec![&cfg.preview_zone, &cfg.api_host, &cfg.tunnel_host];
     if cfg.webrtc.enabled {
         hosts.push(&cfg.turn_host);
     }
+    if let Some(ui) = &cfg.ui_host {
+        hosts.push(ui);
+    }
     for host in hosts {
-        anyhow::ensure!(inside(host.as_str()), "{host} is not inside the DNS zone {zone}");
+        anyhow::ensure!(cfg.dns_for(host).is_some(), "{host} is not inside the DNS zone {}", cfg.dns.zone);
     }
     Ok(())
 }
@@ -897,6 +1113,10 @@ fn generate_secrets(cfg: &mut Config) -> Option<String> {
         minted = Some(token);
         println!("Generated a new admin API token (shown at the end)");
     }
+    if cfg.ui_host.is_some() && cfg.ui_secret.as_deref().is_none_or(|s| s.len() < 32) {
+        cfg.ui_secret = Some(tokens::random_secret());
+        println!("Generated the web UI secret");
+    }
     if cfg.webrtc.enabled && cfg.webrtc.static_auth_secret.is_empty() {
         cfg.webrtc.static_auth_secret = tokens::random_secret();
         println!("Generated the TURN static auth secret");
@@ -911,6 +1131,9 @@ fn record_hosts(cfg: &Config) -> Vec<String> {
         cfg.api_host.clone(),
         cfg.tunnel_host.clone(),
     ];
+    if let Some(ui) = &cfg.ui_host {
+        hosts.push(ui.clone());
+    }
     if cfg.webrtc.enabled && !cfg.covered_by_wildcard(&cfg.turn_host) {
         hosts.push(cfg.turn_host.clone());
     }
@@ -922,9 +1145,10 @@ fn record_hosts(cfg: &Config) -> Vec<String> {
     hosts
 }
 
-async fn configure_dns(cfg: &Config, provider: &dns::Provider) -> anyhow::Result<()> {
+async fn configure_dns(cfg: &Config) -> anyhow::Result<()> {
     let v4 = cfg.public_ipv4.context("no public IPv4 address")?;
     for host in record_hosts(cfg) {
+        let provider = dns::Provider::for_host(cfg, &host)?;
         println!("  {host} A {v4}");
         provider.upsert(&host, "A", &v4.to_string()).await?;
         if let Some(v6) = cfg.public_ipv6 {
@@ -937,6 +1161,7 @@ async fn configure_dns(cfg: &Config, provider: &dns::Provider) -> anyhow::Result
 
 fn dns_verification_names(cfg: &Config, probe: String) -> Vec<String> {
     let mut names = vec![cfg.api_host.clone(), cfg.tunnel_host.clone(), cfg.preview_zone.clone(), probe];
+    names.extend(cfg.ui_host.clone());
     names.sort();
     names.dedup();
     names
@@ -1029,6 +1254,19 @@ fn is_cloudflare_proxy(ip: IpAddr) -> bool {
 
 async fn ensure_certificate(cfg: &Config) -> anyhow::Result<()> {
     let status = tls::cert_status(cfg);
+    if cfg.acme.own_certificate {
+        return match status {
+            tls::CertStatus::Valid { not_after } => {
+                println!("Own certificate is valid until {} and covers every name", format_unix(not_after));
+                Ok(())
+            }
+            other => bail!(
+                "own certificate: {other:?}. Put fullchain.pem and privkey.pem covering {} into {} and re-run setup",
+                cfg.cert_names().join(", "),
+                cfg.cert_dir().display()
+            ),
+        };
+    }
     // A staging leftover is "valid" by dates and names but untrusted.
     let staging_leftover = !cfg.acme.staging && cert_is_staging(cfg);
     match status {
@@ -1131,6 +1369,9 @@ fn print_token_box(cfg: &Config, token: &str) {
 
 fn finish(cfg: &Config, mode: Mode, new_token: Option<&str>) {
     println!("\nSetup complete.\n");
+    if let Some(ui) = &cfg.ui_host {
+        println!("  Web UI          https://{ui}");
+    }
     println!("  API             https://{}", cfg.api_host);
     println!("  Sandbox server  TUNNEL_SERVER=wss://{}", cfg.tunnel_host);
     println!("  Previews        https://{{port}}-{{id}}.{}", cfg.preview_zone);
@@ -1618,5 +1859,187 @@ mod tests {
         assert!(is_cloudflare_proxy("172.67.213.73".parse().unwrap()));
         assert!(is_cloudflare_proxy("2606:4700:3030::ac43:d549".parse().unwrap()));
         assert!(!is_cloudflare_proxy("203.0.113.10".parse().unwrap()));
+    }
+
+    fn hosts_config() -> Config {
+        let mut cfg = fresh_config().unwrap();
+        cfg.tunnel_host = "tunnel.example.com".into();
+        cfg.api_host = cfg.tunnel_host.clone();
+        cfg.preview_zone = "tunnel.example.com".into();
+        cfg.turn_host = "turn.tunnel.example.com".into();
+        cfg.acme.email = "test@example.com".into();
+        cfg.dns.provider = DnsProviderKind::Hetzner;
+        cfg.dns.zone = "example.com".into();
+        cfg.dns.api_token = Some("test-token".into());
+        cfg
+    }
+
+    #[test]
+    fn default_ui_host_is_never_a_preview_name() {
+        assert_eq!(default_ui_host("tunnel.example.com", "tunnel.example.com"), "tunnel-ui.example.com");
+        assert_eq!(default_ui_host("tunnel.example.com", "previews.example-previews.com"), "tunnel.example.com");
+        assert_eq!(default_ui_host("example.com", "example.com"), "tunnel-ui.example.com");
+        assert_eq!(parse_ui_host("None").unwrap(), None);
+        assert_eq!(parse_ui_host("UI.Example.com").unwrap().as_deref(), Some("ui.example.com"));
+    }
+
+    #[test]
+    fn hosts_refuse_the_ui_under_previews_and_same_site_previews_for_several_people() {
+        let mut cfg = hosts_config();
+        cfg.ui_host = Some("ui.tunnel.example.com".into());
+        assert!(check_hosts(&cfg, false).unwrap_err().to_string().contains("must not be the preview zone"));
+        cfg.ui_host = Some("tunnel-ui.example.com".into());
+        check_hosts(&cfg, false).unwrap();
+        assert!(check_hosts(&cfg, true).unwrap_err().to_string().contains("separate registrable domain"));
+        cfg.preview_zone = "previews.example-previews.com".into();
+        check_hosts(&cfg, true).unwrap();
+        cfg.ui_host = None;
+        assert!(check_hosts(&cfg, true).unwrap_err().to_string().contains("needs the web UI"));
+    }
+
+    #[tokio::test]
+    async fn ask_config_sets_up_the_ui_and_a_separate_preview_zone() {
+        let token_file =
+            std::env::temp_dir().join(format!("tunnel-preview-token-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::write(&token_file, "preview-test-token\n").unwrap();
+        let ask = Ask { yes: true };
+        // Fresh single-user layout: the UI gets a sibling name, previews stay on the host.
+        let args = SetupArgs {
+            yes: true,
+            host: Some("tunnel.example.com".into()),
+            email: Some("test@example.com".into()),
+            dns_provider: Some("hetzner".into()),
+            dns_zone: Some("example.com".into()),
+            dns_token_file: Some(token_file.clone()),
+            webrtc: Some(false),
+            ..Default::default()
+        };
+        let cfg = ask_config(&ask, None, &args, Mode::System).await.unwrap();
+        assert_eq!(cfg.ui_host.as_deref(), Some("tunnel-ui.example.com"));
+        assert!(cfg.ui_same_site_as_previews());
+        assert!(record_hosts(&cfg).contains(&"tunnel-ui.example.com".to_string()));
+        // Several people: previews on another domain at another provider.
+        let args = SetupArgs {
+            multi_user: Some(true),
+            preview_zone: Some("previews.example-previews.com".into()),
+            preview_dns_provider: Some("digitalocean".into()),
+            preview_dns_zone: Some("example-previews.com".into()),
+            preview_dns_token_file: Some(token_file.clone()),
+            ..args
+        };
+        let cfg = ask_config(&ask, None, &args, Mode::System).await.unwrap();
+        assert_eq!(cfg.ui_host.as_deref(), Some("tunnel.example.com"));
+        assert_eq!(cfg.extra_dns.len(), 1);
+        assert_eq!(cfg.extra_dns[0].zone, "example-previews.com");
+        assert_eq!(
+            cfg.dns_for("3000-abc.previews.example-previews.com").unwrap().provider,
+            DnsProviderKind::Digitalocean
+        );
+        assert_eq!(cfg.dns_for("tunnel.example.com").unwrap().zone, "example.com");
+        check_names(&cfg).unwrap();
+        // Several people without a separate preview domain: refused.
+        let args = SetupArgs { preview_zone: Some("previews.example.com".into()), ..args };
+        let err = ask_config(&ask, None, &args, Mode::System).await.unwrap_err().to_string();
+        assert!(err.contains("separate registrable domain"), "{err}");
+        // An existing server without the UI keeps it off on a plain re-run.
+        let existing = hosts_config();
+        let args = SetupArgs { yes: true, ..Default::default() };
+        assert_eq!(ask_config(&ask, Some(&existing), &args, Mode::System).await.unwrap().ui_host, None);
+        std::fs::remove_file(token_file).unwrap();
+    }
+
+    #[test]
+    fn the_ui_secret_is_generated_with_the_ui() {
+        let mut cfg = hosts_config();
+        cfg.admin_token_hash = "set".into();
+        generate_secrets(&mut cfg);
+        assert!(cfg.ui_secret.is_none());
+        cfg.ui_host = Some("tunnel-ui.example.com".into());
+        generate_secrets(&mut cfg);
+        let secret = cfg.ui_secret.clone().unwrap();
+        assert!(secret.len() >= 32);
+        cfg.validate().unwrap();
+        generate_secrets(&mut cfg);
+        assert_eq!(cfg.ui_secret.as_deref(), Some(secret.as_str()), "kept on re-runs");
+    }
+
+    #[tokio::test]
+    async fn an_own_certificate_must_cover_every_name_and_is_never_issued() {
+        let dir =
+            std::env::temp_dir().join(format!("tunnel-own-cert-{}-{}", std::process::id(), rand::random::<u64>()));
+        let mut cfg = hosts_config();
+        cfg.data_dir = dir.clone();
+        cfg.acme.own_certificate = true;
+        cfg.ui_host = Some("tunnel-ui.example.com".into());
+        std::fs::create_dir_all(cfg.cert_dir()).unwrap();
+        let write = |names: &[&str]| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params =
+                rcgen::CertificateParams::new(names.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            std::fs::write(cfg.cert_dir().join("fullchain.pem"), cert.pem()).unwrap();
+            std::fs::write(cfg.cert_dir().join("privkey.pem"), key.serialize_pem()).unwrap();
+        };
+        write(&["*.tunnel.example.com", "tunnel.example.com"]);
+        let err = ensure_certificate(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("tunnel-ui.example.com"), "{err}");
+        write(&["*.tunnel.example.com", "tunnel.example.com", "tunnel-ui.example.com"]);
+        ensure_certificate(&cfg).await.unwrap();
+        assert!(crate::acme::issue(&cfg).await.unwrap_err().to_string().contains("own certificate"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_dns_with_an_own_certificate_needs_no_provider_settings() {
+        let ask = Ask { yes: true };
+        let args = SetupArgs {
+            yes: true,
+            host: Some("tunnel.example.org".into()),
+            email: Some("test@example.org".into()),
+            skip_dns: true,
+            own_certificate: Some(true),
+            webrtc: Some(false),
+            ..Default::default()
+        };
+        let cfg = ask_config(&ask, None, &args, Mode::System).await.unwrap();
+        assert!(cfg.acme.own_certificate);
+        assert_eq!(cfg.dns.zone, "example.org");
+        assert_eq!(cfg.dns.api_token, None);
+        assert!(cfg.extra_dns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_dns_flags_replace_an_existing_zone_on_reruns() {
+        let token_file = std::env::temp_dir().join(format!(
+            "tunnel-preview-token2-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&token_file, "renewed-token\n").unwrap();
+        let mut existing = hosts_config();
+        existing.preview_zone = "previews.example-previews.com".into();
+        existing.ui_host = Some("tunnel.example.com".into());
+        existing.extra_dns.push(DnsConfig {
+            provider: DnsProviderKind::Digitalocean,
+            zone: "example-previews.com".into(),
+            api_token: Some("expired-token".into()),
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            route53_hosted_zone_id: None,
+        });
+        let ask = Ask { yes: true };
+        // A plain re-run keeps the zone as it is.
+        let kept = ask_config(&ask, Some(&existing), &SetupArgs { yes: true, ..Default::default() }, Mode::System)
+            .await
+            .unwrap();
+        assert_eq!(kept.extra_dns[0].api_token.as_deref(), Some("expired-token"));
+        // An explicit token file replaces just the token.
+        let args = SetupArgs { yes: true, preview_dns_token_file: Some(token_file.clone()), ..Default::default() };
+        let renewed = ask_config(&ask, Some(&existing), &args, Mode::System).await.unwrap();
+        assert_eq!(renewed.extra_dns.len(), 1);
+        assert_eq!(renewed.extra_dns[0].api_token.as_deref(), Some("renewed-token"));
+        assert_eq!(renewed.extra_dns[0].provider, DnsProviderKind::Digitalocean);
+        assert_eq!(renewed.extra_dns[0].zone, "example-previews.com");
+        std::fs::remove_file(token_file).unwrap();
     }
 }

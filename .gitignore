@@ -9,3 +9,5 @@
 .vscode/
 *.swp
 .DS_Store
+/crates/web/target
+/crates/web/dist

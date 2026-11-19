@@ -1,0 +1,1 @@
+template@8020c16 packages/ui/src/styles/globals.css (tokens), packages/ui/src/components/{button,input,card,dialog}.tsx and apps/web/src/components/{header,page-shell,empty-state,error-state}.tsx (class strings ported by hand)

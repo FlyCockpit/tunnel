@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "tunnel", version, about = "Expose sandbox ports through Tunnel")]
+#[command(name = "tunnel", version, about = "Expose sandbox ports through Tunnel", disable_help_subcommand = true)]
 struct Cli {
     /// State directory (absolute): one daemon and one tunnel per directory.
     /// Default `$TUNNEL_STATE_DIR`, else `$XDG_RUNTIME_DIR/tunnel`, else `/tmp/tunnel-<uid>`.
@@ -66,11 +66,19 @@ enum Cmd {
     },
     /// Stop the daemon and forget exposed ports (deletes a tunnel `share` created).
     Stop,
-    /// Log this machine in with the code `tunnel-server client add` printed
-    /// (prompted for, so it stays out of process listings and shell history).
+    /// Log this machine in: `tunnel login https://<server>` asks you to approve
+    /// it in the browser; `tunnel login` with the code `tunnel-server client add`
+    /// printed works without one (prompted for, so it stays out of process
+    /// listings and shell history).
     Login {
-        /// `<code>@<host>`; omit (or `-`) to be prompted / read it from stdin.
+        /// `https://<server>`, or `<code>@<host>`; omit (or `-`) to be prompted / read it from stdin.
         code: Option<String>,
+        /// Machine name for browser approval (default: this host's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Do not try to open the approval page in a browser.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Forget this machine's login.
     Logout,
@@ -109,6 +117,11 @@ enum Cmd {
         /// How long the link works, e.g. 10m, 1h.
         #[arg(long, default_value = "10m", value_parser = login::parse_duration)]
         ttl: u64,
+    },
+    /// Help for a command, or `tunnel help agent`: how AI agents should share apps with tunnel.
+    Help {
+        /// A command name, or `agent`.
+        topic: Option<String>,
     },
     /// Run the daemon in the foreground, e.g. under systemd. Token, server and
     /// target come from TUNNEL_TOKEN, TUNNEL_SERVER and TUNNEL_TARGET_HOST (or the
@@ -162,14 +175,35 @@ fn main() {
     std::process::exit(code);
 }
 
+/// The agent skill (docs/agent/SKILL.md), for `tunnel help agent`.
+const AGENT_SKILL: &str = include_str!("../../../docs/agent/SKILL.md");
+
+fn help(topic: Option<&str>) -> anyhow::Result<i32> {
+    use clap::CommandFactory;
+    let mut cli = Cli::command();
+    match topic {
+        Some("agent") => print!("{AGENT_SKILL}"),
+        Some(name) => match cli.find_subcommand_mut(name) {
+            Some(sub) => sub.print_long_help()?,
+            None => anyhow::bail!("no help topic '{name}'; try `tunnel help` or `tunnel help agent`"),
+        },
+        None => {
+            cli.print_long_help()?;
+            println!("\nAI agents: `tunnel help agent` explains how to share an app safely.");
+        }
+    }
+    Ok(0)
+}
+
 async fn run(cmd: Cmd) -> anyhow::Result<i32> {
     match cmd {
+        Cmd::Help { topic } => help(topic.as_deref()),
         Cmd::Expose { ports, target } => commands::expose(ports, target).await,
         Cmd::Unexpose { port } => commands::unexpose(port).await,
         Cmd::Status { json } => commands::status(json).await,
         Cmd::Ice { format, fresh, exec: _, command } => commands::ice(format, fresh, command).await,
         Cmd::Stop => commands::stop().await,
-        Cmd::Login { code } => share::login(code.as_deref()).await,
+        Cmd::Login { code, name, no_browser } => share::login(code.as_deref(), name.as_deref(), !no_browser).await,
         Cmd::Logout => share::logout(),
         Cmd::Share { ports, public, password, link, username, ttl, label, target } => {
             share::share(ports, share::ShareAccess { public, password, link, username }, ttl, label, target).await

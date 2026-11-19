@@ -1,0 +1,33 @@
+# cargo-deny policy for the web UI (its own workspace): the server's policy
+# plus two permissive licenses its dependency tree needs: CC0-1.0 (base16,
+# via leptos' wasm_split macros) and BSL-1.0 (xxhash-rust, via server_fn).
+[graph]
+all-features = true
+targets = ["wasm32-unknown-unknown"]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

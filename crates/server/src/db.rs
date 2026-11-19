@@ -87,14 +87,100 @@ CREATE TABLE IF NOT EXISTS gate_grant_logins (
     PRIMARY KEY (session_hash, tunnel_id),
     FOREIGN KEY (session_hash, tunnel_id) REFERENCES gate_grants(session_hash, tunnel_id) ON DELETE CASCADE
 );
--- Machines enrolled with `client add` + `tunnel login`.
+-- Machines enrolled with `client add` + `tunnel login`, or approved in the
+-- browser (`tunnel login <url>`). Each belongs to a user.
 CREATE TABLE IF NOT EXISTS clients (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     token_hash   TEXT UNIQUE,
     created_at   INTEGER NOT NULL,
-    last_used_at INTEGER
+    last_used_at INTEGER,
+    user_id      TEXT NOT NULL REFERENCES users(id)
 );
+CREATE INDEX IF NOT EXISTS clients_user ON clients(user_id);
+-- People who sign in to the web UI. Exactly one owner (setup); admins manage
+-- users and see everything; members manage only their own machines.
+CREATE TABLE IF NOT EXISTS users (
+    id                 TEXT PRIMARY KEY,
+    username           TEXT NOT NULL UNIQUE,
+    password_hash      TEXT NOT NULL,
+    -- Sealed with a key derived from `ui_secret`; the pending one waits for
+    -- the first code during enrolment.
+    totp_secret_sealed TEXT,
+    totp_pending_sealed TEXT,
+    totp_last_step     INTEGER,
+    role               TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    disabled_at        INTEGER,
+    can_public         INTEGER NOT NULL DEFAULT 0,
+    max_tunnels        INTEGER NOT NULL,
+    max_clients        INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL,
+    -- Bumped by every change to how the user signs in (password, TOTP, role,
+    -- disabling): a session is issued only if it is unchanged since the check.
+    auth_epoch         INTEGER NOT NULL DEFAULT 0,
+    -- Wrong TOTP or recovery codes in a row, and the lockout they caused.
+    factor_failures    INTEGER NOT NULL DEFAULT 0,
+    factor_locked_until INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_one_owner ON users(role) WHERE role = 'owner';
+CREATE TABLE IF NOT EXISTS recovery_codes (
+    user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    used_at   INTEGER,
+    PRIMARY KEY (user_id, code_hash)
+);
+-- Single-use sign-up links: `invite` (role admin or member), and the owner's
+-- `owner_setup` / `owner_reset` from `tunnel-server admin link`.
+CREATE TABLE IF NOT EXISTS invites (
+    id         TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    kind       TEXT NOT NULL CHECK (kind IN ('invite', 'owner_setup', 'owner_reset')),
+    role       TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    created_by TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at    INTEGER,
+    used_by    TEXT
+);
+-- Web UI sessions (`__Host-tunnel-ui` cookie; only the hash is stored).
+-- `pending` sessions have passed the password and wait for the TOTP code.
+CREATE TABLE IF NOT EXISTS ui_sessions (
+    id_hash      TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    pending      INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    -- Last password or TOTP check, for re-authentication on sensitive steps.
+    auth_at      INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    -- The user's auth_epoch when the session was issued.
+    auth_epoch   INTEGER NOT NULL,
+    ip           TEXT,
+    user_agent   TEXT
+);
+CREATE INDEX IF NOT EXISTS ui_sessions_user ON ui_sessions(user_id);
+-- Browser-approved machine logins (RFC 8628 device flow).
+CREATE TABLE IF NOT EXISTS device_logins (
+    device_code_hash TEXT PRIMARY KEY,
+    user_code        TEXT NOT NULL UNIQUE,
+    client_name      TEXT NOT NULL,
+    ip               TEXT,
+    created_at       INTEGER NOT NULL,
+    expires_at       INTEGER NOT NULL,
+    interval_s       INTEGER NOT NULL,
+    last_poll_at     INTEGER,
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
+    user_id          TEXT REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS audit (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    at      INTEGER NOT NULL,
+    user_id TEXT,
+    action  TEXT NOT NULL,
+    target  TEXT,
+    ip      TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_at ON audit(at);
 -- Service credentials (`service add`): API-only callers such as a sandbox
 -- platform. They manage only their own tunnels, within `max_tunnels`.
 CREATE TABLE IF NOT EXISTS services (
@@ -232,9 +318,56 @@ pub struct TunnelPatch {
     pub access: Option<Access>,
     /// Resolve an omitted password from the row in the update transaction.
     pub keep_password_hash: bool,
-    /// Refuse a switch into public access (the row is checked in the update
-    /// transaction; a tunnel that is already public may stay public).
-    pub forbid_public: bool,
+    /// The caller's owner id (client or service) and the server's rules for
+    /// it, applied with the owner's *current* role and permissions inside the
+    /// update transaction: a switch into public access needs permission (a
+    /// tunnel that is already public may stay public), and members' expiry is
+    /// capped. `None` for the admin token.
+    pub owner_policy: Option<(String, Policy)>,
+}
+
+/// Server rules evaluated against an owner's current permissions in the
+/// same transaction as a tunnel write.
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    /// `limits.allow_public_for_clients`.
+    pub allow_all_public: bool,
+    /// Longest lifetime for a member's machine, in seconds from now.
+    pub member_max_ttl_s: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("the tunnel lifetime is longer than this account may set")]
+pub struct TtlTooLong;
+
+/// The current permissions of tunnel owner `owner` (a client or service id):
+/// whether it may create public previews, and its longest lifetime. `None`
+/// if the owner is gone or its user is disabled.
+fn owner_rules(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &str,
+    policy: Policy,
+) -> anyhow::Result<Option<(bool, Option<i64>)>> {
+    let service: bool =
+        tx.query_row("SELECT EXISTS (SELECT 1 FROM services WHERE id = ?1)", params![owner], |r| r.get(0))?;
+    if service {
+        return Ok(Some((policy.allow_all_public, None)));
+    }
+    let user: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT u.role, u.can_public FROM clients c JOIN users u ON u.id = c.user_id
+             WHERE c.id = ?1 AND u.disabled_at IS NULL",
+            params![owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(user.map(|(role, can_public)| {
+        if role == "member" {
+            (can_public || policy.allow_all_public, Some(policy.member_max_ttl_s))
+        } else {
+            (true, None)
+        }
+    }))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,12 +410,34 @@ pub struct ServiceRow {
 #[derive(Debug, Clone)]
 pub struct ClientRow {
     pub name: String,
+    /// The owning user's name.
+    pub user: String,
     /// False until the enrollment code has been redeemed.
     pub enrolled: bool,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     /// Unexpired tunnels it created.
     pub tunnels: i64,
+}
+
+/// The machine client behind a `tncli_` token, and its owner.
+#[derive(Debug, Clone)]
+pub struct ClientAuth {
+    pub id: String,
+    pub name: String,
+    pub user_id: String,
+    pub role: crate::ui::store::Role,
+    pub can_public: bool,
+}
+
+/// Why a new client was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewClientError {
+    NameTaken,
+    /// The owner is unknown or disabled.
+    NoUser,
+    /// A member already has `max_clients` machines.
+    Quota,
 }
 
 /// Outcome of redeeming an access link.
@@ -348,6 +503,23 @@ impl Db {
             }
             v => anyhow::bail!("unsupported database schema version {v}"),
         }
+        // `CREATE TABLE IF NOT EXISTS` leaves a table from an earlier
+        // prerelease build as it was; refuse one that lacks columns this
+        // build needs, with a message, rather than failing on a query.
+        let clients_table: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'clients')",
+            [],
+            |r| r.get(0),
+        )?;
+        let has_owner: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('clients') WHERE name = 'user_id')",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            !clients_table || has_owner,
+            "database predates user accounts (`clients.user_id` is missing); see the CHANGELOG entry for the one-time upgrade"
+        );
         tx.execute_batch(SCHEMA)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -389,19 +561,51 @@ impl Db {
     /// transaction, including across connections. Clients are limited by
     /// `max_tunnels_per_client`, services by their own `max_tunnels`;
     /// admin-owned tunnels are not limited.
+    #[cfg(test)]
     pub async fn create_tunnel(&self, t: NewTunnel, max_tunnels_per_client: u32) -> anyhow::Result<Option<TunnelRow>> {
+        let unrestricted = Policy { allow_all_public: true, member_max_ttl_s: i64::MAX };
+        self.create_tunnel_with(t, max_tunnels_per_client, unrestricted).await
+    }
+
+    /// [`Db::create_tunnel`], with the owner's current public and lifetime
+    /// rules checked in the same transaction (errors `PublicNotAllowed`,
+    /// `TtlTooLong`).
+    pub async fn create_tunnel_with(
+        &self,
+        t: NewTunnel,
+        max_tunnels_per_client: u32,
+        policy: Policy,
+    ) -> anyhow::Result<Option<TunnelRow>> {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let created = now();
+            if let Some(owner) = &t.client_id
+                && let Some((public, cap)) = owner_rules(&tx, owner, policy)?
+            {
+                if t.access.mode == AccessMode::Public && !public {
+                    return Err(PublicNotAllowed.into());
+                }
+                if cap.is_some_and(|cap| t.expires_at - created > cap) {
+                    return Err(TtlTooLong.into());
+                }
+            }
             let metadata = t.metadata.as_ref().map(|m| m.to_string());
             let inserted = tx.execute(
                 "INSERT INTO tunnels (id, token_hash, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at,
                                       access_mode, password_user, password_hash, client_id)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
                  WHERE ?13 IS NULL OR (
-                     (EXISTS (SELECT 1 FROM clients WHERE id = ?13) OR EXISTS (SELECT 1 FROM services WHERE id = ?13))
+                     (EXISTS (SELECT 1 FROM clients c JOIN users u ON u.id = c.user_id
+                              WHERE c.id = ?13 AND u.disabled_at IS NULL)
+                      OR EXISTS (SELECT 1 FROM services WHERE id = ?13))
                      AND (SELECT COUNT(*) FROM tunnels WHERE client_id = ?13 AND expires_at > ?8)
                          < COALESCE((SELECT max_tunnels FROM services WHERE id = ?13), ?14)
+                     -- A member's quota covers the tunnels of all their machines.
+                     AND NOT EXISTS (
+                         SELECT 1 FROM clients c JOIN users u ON u.id = c.user_id
+                         WHERE c.id = ?13 AND u.role = 'member'
+                           AND (SELECT COUNT(*) FROM tunnels t JOIN clients c2 ON c2.id = t.client_id
+                                WHERE c2.user_id = u.id AND t.expires_at > ?8) >= u.max_tunnels)
                  )",
                 params![
                     t.id,
@@ -422,7 +626,9 @@ impl Db {
             )?;
             if inserted == 0 {
                 let owner_exists: bool = tx.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM clients WHERE id = ?1) OR EXISTS (SELECT 1 FROM services WHERE id = ?1)",
+                    "SELECT EXISTS (SELECT 1 FROM clients c JOIN users u ON u.id = c.user_id
+                                    WHERE c.id = ?1 AND u.disabled_at IS NULL)
+                         OR EXISTS (SELECT 1 FROM services WHERE id = ?1)",
                     params![t.client_id],
                     |r| r.get(0),
                 )?;
@@ -525,7 +731,18 @@ impl Db {
             let Some(current) = current.filter(|row| !row.is_expired()) else { return Ok(None) };
             let mut access_changed = false;
             let mut grants_changed = false;
+            let rules = match &patch.owner_policy {
+                Some((owner, policy)) => match owner_rules(&tx, owner, *policy)? {
+                    Some(rules) => Some(rules),
+                    // The machine was removed or its user disabled meanwhile.
+                    None => return Ok(None),
+                },
+                None => None,
+            };
             if let Some(v) = patch.expires_at {
+                if rules.and_then(|(_, cap)| cap).is_some_and(|cap| v - now() > cap) {
+                    return Err(TtlTooLong.into());
+                }
                 tx.execute("UPDATE tunnels SET expires_at = ?2 WHERE id = ?1", params![id, v])?;
             }
             if let Some(v) = &patch.label {
@@ -538,8 +755,8 @@ impl Db {
                 tx.execute("UPDATE tunnels SET inject_ice = ?2 WHERE id = ?1", params![id, v])?;
             }
             if let Some(mut access) = patch.access {
-                if patch.forbid_public && access.mode == AccessMode::Public && current.access.mode != AccessMode::Public
-                {
+                let may_public = rules.is_none_or(|(public, _)| public);
+                if !may_public && access.mode == AccessMode::Public && current.access.mode != AccessMode::Public {
                     return Err(PublicNotAllowed.into());
                 }
                 if patch.keep_password_hash && access.mode == AccessMode::Password {
@@ -780,30 +997,41 @@ impl Db {
 
     // ---------------------------------------------------------------- clients
 
-    /// New client `name` with a one-time enrollment code (hash stored) valid
-    /// until `code_expires_at`. `None` if the name is taken.
+    /// New client `name` owned by `user_id`, with a one-time enrollment code
+    /// (hash stored) valid until `code_expires_at`.
     pub async fn create_client(
         &self,
         id: String,
         name: String,
+        user_id: String,
         code_hash: String,
         code_expires_at: i64,
-    ) -> anyhow::Result<Option<ClientRow>> {
+        session: Option<String>,
+    ) -> anyhow::Result<Result<ClientRow, NewClientError>> {
         self.call(move |c| {
             let t = now();
-            let tx = c.transaction()?;
-            let taken: i64 =
-                tx.query_row("SELECT COUNT(*) FROM clients WHERE name = ?1", params![name], |r| r.get(0))?;
-            if taken > 0 {
-                return Ok(None);
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // From the web UI: only while the requesting session is still valid.
+            if let Some(session) = &session
+                && !crate::ui::store::authorized(&tx, &user_id, None, session)?
+            {
+                return Ok(Err(NewClientError::NoUser));
             }
-            tx.execute("INSERT INTO clients (id, name, created_at) VALUES (?1, ?2, ?3)", params![id, name, t])?;
+            if let Err(e) = client_admissible(&tx, &name, &user_id)? {
+                return Ok(Err(e));
+            }
+            tx.execute(
+                "INSERT INTO clients (id, name, created_at, user_id) VALUES (?1, ?2, ?3, ?4)",
+                params![id, name, t, user_id],
+            )?;
             tx.execute(
                 "INSERT INTO client_enrollments (code_hash, client_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
                 params![code_hash, id, t, code_expires_at],
             )?;
+            let user: String =
+                tx.query_row("SELECT username FROM users WHERE id = ?1", params![user_id], |r| r.get(0))?;
             tx.commit()?;
-            Ok(Some(ClientRow { name, enrolled: false, created_at: t, last_used_at: None, tunnels: 0 }))
+            Ok(Ok(ClientRow { name, user, enrolled: false, created_at: t, last_used_at: None, tunnels: 0 }))
         })
         .await
     }
@@ -842,19 +1070,32 @@ impl Db {
         .await
     }
 
-    /// The client holding `token_hash`, recording use at most once a minute.
-    pub async fn client_by_token_hash(&self, token_hash: String) -> anyhow::Result<Option<(String, String)>> {
+    /// The client holding `token_hash` (its owner enabled), recording use at
+    /// most once a minute.
+    pub async fn client_by_token_hash(&self, token_hash: String) -> anyhow::Result<Option<ClientAuth>> {
         self.call(move |c| {
             let t = now();
-            let found: Option<(String, String)> = c
-                .query_row("SELECT id, name FROM clients WHERE token_hash = ?1", params![token_hash], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
+            let found = c
+                .query_row(
+                    "SELECT c.id, c.name, u.id, u.role, u.can_public FROM clients c
+                     JOIN users u ON u.id = c.user_id
+                     WHERE c.token_hash = ?1 AND u.disabled_at IS NULL",
+                    params![token_hash],
+                    |r| {
+                        Ok(ClientAuth {
+                            id: r.get(0)?,
+                            name: r.get(1)?,
+                            user_id: r.get(2)?,
+                            role: crate::ui::store::Role::parse(&r.get::<_, String>(3)?),
+                            can_public: r.get(4)?,
+                        })
+                    },
+                )
                 .optional()?;
-            if let Some((id, _)) = &found {
+            if let Some(found) = &found {
                 c.execute(
                     "UPDATE clients SET last_used_at = ?2 WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?2 - 60)",
-                    params![id, t],
+                    params![found.id, t],
                 )?;
             }
             Ok(found)
@@ -868,8 +1109,8 @@ impl Db {
             let predicate = if cursor.is_some() { "WHERE c.name > ?3" } else { "" };
             let mut stmt = c.prepare(&format!(
                 "SELECT c.name, c.token_hash IS NOT NULL, c.created_at, c.last_used_at,
-                        (SELECT COUNT(*) FROM tunnels t WHERE t.client_id = c.id AND t.expires_at > ?1)
-                 FROM clients c {predicate} ORDER BY c.name LIMIT ?2"
+                        (SELECT COUNT(*) FROM tunnels t WHERE t.client_id = c.id AND t.expires_at > ?1), u.username
+                 FROM clients c JOIN users u ON u.id = c.user_id {predicate} ORDER BY c.name LIMIT ?2"
             ))?;
             let mut values = vec![Value::Integer(now()), Value::Integer(i64::from(limit) + 1)];
             if let Some(cursor) = cursor {
@@ -883,6 +1124,7 @@ impl Db {
                         created_at: r.get(2)?,
                         last_used_at: r.get(3)?,
                         tunnels: r.get(4)?,
+                        user: r.get(5)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
@@ -894,8 +1136,8 @@ impl Db {
         self.call(|c| {
             let mut stmt = c.prepare(
                 "SELECT c.name, c.token_hash IS NOT NULL, c.created_at, c.last_used_at,
-                        (SELECT COUNT(*) FROM tunnels t WHERE t.client_id = c.id AND t.expires_at > ?1)
-                 FROM clients c ORDER BY c.name",
+                        (SELECT COUNT(*) FROM tunnels t WHERE t.client_id = c.id AND t.expires_at > ?1), u.username
+                 FROM clients c JOIN users u ON u.id = c.user_id ORDER BY c.name",
             )?;
             let rows = stmt
                 .query_map(params![now()], |r| {
@@ -905,6 +1147,7 @@ impl Db {
                         created_at: r.get(2)?,
                         last_used_at: r.get(3)?,
                         tunnels: r.get(4)?,
+                        user: r.get(5)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1132,7 +1375,7 @@ impl Db {
     }
 }
 
-const TUNNEL_SELECT: &str = "SELECT id, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at, last_seen_at, access_mode, password_user, password_hash, client_id FROM tunnels";
+pub(crate) const TUNNEL_SELECT: &str = "SELECT id, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at, last_seen_at, access_mode, password_user, password_hash, client_id FROM tunnels";
 
 /// Fresh session for a new grant on `tunnel_id`, carrying the unexpired grants
 /// (and their provenance) of every live presented session. Returns the
@@ -1241,7 +1484,33 @@ fn revoke_login_grants(tx: &rusqlite::Transaction<'_>, tunnel_id: &str) -> anyho
 
 /// Expire every tunnel owned by `owner_id` so it stops serving at once;
 /// returns their ids.
-fn expire_owner_tunnels(tx: &rusqlite::Transaction<'_>, owner_id: &str) -> anyhow::Result<Vec<String>> {
+/// Checks shared by every way a client is created: a free name and an
+/// enabled owner below their machine quota (members only).
+pub(crate) fn client_admissible(
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    user_id: &str,
+) -> anyhow::Result<Result<(), NewClientError>> {
+    let taken: i64 = tx.query_row("SELECT COUNT(*) FROM clients WHERE name = ?1", params![name], |r| r.get(0))?;
+    if taken > 0 {
+        return Ok(Err(NewClientError::NameTaken));
+    }
+    let user: Option<(String, i64, i64)> = tx
+        .query_row(
+            "SELECT u.role, u.max_clients, (SELECT COUNT(*) FROM clients c WHERE c.user_id = u.id)
+             FROM users u WHERE u.id = ?1 AND u.disabled_at IS NULL",
+            params![user_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(match user {
+        None => Err(NewClientError::NoUser),
+        Some((role, max, have)) if role == "member" && have >= max => Err(NewClientError::Quota),
+        Some(_) => Ok(()),
+    })
+}
+
+pub(crate) fn expire_owner_tunnels(tx: &rusqlite::Transaction<'_>, owner_id: &str) -> anyhow::Result<Vec<String>> {
     let tunnels: Vec<String> = {
         let mut stmt = tx.prepare("SELECT id FROM tunnels WHERE client_id = ?1")?;
         stmt.query_map(params![owner_id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
@@ -1253,7 +1522,7 @@ fn expire_owner_tunnels(tx: &rusqlite::Transaction<'_>, owner_id: &str) -> anyho
     Ok(tunnels)
 }
 
-fn tunnel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
+pub(crate) fn tunnel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelRow> {
     let metadata: Option<String> = r.get(2)?;
     let host_header: String = r.get(4)?;
     Ok(TunnelRow {
@@ -1283,7 +1552,18 @@ mod tests {
         let path = std::env::temp_dir()
             .join("tunnel-db-tests")
             .join(format!("tunnel-test-{}.db", crate::tokens::random_tunnel_id()));
-        (Db::open(&path).unwrap(), path)
+        let db = Db::open(&path).unwrap();
+        // Clients belong to a user; tests share one member with generous quotas.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO users (id, username, password_hash, role, max_tunnels, max_clients, created_at)
+                 VALUES ('utest', 'tester', 'x', 'member', 1000, 1000, 0)",
+                [],
+            )
+            .unwrap();
+        (db, path)
     }
 
     fn password_access(hash: &str) -> Access {
@@ -1567,15 +1847,30 @@ mod tests {
     #[tokio::test]
     async fn client_enrollment_and_delete() {
         let (db, path) = temp_db();
-        assert!(db.create_client("c1".into(), "laptop".into(), "code".into(), now() + 900).await.unwrap().is_some());
-        assert!(db.create_client("c2".into(), "laptop".into(), "code2".into(), now() + 900).await.unwrap().is_none());
-        assert!(db.create_client("c3".into(), "old".into(), "stale".into(), now() - 1).await.unwrap().is_some());
+        assert!(
+            db.create_client("c1".into(), "laptop".into(), "utest".into(), "code".into(), now() + 900, None)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            db.create_client("c2".into(), "laptop".into(), "utest".into(), "code2".into(), now() + 900, None)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            db.create_client("c3".into(), "old".into(), "utest".into(), "stale".into(), now() - 1, None)
+                .await
+                .unwrap()
+                .is_ok()
+        );
 
         assert!(db.enroll_client("wrong".into(), "t".into()).await.unwrap().is_none());
         assert!(db.enroll_client("stale".into(), "t".into()).await.unwrap().is_none(), "expired code");
         assert_eq!(db.enroll_client("code".into(), "tok".into()).await.unwrap().as_deref(), Some("laptop"));
         assert!(db.enroll_client("code".into(), "tok2".into()).await.unwrap().is_none(), "single use");
-        assert_eq!(db.client_by_token_hash("tok".into()).await.unwrap().map(|(id, _)| id).as_deref(), Some("c1"));
+        assert_eq!(db.client_by_token_hash("tok".into()).await.unwrap().map(|c| c.id).as_deref(), Some("c1"));
 
         let mk = |id: &str, client: Option<&str>| NewTunnel {
             id: id.into(),
@@ -1679,7 +1974,7 @@ mod tests {
             client_id: Some(client.into()),
         };
         assert!(db.create_tunnel(t("gone1aaaaa", "no-such-client"), 20).await.unwrap().is_none());
-        db.create_client("cx".into(), "x".into(), "c".into(), now() + 60).await.unwrap();
+        db.create_client("cx".into(), "x".into(), "utest".into(), "c".into(), now() + 60, None).await.unwrap().unwrap();
         assert!(db.create_tunnel(t("live1aaaaa", "cx"), 20).await.unwrap().is_some());
         db.delete_client("x".into()).await.unwrap();
         assert!(db.create_tunnel(t("late1aaaaa", "cx"), 20).await.unwrap().is_none());
@@ -1731,26 +2026,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forbidden_public_switch_is_checked_in_the_update_transaction() {
+    async fn public_and_lifetime_rules_use_the_owners_current_permissions() {
         let (db, path) = temp_db();
-        db.create_tunnel(new_tunnel("aaaaaaaaaa", None, now() + 600), 1).await.unwrap().unwrap();
+        db.create_client("c1".into(), "laptop".into(), "utest".into(), "code".into(), now() + 900, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = Policy { allow_all_public: false, member_max_ttl_s: 3600 };
         let public = Access { mode: AccessMode::Public, password_user: None, password_hash: None };
+        let mut t = new_tunnel("aaaaaaaaaa", Some("c1"), now() + 600);
+        t.access = public.clone();
+        let refused = db.create_tunnel_with(t, 20, policy).await;
+        assert!(refused.err().unwrap().is::<PublicNotAllowed>(), "a member without can_public");
+        let long = db.create_tunnel_with(new_tunnel("bbbbbbbbbb", Some("c1"), now() + 7200), 20, policy).await;
+        assert!(long.err().unwrap().is::<TtlTooLong>());
+        db.create_tunnel_with(new_tunnel("aaaaaaaaaa", Some("c1"), now() + 600), 20, policy).await.unwrap().unwrap();
         let patch = |access: Access| TunnelPatch {
             label: Some("changed".into()),
             access: Some(access),
-            forbid_public: true,
+            owner_policy: Some(("c1".into(), policy)),
             ..TunnelPatch::default()
         };
         let refused = db.update_tunnel("aaaaaaaaaa".into(), patch(public.clone())).await;
         assert!(refused.err().unwrap().is::<PublicNotAllowed>());
         let row = db.get_tunnel("aaaaaaaaaa".into()).await.unwrap().unwrap();
         assert_eq!((row.access.mode, row.label), (AccessMode::Link, None), "nothing of a refused patch is applied");
-        // Already public (e.g. switched by the admin meanwhile): stays editable.
-        let admin = TunnelPatch { access: Some(public.clone()), ..TunnelPatch::default() };
-        db.update_tunnel("aaaaaaaaaa".into(), admin).await.unwrap().unwrap();
+        let extend = TunnelPatch {
+            expires_at: Some(now() + 7200),
+            owner_policy: Some(("c1".into(), policy)),
+            ..TunnelPatch::default()
+        };
+        assert!(db.update_tunnel("aaaaaaaaaa".into(), extend).await.err().unwrap().is::<TtlTooLong>());
+        // Permission granted meanwhile: the same patch now passes.
+        db.call(|c| {
+            c.execute("UPDATE users SET can_public = 1 WHERE id = 'utest'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let switched = db.update_tunnel("aaaaaaaaaa".into(), patch(public.clone())).await.unwrap().unwrap();
+        assert_eq!(switched.row.access.mode, AccessMode::Public);
+        // Revoked again: an already public tunnel stays editable.
+        db.call(|c| {
+            c.execute("UPDATE users SET can_public = 0 WHERE id = 'utest'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         let kept = db.update_tunnel("aaaaaaaaaa".into(), patch(public)).await.unwrap().unwrap();
         assert_eq!(kept.row.access.mode, AccessMode::Public);
         drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn a_clients_table_without_owners_is_refused() {
+        let (db, path) = temp_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            // A prerelease database from before user accounts.
+            conn.execute_batch("DROP TABLE client_enrollments; DROP TABLE clients; CREATE TABLE clients (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT UNIQUE, created_at INTEGER NOT NULL, last_used_at INTEGER);").unwrap();
+        }
+        drop(db);
+        let err = Db::open(&path).err().expect("refused");
+        assert!(format!("{err:#}").contains("clients.user_id"), "{err:#}");
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
@@ -1763,7 +2104,10 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             // A database written before service credentials existed.
             conn.execute_batch("DROP TABLE services").unwrap();
-            conn.execute("INSERT INTO clients (id, name, token_hash, created_at) VALUES ('c1', 'laptop', 'h', 1)", [])
+            conn.execute(
+                "INSERT INTO clients (id, name, token_hash, created_at, user_id) VALUES ('c1', 'laptop', 'h', 1, 'utest')",
+                [],
+            )
                 .unwrap();
         }
         drop(db);
@@ -1816,7 +2160,10 @@ mod tests {
     #[tokio::test]
     async fn tunnel_quota_boundary_expiry_deletion_and_admin_exemption() {
         let (db, path) = temp_db();
-        db.create_client("client".into(), "client".into(), "code".into(), now() + 600).await.unwrap();
+        db.create_client("client".into(), "client".into(), "utest".into(), "code".into(), now() + 600, None)
+            .await
+            .unwrap()
+            .unwrap();
         let denied = db.create_tunnel(new_tunnel("zero", Some("client"), now() + 600), 0).await.unwrap_err();
         assert!(denied.is::<TunnelQuotaExceeded>());
         db.create_tunnel(new_tunnel("expired", Some("client"), now()), 1).await.unwrap().unwrap();
@@ -1837,7 +2184,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_connections_cannot_exceed_tunnel_quota() {
         let (db, path) = temp_db();
-        db.create_client("client".into(), "client".into(), "code".into(), now() + 600).await.unwrap();
+        db.create_client("client".into(), "client".into(), "utest".into(), "code".into(), now() + 600, None)
+            .await
+            .unwrap()
+            .unwrap();
         let other = Db::open(&path).unwrap();
         let mut pending = Vec::new();
         for i in 0..12 {
@@ -1880,7 +2230,8 @@ mod tests {
                     .unwrap();
                 assert!(required);
             }
-            conn.execute("INSERT INTO clients (id, name, created_at) VALUES ('c1', 'saved', 1)", []).unwrap();
+            conn.execute("INSERT INTO clients (id, name, created_at, user_id) VALUES ('c1', 'saved', 1, 'utest')", [])
+                .unwrap();
         }
         drop(db);
         let reopened = Db::open(&path).unwrap();

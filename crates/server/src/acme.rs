@@ -35,11 +35,20 @@ struct StoredAccount {
 /// Run a full DNS-01 order for `cfg.cert_names()` and write the result to
 /// `cfg.cert_dir()`. Challenge TXT cleanup is attempted afterwards, including on timeout.
 pub async fn issue(cfg: &Config) -> anyhow::Result<()> {
-    let provider = dns::Provider::from_config(cfg)?;
+    anyhow::ensure!(
+        !cfg.acme.own_certificate,
+        "this server uses its own certificate (acme.own_certificate): replace fullchain.pem and privkey.pem in {}",
+        cfg.cert_dir().display()
+    );
+    // Every name must be in a configured zone before anything is ordered.
+    for name in cfg.cert_names() {
+        dns::Provider::for_host(cfg, &name)?;
+    }
     issue_with_cleanup(
-        &(cfg, provider),
-        |(cfg, provider), created| Box::pin(run_order(cfg, provider, created)),
-        |(_, provider), rec| Box::pin(provider.delete(rec)),
+        cfg,
+        |cfg, created| Box::pin(run_order(cfg, created)),
+        // A challenge record lives in the zone of the name it is for.
+        |cfg, rec| Box::pin(async move { dns::Provider::for_host(cfg, &rec.name)?.delete(rec).await }),
     )
     .await
 }
@@ -68,7 +77,7 @@ async fn issue_with_cleanup<C>(
     result
 }
 
-async fn run_order(cfg: &Config, provider: &dns::Provider, created: &mut Vec<RecordRef>) -> anyhow::Result<()> {
+async fn run_order(cfg: &Config, created: &mut Vec<RecordRef>) -> anyhow::Result<()> {
     let names = cfg.cert_names();
     let account = load_or_create_account(cfg).await?;
 
@@ -99,7 +108,7 @@ async fn run_order(cfg: &Config, provider: &dns::Provider, created: &mut Vec<Rec
             let txt_name = format!("_acme-challenge.{}", domain.trim_start_matches("*."));
             let value = challenge.key_authorization().dns_value();
             // Create, never replace: two authorizations could share a TXT name.
-            let rec = provider.create_txt(&txt_name, &value).await?;
+            let rec = dns::Provider::for_host(cfg, &txt_name)?.create_txt(&txt_name, &value).await?;
             created.push(rec);
             pending.push((txt_name, value));
         }
@@ -269,6 +278,11 @@ pub async fn renew_loop(state: Arc<AppState>) {
 async fn renew_if_needed(state: &AppState) -> anyhow::Result<()> {
     let status = tls::cert_status(&state.config);
     if let CertStatus::Valid { .. } = status {
+        return Ok(());
+    }
+    if state.config.acme.own_certificate {
+        // Not ours to renew; say so while there is time to act.
+        tracing::warn!(?status, dir = %state.config.cert_dir().display(), "own certificate needs replacing");
         return Ok(());
     }
     tracing::info!(?status, "certificate needs (re)issuance");

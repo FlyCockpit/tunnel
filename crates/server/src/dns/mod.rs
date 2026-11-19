@@ -41,8 +41,13 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn from_config(cfg: &Config) -> anyhow::Result<Self> {
-        let dns = &cfg.dns;
+    /// The provider of the zone holding `host` (see `Config::dns_for`).
+    pub fn for_host(cfg: &Config, host: &str) -> anyhow::Result<Self> {
+        let host = host.trim_start_matches("*.");
+        Self::from_dns(cfg.dns_for(host).with_context(|| format!("no configured DNS zone holds {host}"))?)
+    }
+
+    pub fn from_dns(dns: &crate::config::DnsConfig) -> anyhow::Result<Self> {
         let zone = normalize(&dns.zone);
         anyhow::ensure!(!zone.is_empty(), "dns.zone is empty");
         let http = http_client()?;

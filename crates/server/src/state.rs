@@ -93,6 +93,8 @@ pub struct AppState {
     pub metrics: Metrics,
     /// Per-IP limiter for `/__access/*`.
     pub access_limiter: RateLimiter,
+    /// Web UI keys and limiters.
+    pub ui: crate::ui::UiState,
     tunnel_cache: Cache<Arc<TunnelLookup>>,
     session_cache: Cache<Grants>,
     visitor_lookups: tokio::sync::Semaphore,
@@ -108,6 +110,7 @@ impl AppState {
     pub fn new(config: Config, db: Db, certs: Arc<CertStore>) -> Arc<Self> {
         let access_limiter = RateLimiter::new(config.limits.access_rate_per_min);
         Arc::new(Self {
+            ui: crate::ui::UiState::new(&config),
             config,
             db,
             registry: Registry::default(),

@@ -1,7 +1,9 @@
 #!/bin/sh
-# Tunnel installer: download `tunnel-server`, verify its minisign
-# signature and SHA-256, install it to /usr/local/bin, then run the setup
-# wizard. All configuration logic lives in `tunnel-server setup`.
+# Tunnel server installer: download `tunnel-server`, install it to
+# /usr/local/bin only if its SHA-256 matches the release's `sha256.sum`
+# (fail closed), then run the setup wizard. All configuration logic lives in
+# `tunnel-server setup`. The release also carries signed build provenance:
+# `gh attestation verify tunnel-server-<target> --repo FlyCockpit/tunnel`.
 #
 #   curl -fsSL https://github.com/FlyCockpit/tunnel/releases/latest/download/install.sh | sudo sh
 #   curl -fsSL https://github.com/FlyCockpit/tunnel/releases/latest/download/install.sh | sudo sh -s -- --staging
@@ -9,11 +11,6 @@ set -eu
 
 # Override DOWNLOAD_BASE to install from a specific release or an HTTPS mirror.
 DOWNLOAD_BASE="${DOWNLOAD_BASE:-https://github.com/FlyCockpit/tunnel/releases/latest/download}"
-# PLACEHOLDER: replace with the project's minisign public key before the first release
-# Use the second line of minisign.pub. Until replaced, installation is refused
-# unless TUNNEL_ALLOW_UNSIGNED=1 is explicitly set; checksums are still verified.
-MINISIGN_PUBKEY="REPLACE_WITH_MINISIGN_PUBLIC_KEY"
-PUBKEY_PLACEHOLDER="REPLACE_WITH_MINISIGN_PUBLIC_KEY"
 
 BIN=tunnel-server
 INSTALL_DIR=/usr/local/bin
@@ -44,40 +41,16 @@ fetch() {
         die "download failed: $DOWNLOAD_BASE/$1"
 }
 
-install_minisign() {
-    command -v minisign >/dev/null 2>&1 && return 0
-    echo "Installing minisign"
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq minisign
-    elif command -v dnf >/dev/null 2>&1; then
-        # Fedora ships minisign; RHEL-likes need EPEL.
-        dnf install -y -q minisign || { dnf install -y -q epel-release && dnf install -y -q minisign; }
-    fi
-    command -v minisign >/dev/null 2>&1 || die "could not install minisign"
-}
-
 echo "Downloading $asset from $DOWNLOAD_BASE"
+fetch sha256.sum
 fetch "$asset"
-fetch SHA256SUMS
-fetch SHA256SUMS.minisig
-
-if [ "$MINISIGN_PUBKEY" = "$PUBKEY_PLACEHOLDER" ]; then
-    if [ "${TUNNEL_ALLOW_UNSIGNED:-0}" = 1 ]; then
-        echo "WARNING: no minisign public key embedded; skipping signature check (TUNNEL_ALLOW_UNSIGNED=1)" >&2
-    else
-        die "this installer has no minisign public key embedded; refusing to install" \
-            "(set TUNNEL_ALLOW_UNSIGNED=1 to override)"
-    fi
-else
-    install_minisign
-    minisign -V -q -P "$MINISIGN_PUBKEY" -m "$tmp/SHA256SUMS" -x "$tmp/SHA256SUMS.minisig" ||
-        die "SHA256SUMS signature verification failed"
-fi
 
 # Lines are "<hash>  <name>" (or "<hash> *<name>" in binary mode).
-expected=$(awk -v f="$asset" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")
-[ -n "$expected" ] || die "$asset is not listed in SHA256SUMS"
+expected=$(awk -v f="$asset" '{ sub(/\r$/, "") } $2 == f || $2 == "*" f { print tolower($1); exit }' "$tmp/sha256.sum")
+case "$expected" in
+    "" | *[!0-9a-f]*) die "$asset is not listed in sha256.sum; not installing it" ;;
+esac
+[ ${#expected} -eq 64 ] || die "$asset is not listed in sha256.sum; not installing it"
 actual=$(sha256sum "$tmp/$asset" | awk '{ print $1 }')
 [ "$expected" = "$actual" ] || die "checksum mismatch for $asset (expected $expected, got $actual)"
 

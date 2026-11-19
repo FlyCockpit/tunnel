@@ -14,7 +14,6 @@ use bytes::Bytes;
 use http::request::Parts;
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -28,13 +27,14 @@ use utoipa::{Modify, OpenApi, ToSchema};
 use crate::clients;
 use crate::db::{
     Access, AccessMode, ClientRow, DeleteOutcome, HostHeaderMode, NewAccessLink, NewTunnel, PasswordRequired,
-    PublicNotAllowed, ServiceRow, TunnelPatch, TunnelQuotaExceeded, TunnelRow,
+    PublicNotAllowed, ServiceRow, TtlTooLong, TunnelPatch, TunnelQuotaExceeded, TunnelRow,
 };
 use crate::ice;
 use crate::password;
 use crate::services;
 use crate::state::AppState;
 use crate::tokens::{self, now};
+use crate::ui::store::Role;
 use crate::util::{Body, full, json_response};
 
 const MIN_TUNNEL_TTL_S: u64 = 60;
@@ -48,7 +48,11 @@ const API_SUBJECT: &str = "api";
 
 static ROUTER: LazyLock<Router<Arc<AppState>>> = LazyLock::new(build_router);
 
-pub async fn handle(state: Arc<AppState>, req: Request<Incoming>) -> Response<Body> {
+pub async fn handle<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body>
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<crate::util::BoxError>,
+{
     let router: Router = ROUTER.clone().with_state(state);
     let resp = match router.oneshot(req.map(axum::body::Body::new)).await {
         Ok(resp) => resp,
@@ -75,11 +79,14 @@ fn build_router() -> Router<Arc<AppState>> {
         .route("/v1/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/v1/tunnels/{id}", get(get_tunnel).patch(patch_tunnel).delete(delete_tunnel))
         .route("/v1/tunnels/{id}/token", post(rotate_tunnel_token))
-        .route("/v1/tunnels/{id}/access-links", post(create_access_link))
+        .route("/v1/tunnels/{id}/access-links", post(create_access_link).get(list_access_links))
         .route("/v1/access-links/{id}", axum::routing::delete(delete_access_link))
         .route("/v1/tunnels/{id}/turn-credentials", post(turn_credentials))
         .route("/v1/clients", post(create_client).get(list_clients))
         .route("/v1/clients/enroll", post(enroll_client))
+        .route("/v1/device/code", post(crate::device::device_code))
+        .route("/v1/device/token", post(crate::device::device_token))
+        .route("/v1/server", get(server_info))
         .route("/v1/clients/{name}", axum::routing::delete(delete_client))
         .route("/v1/services", post(create_service).get(list_services))
         .route("/v1/services/{name}", axum::routing::patch(patch_service).delete(delete_service))
@@ -103,33 +110,33 @@ pub struct ErrorDetail {
 
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self { status, code, message: message.into() }
     }
 
-    fn unauthorized() -> Self {
+    pub(crate) fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token")
     }
 
-    fn not_found(what: &str) -> Self {
+    pub(crate) fn not_found(what: &str) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", format!("{what} not found"))
     }
 
-    fn expired() -> Self {
+    pub(crate) fn expired() -> Self {
         Self::new(StatusCode::CONFLICT, "tunnel_expired", "tunnel has expired or was deleted")
     }
 
-    fn validation(message: impl Into<String>) -> Self {
+    pub(crate) fn validation(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, "validation", message)
     }
 
-    fn internal(e: anyhow::Error) -> Self {
+    pub(crate) fn internal(e: anyhow::Error) -> Self {
         tracing::error!(error = %format!("{e:#}"), "api request failed");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal server error")
     }
@@ -153,7 +160,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
 // -------------------------------------------------------------- extractors
 
@@ -165,8 +172,24 @@ pub struct Admin;
 #[derive(Debug, Clone)]
 pub enum Caller {
     Admin,
-    Client { id: String, name: String },
-    Service { id: String, name: String },
+    /// A machine, acting for the user who owns it.
+    Client {
+        id: String,
+        name: String,
+        user: ClientUser,
+    },
+    Service {
+        id: String,
+        name: String,
+    },
+}
+
+/// The owner of a machine client, as far as tunnel rules need it.
+#[derive(Debug, Clone)]
+pub struct ClientUser {
+    pub id: String,
+    pub role: Role,
+    pub can_public: bool,
 }
 
 impl Caller {
@@ -189,21 +212,51 @@ impl Caller {
     fn describe(&self) -> String {
         match self {
             Self::Admin => "admin".to_string(),
-            Self::Client { name, .. } => format!("client:{name}"),
+            Self::Client { name, user, .. } => format!("client:{name} (user {})", user.id),
             Self::Service { name, .. } => format!("service:{name}"),
         }
     }
 
-    /// Public previews need the admin token unless the server allows them for everyone.
+    /// Public previews need the admin token, an admin's machine or a user
+    /// allowed public previews, unless the server allows them for everyone.
     fn check_public(&self, mode: AccessMode, limits: &crate::config::Limits) -> ApiResult<()> {
-        if mode == AccessMode::Public && self.owner_id().is_some() && !limits.allow_public_for_clients {
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "public_not_allowed",
-                "this server allows public previews only for the admin; use access links or password mode",
-            ));
+        let allowed = match self {
+            Self::Admin => true,
+            Self::Client { user, .. } => user.role.is_admin() || user.can_public,
+            Self::Service { .. } => false,
+        };
+        if mode == AccessMode::Public && !allowed && !limits.allow_public_for_clients {
+            return Err(public_refused());
         }
         Ok(())
+    }
+
+    /// Longest tunnel lifetime this caller may set: members are capped lower.
+    fn max_tunnel_ttl_s(&self, limits: &crate::config::Limits) -> u64 {
+        match self {
+            Self::Client { user, .. } if user.role == Role::Member => {
+                limits.max_tunnel_ttl_s.min(limits.member_max_tunnel_ttl_s)
+            }
+            _ => limits.max_tunnel_ttl_s,
+        }
+    }
+}
+
+fn public_refused() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "public_not_allowed",
+        "public previews need an admin's permission on this server; use access links or password mode",
+    )
+}
+
+/// The server's tunnel rules for the database to apply to an owner's
+/// current permissions.
+fn policy(limits: &crate::config::Limits) -> crate::db::Policy {
+    crate::db::Policy {
+        allow_all_public: limits.allow_public_for_clients,
+        member_max_ttl_s: i64::try_from(limits.max_tunnel_ttl_s.min(limits.member_max_tunnel_ttl_s))
+            .unwrap_or(i64::MAX),
     }
 }
 
@@ -230,9 +283,13 @@ impl FromRequestParts<Arc<AppState>> for Caller {
         }
         if token.starts_with(CLIENT_TOKEN_PREFIX)
             && token.len() <= 256
-            && let Some((id, name)) = state.db.client_by_token_hash(tokens::hash_token(token)).await?
+            && let Some(c) = state.db.client_by_token_hash(tokens::hash_token(token)).await?
         {
-            return Ok(Self::Client { id, name });
+            return Ok(Self::Client {
+                id: c.id,
+                name: c.name,
+                user: ClientUser { id: c.user_id, role: c.role, can_public: c.can_public },
+            });
         }
         if token.starts_with(SERVICE_TOKEN_PREFIX)
             && token.len() <= 256
@@ -467,6 +524,7 @@ pub struct TurnCredentialsResponse {
         delete_tunnel,
         rotate_tunnel_token,
         create_access_link,
+        list_access_links,
         delete_access_link,
         turn_credentials,
         create_client,
@@ -478,6 +536,9 @@ pub struct TurnCredentialsResponse {
         patch_service,
         rotate_service_token,
         delete_service,
+        server_info,
+        crate::device::device_code,
+        crate::device::device_token,
     ),
     components(schemas(
         Health,
@@ -509,6 +570,13 @@ pub struct TurnCredentialsResponse {
         ServiceView,
         ServiceList,
         PatchServiceRequest,
+        AccessLinkView,
+        AccessLinkList,
+        ServerInfo,
+        ServerLimits,
+        crate::device::DeviceCodeRequest,
+        crate::device::DeviceCodeResponse,
+        crate::device::DeviceTokenRequest,
     )),
     modifiers(&BearerAuth),
     security(("admin" = []))
@@ -599,6 +667,59 @@ async fn openapi_json(_admin: Admin) -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServerInfo {
+    pub version: String,
+    /// `https://<api host>`: this API.
+    pub api_origin: String,
+    /// `wss://<tunnel host>`: where `tunnel` connects.
+    pub control_origin: String,
+    /// `https://<preview zone>`: access links and the sign-in page.
+    pub gate_origin: String,
+    /// `https://<ui host>`, when the web UI is enabled.
+    pub ui_origin: Option<String>,
+    /// `{port}-{id}.<zone>`; replace both placeholders.
+    pub preview_host_template: String,
+    /// The preview zone, the parent domain of every preview host.
+    pub preview_zone: String,
+    pub webrtc: bool,
+    pub limits: ServerLimits,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServerLimits {
+    pub max_tunnel_ttl_s: u64,
+    pub default_max_ports: u16,
+    pub hard_max_ports: u16,
+    pub default_session_ttl_s: u64,
+    /// Whether this caller may create public previews.
+    pub public_allowed: bool,
+}
+
+/// Any bearer caller: where things live and what this caller may do.
+#[utoipa::path(get, path = "/v1/server", responses((status = 200, body = ServerInfo), (status = 401, body = ErrorBody)))]
+async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> Json<ServerInfo> {
+    let cfg = &state.config;
+    let limits = &cfg.limits;
+    Json(ServerInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        api_origin: format!("https://{}", cfg.api_host),
+        control_origin: format!("wss://{}", cfg.tunnel_host),
+        gate_origin: format!("https://{}", cfg.preview_zone),
+        ui_origin: cfg.ui_host.as_ref().map(|h| format!("https://{h}")),
+        preview_host_template: format!("{{port}}-{{id}}.{}", cfg.preview_zone),
+        preview_zone: cfg.preview_zone.clone(),
+        webrtc: cfg.webrtc.enabled,
+        limits: ServerLimits {
+            max_tunnel_ttl_s: caller.max_tunnel_ttl_s(limits),
+            default_max_ports: limits.default_max_ports,
+            hard_max_ports: limits.hard_max_ports,
+            default_session_ttl_s: limits.default_session_ttl_s,
+            public_allowed: caller.check_public(AccessMode::Public, limits).is_ok(),
+        },
+    })
+}
+
 async fn fallback() -> ApiError {
     ApiError::not_found("route")
 }
@@ -621,7 +742,7 @@ async fn create_tunnel(
     ApiJson(req): ApiJson<CreateTunnelRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateTunnelResponse>)> {
     let limits = &state.config.limits;
-    validate_tunnel_ttl(req.ttl_s, limits.max_tunnel_ttl_s)?;
+    validate_tunnel_ttl(req.ttl_s, caller.max_tunnel_ttl_s(limits))?;
     let max_ports = req.max_ports.unwrap_or(limits.default_max_ports);
     if !(1..=limits.hard_max_ports).contains(&max_ports) {
         return Err(ApiError::validation(format!("max_ports must be within 1..={}", limits.hard_max_ports)));
@@ -646,7 +767,7 @@ async fn create_tunnel(
     let token = tokens::random_token(TUNNEL_TOKEN_PREFIX);
     let row = state
         .db
-        .create_tunnel(
+        .create_tunnel_with(
             NewTunnel {
                 id,
                 token_hash: tokens::hash_token(&token),
@@ -660,11 +781,22 @@ async fn create_tunnel(
                 client_id: caller.owner_id().map(str::to_string),
             },
             limits.max_tunnels_per_client,
+            // Checked again in the INSERT transaction against the owner's
+            // current role and permissions (the checks above may be stale).
+            policy(limits),
         )
         .await
         .map_err(|e| {
-            if e.is::<TunnelQuotaExceeded>() {
-                ApiError::new(StatusCode::TOO_MANY_REQUESTS, "tunnel_quota", "live-tunnel quota reached")
+            if e.is::<PublicNotAllowed>() {
+                public_refused()
+            } else if e.is::<TtlTooLong>() {
+                ApiError::validation("ttl_s is longer than this account may set")
+            } else if e.is::<TunnelQuotaExceeded>() {
+                ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "tunnel_quota",
+                    "live-tunnel quota reached; delete a tunnel or ask an admin for a higher limit",
+                )
             } else {
                 ApiError::internal(e)
             }
@@ -786,7 +918,7 @@ async fn patch_tunnel(
     ApiJson(req): ApiJson<PatchTunnelRequest>,
 ) -> ApiResult<Json<TunnelView>> {
     if let Some(ttl) = req.ttl_s {
-        validate_tunnel_ttl(ttl, state.config.limits.max_tunnel_ttl_s)?;
+        validate_tunnel_ttl(ttl, caller.max_tunnel_ttl_s(&state.config.limits))?;
     }
     validate_label(req.label.as_deref())?;
     // Expiry is revocation: an expired tunnel cannot be revived by extending it.
@@ -805,15 +937,17 @@ async fn patch_tunnel(
         inject_ice: req.inject_ice,
         access,
         keep_password_hash,
-        // Only a switch into public is refused (checked against the row in the
-        // update transaction), so a tunnel that is already public stays editable.
-        forbid_public: caller.check_public(AccessMode::Public, &state.config.limits).is_err(),
+        // The owner's current rules, applied in the update transaction: only a
+        // switch into public is refused, so a public tunnel stays editable.
+        owner_policy: caller.owner_id().map(|o| (o.to_string(), policy(&state.config.limits))),
     };
     let updated = state.db.update_tunnel(id.clone(), patch).await.map_err(|e| {
         if e.is::<PasswordRequired>() {
             ApiError::validation(e.to_string())
         } else if e.is::<PublicNotAllowed>() {
-            caller.check_public(AccessMode::Public, &state.config.limits).unwrap_err()
+            public_refused()
+        } else if e.is::<TtlTooLong>() {
+            ApiError::validation("ttl_s is longer than this account may set")
         } else {
             ApiError::internal(e)
         }
@@ -943,6 +1077,18 @@ async fn create_access_link(
     ApiJson(req): ApiJson<CreateAccessLinkRequest>,
 ) -> ApiResult<(StatusCode, Json<AccessLinkResponse>)> {
     let tunnel = active_tunnel(&state, &caller, &id).await?;
+    Ok((StatusCode::CREATED, Json(mint_access_link(&state, &tunnel, req, None).await?)))
+}
+
+/// Mint an access link for `tunnel` (already authorized and unexpired).
+/// From the web UI, `ui` is `(user id, session id hash)`: the session and the
+/// user's right to the tunnel are checked again when the link is stored.
+pub(crate) async fn mint_access_link(
+    state: &AppState,
+    tunnel: &TunnelRow,
+    req: CreateAccessLinkRequest,
+    ui: Option<(String, String)>,
+) -> ApiResult<AccessLinkResponse> {
     let t = now();
     let remaining = (tunnel.expires_at - t).max(0) as u64;
     if req.ttl_s < MIN_LINK_TTL_S || req.ttl_s > remaining {
@@ -966,28 +1112,92 @@ async fn create_access_link(
     let token = tokens::random_token(ACCESS_TOKEN_PREFIX);
     let expires_at = t + req.ttl_s as i64;
     let single_use = req.single_use.unwrap_or(true);
-    state
-        .db
-        .create_access_link(NewAccessLink {
-            id: link_id.clone(),
-            tunnel_id: tunnel.id.clone(),
-            token_hash: tokens::hash_token(&token),
-            single_use,
-            label: req.label,
-            session_ttl_s: session_ttl_s as i64,
-            expires_at,
-        })
-        .await?;
+    let link = NewAccessLink {
+        id: link_id.clone(),
+        tunnel_id: tunnel.id.clone(),
+        token_hash: tokens::hash_token(&token),
+        single_use,
+        label: req.label,
+        session_ttl_s: session_ttl_s as i64,
+        expires_at,
+    };
+    match ui {
+        Some((user, session)) => {
+            if !state.db.create_access_link_for(link, user, session).await? {
+                return Err(ApiError::not_found("tunnel"));
+            }
+        }
+        None => state.db.create_access_link(link).await?,
+    }
     tracing::info!(tunnel = %tunnel.id, link = %link_id, single_use, expires_at, "access link created");
+    Ok(AccessLinkResponse {
+        id: link_id,
+        url: crate::gatehost::access_url(&state.config.preview_zone, &tunnel.id, port, &token),
+        expires_at,
+    })
+}
 
-    Ok((
-        StatusCode::CREATED,
-        Json(AccessLinkResponse {
-            id: link_id,
-            url: crate::gatehost::access_url(&state.config.preview_zone, &tunnel.id, port, &token),
-            expires_at,
-        }),
-    ))
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AccessLinkView {
+    pub id: String,
+    pub label: Option<String>,
+    pub single_use: bool,
+    /// When a single-use link was redeemed.
+    pub used_at: Option<i64>,
+    pub session_ttl_s: i64,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AccessLinkList {
+    /// Newest first. The link URLs are not stored and cannot be listed.
+    pub links: Vec<AccessLinkView>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tunnels/{id}/access-links",
+    params(("id" = String, Path, description = "Tunnel id")),
+    responses((status = 200, body = AccessLinkList), (status = 401, body = ErrorBody), (status = 404, body = ErrorBody))
+)]
+async fn list_access_links(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> ApiResult<Json<AccessLinkList>> {
+    let tunnel = find_tunnel(&state, &caller, &id).await?;
+    Ok(Json(access_link_list(&state, &tunnel.id).await?))
+}
+
+pub(crate) async fn access_link_list(state: &AppState, tunnel_id: &str) -> ApiResult<AccessLinkList> {
+    let links = state
+        .db
+        .list_access_links(tunnel_id.to_string())
+        .await?
+        .into_iter()
+        .map(|l| AccessLinkView {
+            id: l.id,
+            label: l.label,
+            single_use: l.single_use,
+            used_at: l.used_at,
+            session_ttl_s: l.session_ttl_s,
+            created_at: l.created_at,
+            expires_at: l.expires_at,
+        })
+        .collect();
+    Ok(AccessLinkList { links })
+}
+
+/// Revoke link `id` of `tunnel_id` and everything it granted.
+pub(crate) async fn revoke_access_link(state: &AppState, id: &str, tunnel_id: &str) -> ApiResult<()> {
+    if !state.db.delete_access_link(id.to_string()).await? {
+        return Err(ApiError::not_found("access link"));
+    }
+    state.invalidate_sessions();
+    state.registry.rotate_gate_epoch(tunnel_id);
+    tracing::info!(link = %id, "access link revoked");
+    Ok(())
 }
 
 #[utoipa::path(
@@ -1009,12 +1219,7 @@ async fn delete_access_link(
     if caller.owner_id().is_some() && find_tunnel(&state, &caller, &tunnel).await.is_err() {
         return Err(ApiError::not_found("access link"));
     }
-    if !state.db.delete_access_link(id.clone()).await? {
-        return Err(ApiError::not_found("access link"));
-    }
-    state.invalidate_sessions();
-    state.registry.rotate_gate_epoch(&tunnel);
-    tracing::info!(link = %id, "access link revoked");
+    revoke_access_link(&state, &id, &tunnel).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1077,6 +1282,9 @@ fn validate_label(label: Option<&str>) -> ApiResult<()> {
 pub struct CreateClientRequest {
     /// 1..=64 characters: letters, digits, `.`, `_`, `-`.
     pub name: String,
+    /// The user who owns the machine (default: the owner).
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1094,6 +1302,8 @@ pub struct CreateClientResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ClientView {
     pub name: String,
+    /// The user who owns this machine.
+    pub user: String,
     /// The login code has been used.
     pub enrolled: bool,
     pub created_at: i64,
@@ -1132,6 +1342,7 @@ impl From<ClientRow> for ClientView {
     fn from(c: ClientRow) -> Self {
         Self {
             name: c.name,
+            user: c.user,
             enrolled: c.enrolled,
             created_at: c.created_at,
             last_used_at: c.last_used_at,
@@ -1151,7 +1362,13 @@ async fn create_client(
     _admin: Admin,
     ApiJson(req): ApiJson<CreateClientRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateClientResponse>)> {
-    match clients::add(&state.db, &state.config, &req.name).await {
+    let user_id = match &req.user {
+        Some(name) => state.db.user_by_name(name.clone()).await?.map(|u| u.id),
+        // Created without a password on a server used without the web UI.
+        None => Some(state.db.ensure_owner().await?.id),
+    }
+    .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "no_user", "no such user"))?;
+    match clients::add(&state.db, &state.config, &req.name, &user_id, None).await {
         Ok(e) => Ok((
             StatusCode::CREATED,
             Json(CreateClientResponse {
@@ -1164,6 +1381,14 @@ async fn create_client(
         Err(clients::AddError::Invalid(m)) => Err(ApiError::validation(m)),
         Err(clients::AddError::Taken) => {
             Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a client with this name exists; delete it first"))
+        }
+        Err(clients::AddError::Quota) => Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "client_quota",
+            "this user has as many machines as allowed",
+        )),
+        Err(clients::AddError::NoUser) => {
+            Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "no_user", "the user is unknown or disabled"))
         }
         Err(clients::AddError::Other(e)) => Err(e.into()),
     }
@@ -1536,7 +1761,7 @@ async fn active_tunnel(state: &AppState, caller: &Caller, id: &str) -> ApiResult
     }
 }
 
-fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
+pub(crate) fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
     let live = state.registry.get(&row.id);
     let ports = live
         .as_ref()
@@ -1641,7 +1866,13 @@ mod tests {
     }
 
     async fn enroll_test_client(state: &Arc<AppState>, id: &str, name: &str) {
-        state.db.create_client(id.into(), name.into(), format!("code-{id}"), now() + 600).await.unwrap().unwrap();
+        state.db.insert_test_user("utest", "tester", Role::Member).await;
+        state
+            .db
+            .create_client(id.into(), name.into(), "utest".into(), format!("code-{id}"), now() + 600, None)
+            .await
+            .unwrap()
+            .unwrap();
         state.db.enroll_client(format!("code-{id}"), tokens::hash_token(CLIENT_CREDENTIAL)).await.unwrap().unwrap();
     }
 
@@ -1710,7 +1941,13 @@ mod tests {
         let state = test_state(false, 20);
         enroll_test_client(&state, "c1", "one").await;
         for (id, name) in [("c2", "two"), ("c3", "three")] {
-            state.db.create_client(id.into(), name.into(), format!("code-{id}"), now() + 600).await.unwrap().unwrap();
+            state.db.insert_test_user("utest", "tester", Role::Member).await;
+            state
+                .db
+                .create_client(id.into(), name.into(), "utest".into(), format!("code-{id}"), now() + 600, None)
+                .await
+                .unwrap()
+                .unwrap();
         }
         for _ in 0..3 {
             assert_eq!(
@@ -1760,9 +1997,14 @@ mod tests {
             .db
             .call(|c| {
                 let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO users (id, username, password_hash, role, max_tunnels, max_clients, created_at)
+                     VALUES ('utest', 'tester', 'x', 'member', 1000, 1000, 0)",
+                    [],
+                )?;
                 for i in 0..101 {
                     tx.execute(
-                        "INSERT INTO clients (id, name, created_at) VALUES (?1, ?1, ?2)",
+                        "INSERT INTO clients (id, name, created_at, user_id) VALUES (?1, ?1, ?2, 'utest')",
                         rusqlite::params![format!("client-{i:03}"), now()],
                     )?;
                     tx.execute(
@@ -1835,7 +2077,7 @@ mod tests {
             ("/healthz", vec!["get"]),
             ("/v1/tunnels", vec!["get", "post"]),
             ("/v1/tunnels/{id}", vec!["get", "patch", "delete"]),
-            ("/v1/tunnels/{id}/access-links", vec!["post"]),
+            ("/v1/tunnels/{id}/access-links", vec!["get", "post"]),
             ("/v1/access-links/{id}", vec!["delete"]),
             ("/v1/tunnels/{id}/turn-credentials", vec!["post"]),
             ("/v1/clients", vec!["get", "post"]),
@@ -1845,6 +2087,9 @@ mod tests {
             ("/v1/services", vec!["get", "post"]),
             ("/v1/services/{name}", vec!["patch", "delete"]),
             ("/v1/services/{name}/token", vec!["post"]),
+            ("/v1/server", vec!["get"]),
+            ("/v1/device/code", vec!["post"]),
+            ("/v1/device/token", vec!["post"]),
         ];
         assert_eq!(doc["paths"].as_object().unwrap().len(), expected.len());
         for (path, methods) in expected {

@@ -28,6 +28,28 @@ pub enum Verdict {
     Busy,
 }
 
+/// The hasher for new hashes: Argon2id with the crate's default (OWASP)
+/// parameters. Test builds use tiny parameters so that the many tests that
+/// sign in do not queue on the two hashing slots; verification always uses
+/// the parameters recorded in the PHC string.
+fn hasher() -> Argon2<'static> {
+    #[cfg(not(test))]
+    {
+        Argon2::default()
+    }
+    #[cfg(test)]
+    {
+        let params = argon2::Params::new(64, 1, 1, None).expect("valid test parameters");
+        Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Password checks started on this thread (tests run one per thread).
+    pub static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub async fn hash(password: String) -> anyhow::Result<String> {
     let slot = tokio::time::timeout(SLOT_WAIT, SLOTS.acquire())
         .await
@@ -36,7 +58,7 @@ pub async fn hash(password: String) -> anyhow::Result<String> {
     // must not free the slot while Argon2 is still running.
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        Argon2::default()
+        hasher()
             .hash_password(password.as_bytes())
             .map(|h| h.to_string())
             .map_err(|e| anyhow::anyhow!("hashing password: {e}"))
@@ -60,6 +82,27 @@ pub async fn verify(expected_user: String, phc: String, username: String, passwo
     .await
     .unwrap_or(false);
     if ok { Verdict::Match } else { Verdict::NoMatch }
+}
+
+/// `password` against `phc` alone (web UI accounts look the user up first).
+pub async fn verify_phc(phc: String, password: String) -> Verdict {
+    #[cfg(test)]
+    CHECKS.with(|c| c.set(c.get() + 1));
+    let Ok(Ok(slot)) = tokio::time::timeout(SLOT_WAIT, SLOTS.acquire()).await else {
+        return Verdict::Busy;
+    };
+    let ok = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        Argon2::default().verify_password(password.as_bytes(), phc.as_str()).is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if ok { Verdict::Match } else { Verdict::NoMatch }
+}
+
+/// Argon2 checks running or waiting right now (for the status page and tests).
+pub fn slots_in_use() -> usize {
+    MAX_CONCURRENT - SLOTS.available_permits()
 }
 
 #[cfg(test)]

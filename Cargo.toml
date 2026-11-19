@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/protocol", "crates/server", "crates/client"]
+# The web UI builds for wasm32 only (crates/web/build.sh); see its Cargo.toml.
+exclude = ["crates/web"]
 
 [workspace.package]
 version = "1.0.0"

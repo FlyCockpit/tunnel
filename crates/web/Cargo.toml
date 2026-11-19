@@ -1,0 +1,35 @@
+[package]
+name = "tunnel-web"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+description = "Tunnel's web UI: a Leptos (client-side rendered) app embedded in tunnel-server."
+
+# Built for wasm32 by build.sh only; kept out of the main workspace so Rust
+# contributors never need the wasm target.
+[workspace]
+
+[dependencies]
+leptos = { version = "=0.8.23", features = ["csr"] }
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "Window", "Document", "Location", "History", "Headers", "Request", "RequestInit", "RequestCredentials",
+  "Response", "Storage", "HtmlElement", "Element", "DomTokenList", "MediaQueryList", "Navigator", "Clipboard",
+  "PopStateEvent", "Event",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+console_error_panic_hook = "0.1.7"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+# Not stripped here: wasm-bindgen needs the target_features section; build.sh
+# strips debug info and producers with wasm-opt.
+strip = false

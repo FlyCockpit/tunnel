@@ -343,12 +343,27 @@ pub async fn cert_renew(config_path: &Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn client_add(config_path: &Path, name: &str) -> anyhow::Result<()> {
+pub async fn client_add(config_path: &Path, name: &str, user: Option<&str>) -> anyhow::Result<()> {
     ensure_can_write(config_path, "client add")?;
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
     let db = Db::open(&cfg.db_path())?;
-    let result = crate::clients::add(&db, &cfg, name).await;
+    // Without --user the machine is the owner's; on a server used without the
+    // web UI that account is created here, without a password.
+    let owner = match user {
+        Some(u) => db.user_by_name(u.to_ascii_lowercase()).await,
+        None => db.ensure_owner().await.map(Some),
+    };
+    let owner = match owner {
+        Ok(Some(o)) => o,
+        other => {
+            drop(db);
+            restore_ownership(config_path, &cfg)?;
+            other?;
+            anyhow::bail!("no user {}; see `tunnel-server user list`", user.unwrap_or_default());
+        }
+    };
+    let result = crate::clients::add(&db, &cfg, name, &owner.id, None).await;
     drop(db);
     restore_ownership(config_path, &cfg)?;
     match result {
@@ -364,8 +379,93 @@ pub async fn client_add(config_path: &Path, name: &str) -> anyhow::Result<()> {
         Err(crate::clients::AddError::Taken) => {
             anyhow::bail!("client {name} exists; `client delete {name}` first to re-register it")
         }
+        Err(crate::clients::AddError::Quota) => {
+            anyhow::bail!("{} has as many machines as allowed; raise their limit in the web UI", owner.username)
+        }
+        Err(crate::clients::AddError::NoUser) => anyhow::bail!("{} is disabled", owner.username),
         Err(crate::clients::AddError::Other(e)) => Err(e),
     }
+}
+
+/// One-time owner link: sign up as the owner (first run) or reset the
+/// owner's password and two-factor sign-in (recovery). Anyone with a shell
+/// here as the service user can already do anything, so this is the
+/// recovery path too.
+/// With `first_run`, nothing happens once the owner has signed up (setup
+/// calls it so a fresh install ends with the owner's link).
+pub async fn admin_link(config_path: &Path, first_run: bool) -> anyhow::Result<()> {
+    use crate::ui::store::{InviteKind, Role};
+    ensure_can_write(config_path, "admin link")?;
+    let cfg = Config::load(config_path)?;
+    let Some(ui) = cfg.ui_host.clone() else {
+        anyhow::bail!("the web UI is off: turn it on with `tunnel-server setup --ui-host <name>`");
+    };
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    let owner = db.owner().await?;
+    // An owner created for machines without the UI has no password yet: it signs up.
+    let unclaimed = db.owner_without_password().await?;
+    if first_run && owner.is_some() && !unclaimed {
+        return Ok(());
+    }
+    let kind = if owner.is_some() && !unclaimed { InviteKind::OwnerReset } else { InviteKind::OwnerSetup };
+    let token = crate::tokens::random_token(crate::ui::INVITE_PREFIX);
+    let ttl = crate::ui::OWNER_LINK_TTL_S;
+    let result = db
+        .create_invite(
+            format!("in{}", crate::tokens::random_tunnel_id()),
+            crate::tokens::hash_token(&token),
+            kind,
+            Role::Owner,
+            None,
+            None,
+            crate::tokens::now() + ttl,
+        )
+        .await;
+    if result.is_ok() {
+        let _ = db.audit(None, if owner.is_some() { "owner_reset_link" } else { "owner_setup_link" }, None, None).await;
+    }
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    result?;
+    match owner.filter(|_| !unclaimed) {
+        Some(o) => println!(
+            "Open this link within {} minutes to set a new password for the owner {} \
+             (two-factor sign-in is turned off; turn it on again afterwards). It works once:\n",
+            ttl / 60,
+            o.username
+        ),
+        None => println!("Open this link within {} minutes to create the owner account. It works once:\n", ttl / 60),
+    }
+    println!("  https://{ui}/invite#{token}\n");
+    Ok(())
+}
+
+pub async fn user_list(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path)?;
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    let users = db.list_users().await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    let users = users?;
+    if users.is_empty() {
+        println!("No users yet; `tunnel-server admin link` creates the owner.");
+        return Ok(());
+    }
+    println!("{:<24} {:<8} {:<9} {:>8} {:>8} {:>4}", "USERNAME", "ROLE", "STATUS", "MACHINES", "TUNNELS", "2FA");
+    for u in users {
+        println!(
+            "{:<24} {:<8} {:<9} {:>8} {:>8} {:>4}",
+            u.user.username,
+            u.user.role.as_str(),
+            if u.user.disabled { "disabled" } else { "active" },
+            format!("{}/{}", u.clients, u.user.max_clients),
+            format!("{}/{}", u.tunnels, u.user.max_tunnels),
+            if u.user.totp { "on" } else { "off" }
+        );
+    }
+    Ok(())
 }
 
 pub async fn client_list(config_path: &Path) -> anyhow::Result<()> {
@@ -379,11 +479,11 @@ pub async fn client_list(config_path: &Path) -> anyhow::Result<()> {
         println!("No clients. Add one with `tunnel-server client add <name>`.");
         return Ok(());
     }
-    println!("{:<24} {:<12} {:<22} {:>7}", "NAME", "STATUS", "LAST USED", "TUNNELS");
+    println!("{:<24} {:<16} {:<12} {:<22} {:>7}", "NAME", "USER", "STATUS", "LAST USED", "TUNNELS");
     for c in clients {
         let status = if c.enrolled { "active" } else { "not logged in" };
         let last = c.last_used_at.map(describe_ago).unwrap_or_else(|| "never".to_string());
-        println!("{:<24} {:<12} {:<22} {:>7}", c.name, status, last, c.tunnels);
+        println!("{:<24} {:<16} {:<12} {:<22} {:>7}", c.name, c.user, status, last, c.tunnels);
     }
     Ok(())
 }

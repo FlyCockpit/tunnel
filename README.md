@@ -13,7 +13,7 @@
   <a href="https://github.com/FlyCockpit"><img src="https://shieldcn.dev/badge/part%20of-FlyCockpit-0ea5e9.svg" alt="Part of FlyCockpit"></a>
 </p>
 
-> **Status: pre-release.** The first release, 1.0.0, is pending. The installer will work once that release is published and its minisign public-key placeholder is replaced (see [Installation](#installation)).
+> **Status: pre-release.** The first release, 1.0.0, is pending. The installers work once that release is published (see [Installation](#installation)).
 
 A sandbox or development machine with no public IP and only outbound 443 runs `tunnel`, which keeps one WSS connection to a VPS running `tunnel-server`. Visitors open `https://{port}-{id}.previews.example.com`, pass a cookie gate minted from a click-time access link, and reach the local port over HTTP/1.1, HTTP/2, WebSockets, SSE, and WebRTC (built-in STUN/TURN relay). It is for people who build apps in sandboxes or on laptops and need to share a running preview.
 
@@ -82,17 +82,32 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl -p tunnel-server
 
 GitHub Releases are the distribution channel. The release workflow builds:
 
-- `tunnel-server-<target>` and `tunnel-<target>` for
-  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (static Linux binaries).
-- `tunnel-<target>` for `aarch64-apple-darwin` and `x86_64-apple-darwin`.
-- `install.sh`, `THIRD_PARTY_LICENSES.html`, `SHA256SUMS` covering every asset,
-  and its minisign signature, `SHA256SUMS.minisig`.
+- `tunnel-server-<target>` for `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` (static Linux binaries, web UI embedded).
+- `tunnel-<target>.tar.xz` (holding `tunnel-<target>/tunnel`) for those two
+  and for `aarch64-apple-darwin` and `x86_64-apple-darwin`.
+- `install.sh` (server), `tunnel.rb` (Homebrew formula pinning each client
+  archive's SHA-256), third-party notices (`THIRD_PARTY_LICENSES.html`, and
+  `THIRD_PARTY_LICENSES_WEB_UI*` for the embedded web UI and its font), and
+  `sha256.sum` covering every asset.
 
-The workflow checks the release tag against the workspace version and uses the
-version's changelog entry as release notes. The Linux server installer checks the
-minisign signature and SHA-256 before installation. Before the first release,
-replace its `MINISIGN_PUBKEY` placeholder. Until then it refuses installation
-unless `TUNNEL_ALLOW_UNSIGNED=1` is explicitly set (SHA-256 is still checked).
+The workflow checks the release tag against the workspace version, uses the
+version's changelog entry as release notes, and signs SLSA build provenance
+for every binary, archive and `sha256.sum` with GitHub artifact attestations
+(keyless; no signing key or repository secret). Verify a download with:
+
+```sh
+sha256sum --ignore-missing -c sha256.sum
+gh attestation verify tunnel-server-x86_64-unknown-linux-musl --repo FlyCockpit/tunnel
+```
+
+Both installers refuse to install anything that does not match `sha256.sum`
+(no file, no entry, no hashing tool or a mismatch stops them). The server's
+installer is `install.sh` in the release; the client's is served by every
+server with the web UI at `https://<ui_host>/install.sh` (it installs that
+server's version into `~/.local/bin`, then runs `tunnel login https://<ui_host>`).
+Homebrew users can install the client from the release's formula once it is
+in a tap (`brew install flycockpit/tap/tunnel`).
 
 ### Server setup
 
@@ -115,17 +130,6 @@ sudo apt-get install -y ca-certificates curl
 curl -fsSL https://github.com/FlyCockpit/tunnel/releases/latest/download/install.sh | sh
 # Otherwise:
 curl -fsSL https://github.com/FlyCockpit/tunnel/releases/latest/download/install.sh | sudo sh
-```
-
-Until the installer's minisign key placeholder is replaced, explicitly opt in to
-checksum-only verification. Put the environment assignment after `sudo`, which
-otherwise resets it:
-
-```sh
-# Already root:
-curl -fsSL https://github.com/FlyCockpit/tunnel/releases/latest/download/install.sh | TUNNEL_ALLOW_UNSIGNED=1 sh
-# Otherwise:
-curl -fsSL https://github.com/FlyCockpit/tunnel/releases/latest/download/install.sh | sudo TUNNEL_ALLOW_UNSIGNED=1 sh
 ```
 
 Append `-s -- --staging` to `sh` to test against Let's Encrypt staging.
@@ -153,23 +157,20 @@ alone any `/etc/tunnel-server` that doesn't hold a Tunnel config.
 #### Rootless install
 
 To get the binary without root, download the server asset and verification files
-directly. You need `curl`, `sha256sum`, and `minisign` available to your user.
+directly. You need `curl` and `sha256sum` available to your user.
 Choose `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` for your server:
 
 ```sh
 target=x86_64-unknown-linux-musl
 release=https://github.com/FlyCockpit/tunnel/releases/latest/download
 curl -fSLO "$release/tunnel-server-$target"
-curl -fSLO "$release/SHA256SUMS"
-curl -fSLO "$release/SHA256SUMS.minisig"
-minisign -Vm SHA256SUMS -P '<key>'
-sha256sum -c --ignore-missing SHA256SUMS
+curl -fSLO "$release/sha256.sum"
+sha256sum -c --ignore-missing sha256.sum
+gh attestation verify "tunnel-server-$target" --repo FlyCockpit/tunnel   # optional, needs the GitHub CLI
 chmod +x "tunnel-server-$target"
 ./tunnel-server-$target setup
 ```
 
-Replace `<key>` with the published project minisign public key. Signature
-verification requires that key to be published; the placeholder is not a key.
 Setup copies itself to `~/.local/bin/tunnel-server`.
 
 Run setup as a normal user (no root after one preflight command).
@@ -188,6 +189,31 @@ tunnel-server setup --yes --host tunnel.example.com --email you@example.com \
 One hostname covers everything: the API and sandbox tunnel use it, previews are
 `*.<host>`, TURN is `turn.<host>`, and two DNS records (`<host>`, `*.<host>`) suffice.
 
+The web UI gets its own name (see [Hosts and domains](#web-ui-accounts-and-hosts)):
+by default `<first label>-ui.<rest>` (e.g. `tunnel-ui.example.com`), since
+names under the preview zone are previews; `--ui-host none` turns it off.
+Setup asks whether other people will use the server (`--multi-user`); if so,
+the preview zone must be on a separate registrable domain, possibly at
+another DNS provider, and setup then needs that zone's settings too:
+
+```sh
+tunnel-server setup --yes --host tunnel.example.com --email you@example.com \
+  --dns-token-file ~/cf-token --multi-user true \
+  --preview-zone previews.example-previews.com \
+  --preview-dns-provider hetzner --preview-dns-zone example-previews.com \
+  --preview-dns-token-file ~/hetzner-token
+```
+
+The config keeps the extra zone under `[[extra_dns]]`; each name uses the most
+specific zone holding it, for records and for DNS-01 certificate challenges.
+For a DNS provider setup does not support, create the records it prints
+yourself (`--skip-dns`; setup still verifies them) and bring your own
+certificate (`--own-certificate true`): put `fullchain.pem` and `privkey.pem`
+covering every listed name into the data directory's `certs/`; the server
+reloads replacements within a minute, never issues or renews one itself, and
+warns in its log when the certificate needs replacing. A first setup with the
+web UI ends by printing the one-time link that creates the owner account.
+
 ## Configuration
 
 The server configuration lives in `/etc/tunnel-server/config.toml` (rootless installs: `$XDG_CONFIG_HOME/tunnel-server/config.toml`, default `~/.config/tunnel-server/config.toml`; the data directory is `$XDG_DATA_HOME/tunnel`, default `~/.local/share/tunnel`). It holds the host, the DNS provider token, `frame_ancestors`, the `[webrtc]` section and limits. The admin token is stored hashed. The server needs TCP 443 and 80, and with WebRTC also UDP/TCP 3478 and UDP 49160–49999 by default.
@@ -197,6 +223,88 @@ Every HTTPS response carries `Strict-Transport-Security: max-age=31536000`
 unaffected).
 
 The client reads `TUNNEL_TOKEN`, `TUNNEL_SERVER`, `TUNNEL_ICE_FILE` and `TUNNEL_ICE_PORT`; see the [client README](crates/client/README.md#environment).
+
+### Web UI, accounts and hosts
+
+The web UI lives on its own host, `ui_host`, and is off until that is set
+(together with `ui_secret`, at least 32 random characters, e.g.
+`openssl rand -base64 33`; it seals TOTP secrets and derives CSRF tokens, so
+keep it with the config's other secrets). The UI host serves the app, its JSON
+API under `/ui/api/*`, the client installer (`/install.sh`) and the bearer API
+under `/v1/*`; `api_host` keeps serving `/v1/*` as before.
+
+**Hosts and domains.** `ui_host` and `preview_zone` are independent:
+
+| Layout | Example | Use |
+|---|---|---|
+| Separate registrable domain (recommended) | UI `tunnel.example.com`, previews `*.example-previews.com` | required when people other than you use the server |
+| Preview zone under a separate domain | UI `tunnel.example.com`, previews `*.p.example-previews.com` | same, when the preview domain also hosts other things |
+| Same domain | UI `tunnel.example.com`, previews `*.previews.example.com` | single-user only; the UI's status page warns |
+
+The UI must never be the preview zone or a name under it (the server refuses
+that config): previews run code anyone with a machine wrote, and a page on the
+preview apex or a preview host would be same-origin or a parent of every
+preview. The preview zone's apex serves only the sign-in pages
+(`/__access/…`, `/__login`) and nothing else. Even with the UI on a
+separate name, previews on the same registrable domain are *same-site* with
+it: the UI defends against that (below), but a preview can still evict the
+UI's cookie by flooding the cookie jar (sign-out only), password managers may
+offer UI passwords on preview pages, and look-alike pages live on your own
+domain. A separate preview domain removes all three. Operators of public
+multi-tenant servers should also get the preview zone onto the
+[Public Suffix List](https://publicsuffix.org/) (as `github.io` is), which
+makes browsers treat each preview host as its own site, isolating previews
+from each other too.
+
+**Defenses on the UI.** The session cookie is `__Host-tunnel-ui` (host-only,
+`Secure`, `HttpOnly`, `SameSite=Strict`); the edge never forwards it to an
+origin. Every `/ui/api/*` request must carry `X-Tunnel-CSRF` (a custom header
+forces a CORS preflight, which the server never grants; writes need the
+session's token), an `Origin` of exactly `https://<ui_host>` (required except
+on GET), and `Sec-Fetch-Site: same-origin` when the browser sends it. Pages
+use a strict CSP (`script-src 'self' 'wasm-unsafe-eval'`, no inline script,
+`frame-ancestors 'none'`). The bearer API ignores cookies and `Origin`, and
+access-link redemption on the preview zone stays a cross-site top-level GET.
+
+**Accounts.** `tunnel-server admin link` prints a one-time link (15 minutes)
+to create the owner account; run on a server that has an owner, it resets the
+owner's password and turns two-factor sign-in off (the recovery path; the
+page can also remove all of the owner's machines). Machines added before
+anyone signed up (`client add` or `POST /v1/clients` without a user) belong to
+an owner account without a password, which the setup link later claims.
+Accounts are owner, admin or member. Admins invite people with single-use,
+expiring links (`https://<ui_host>/invite#…`, 7 days by default; the token
+stays in the fragment, out of logs), manage members, and see every tunnel;
+only the owner invites or changes admins. Members see and manage only their
+own machines, tunnels and links, within their quotas (defaults
+`limits.member_max_tunnels` 10 live tunnels across their machines,
+`member_max_clients` 5 machines, `member_max_tunnel_ttl_s` 7 days). Members
+cannot create public previews unless an admin allows it for them
+(`can_public`) or `limits.allow_public_for_clients` is on; access links and
+password mode always work. Disabling a user ends their sessions, removes their
+machines and closes their tunnels. Sign-in is username and password
+(Argon2id) with optional TOTP and ten single-use recovery codes; changing the
+password or the second factor ends the user's other sessions, and a sign-in
+that was being checked while that happened does not get a session. Sign-in is
+limited per address (`limits.login_rate_per_min`, default 10) and per username
+(three times that, so one address cannot lock anyone out) before any password
+is hashed; five wrong codes in a row lock the second factor for 15 minutes,
+doubling up to a day. Users with two-factor sign-in confirm approving or
+adding a machine with a code when their last check is older than ten minutes. The UI keeps an audit log (90 days).
+`tunnel-server user list` lists accounts. There is no open sign-up, no email
+and no SSO.
+
+**Machines.** `tunnel login https://<ui_host>` on a machine prints a code and
+opens the approval page (RFC 8628 device flow); the user signs in, types the
+code (it never appears in a link, so nobody can send you a link that approves
+their machine), checks the machine's name and address, and approves. The new
+client belongs to them. Users with two-factor sign-in confirm with a code when
+their last check is older than ten minutes. Machines without a browser still
+use one-time login codes (`tunnel-server client add <name> [--user <name>]`,
+or "Add a headless machine" in the UI).
+
+**Services** (`tnsvc_`, below) are not accounts: platforms such as a sandbox
+service keep their own quota, and member limits never apply to them.
 
 ### WebRTC
 
@@ -223,7 +331,8 @@ TURN connections are closed if they do not authenticate promptly.
 ### Administration
 
 Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
-`cert renew [--force]`, `client add <name> | list | delete <name>`, and
+`cert renew [--force]`, `admin link`, `user list`,
+`client add <name> [--user <name>] | list | delete <name>`, and
 `service add <name> --max-tunnels <n> | list | set <name> --max-tunnels <n> | rotate <name> | delete <name>`
 (root only for a root install).
 
@@ -320,6 +429,8 @@ rejects unknown query parameters. Pass the response's `next_cursor` as the next 
 
 ### Logged-in machines
 
+With the web UI on, `tunnel login https://<ui_host>` signs a machine in after
+you approve it in the browser (see above). Without a browser,
 `tunnel-server client add laptop` prints a one-time (15 min) login code:
 
 ```sh
@@ -334,8 +445,13 @@ The login code is single-use and expires after 15 minutes. Enrollment exchanges
 it for a long-lived `tncli_` client token saved locally; it lasts until the client
 is deleted. A client token can manage only the tunnels it created and their
 access links. It may own at most `limits.max_tunnels_per_client` tunnels
-(default 20 live tunnels); creation beyond this quota returns HTTP 429 with
-`error.code: "tunnel_quota"`. Admin tokens are exempt. `client list` shows enrolled machines; `client delete <name>`
+(default 20 live tunnels), and a member's machines together at most the
+member's own quota; creation beyond this returns HTTP 429 with
+`error.code: "tunnel_quota"`. Admin tokens are exempt. `GET /v1/server` tells
+any caller where things live (API, control, gate and UI origins, the preview
+host template) and its own limits, including whether it may create public
+previews. `GET /v1/tunnels/{id}/access-links` lists a tunnel's links (the URLs
+themselves are never stored). `client list` shows enrolled machines; `client delete <name>`
 revokes the token, cancels pending codes and stops its tunnels. `logout` only
 forgets the local login.
 
@@ -371,6 +487,21 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The web UI (`crates/web`, Leptos rendered in the browser) is not a workspace
+member and builds for `wasm32-unknown-unknown` only. A plain server build
+serves a "UI not built" page; to embed the UI:
+
+```sh
+rustup target add wasm32-unknown-unknown
+# wasm-bindgen must match the version in crates/web/Cargo.lock; wasm-opt (binaryen) is optional.
+WASM_BINDGEN=/path/to/wasm-bindgen WASM_OPT=/path/to/wasm-opt crates/web/build.sh
+cargo build --release -p tunnel-server --features ui
+```
+
+CI pins and checksums both tools (`.github/workflows/web.yml`) and fails a
+build whose first load exceeds 400 kB gzip. The UI's design tokens are copied
+from the FlyCockpit template (`crates/web/UPSTREAM` records the commit).
+
 ### Workspace layout
 
 ```text
@@ -378,7 +509,9 @@ Cargo.toml                 workspace, shared dependency versions, release profil
 install.sh                 curl | sh installer: download, verify, exec `setup`
 crates/protocol/           wire messages, constants, mux (rust-yamux driver), WebSocket↔bytes bridge
 crates/server/             tunnel-server (VPS)
-  src/main.rs              CLI: serve | setup | token rotate | health-token | status | backup | restore | cert renew | client
+  src/main.rs              CLI: serve | setup | token rotate | health-token | status | backup | restore | cert renew | admin | user | client | service
+  src/ui/                  web UI host: /ui/api/* (accounts, sessions, TOTP, invites, admin), embedded assets
+  src/device.rs install.rs browser-approved machine login (RFC 8628); the client's /install.sh
   src/commands.rs          non-interactive subcommands; `serve` wires everything together
   src/listener.rs          :443 (SNI peek → TURN over TLS, else TLS + hyper auto) and :80 redirect
   src/turn_relay.rs        built-in STUN/TURN relay (UDP/TCP 3478, TLS via 443), peer filter, limits
@@ -395,6 +528,9 @@ crates/server/             tunnel-server (VPS)
   src/ice.rs metrics.rs    TURN REST credentials, Prometheus text on 127.0.0.1:9464
   src/setup/               interactive wizard (prompts, firewall, systemd)
 crates/client/             tunnel-client (sandbox); see crates/client/README.md
+crates/web/                web UI (Leptos CSR, wasm32); build.sh writes dist/ for the server's `ui` feature
+docs/agent/SKILL.md        how AI agents share apps with tunnel (`tunnel help agent`)
+packaging/homebrew/        formula generator used by the release workflow
 ```
 
 ## Documentation

@@ -144,6 +144,20 @@ pub fn cert_status(cfg: &Config) -> CertStatus {
         Ok(l) => l,
         Err(_) => return CertStatus::Missing,
     };
+    if cfg.acme.own_certificate {
+        // No names file for a certificate we did not issue: read its names.
+        if let Some(missing) = cfg.cert_names().into_iter().find(|n| !covers(&loaded.dns_names, n)) {
+            tracing::warn!(name = %missing, "the own certificate does not cover this name");
+            return CertStatus::NamesChanged;
+        }
+        let lifetime = (loaded.not_after - loaded.not_before).max(0);
+        let remaining = loaded.not_after - crate::tokens::now();
+        return if remaining < lifetime / 3 {
+            CertStatus::NeedsRenewal
+        } else {
+            CertStatus::Valid { not_after: loaded.not_after }
+        };
+    }
     let on_disk: Option<Vec<String>> =
         std::fs::read(dir.join(NAMES)).ok().and_then(|raw| serde_json::from_slice(&raw).ok());
     let mut on_disk = match on_disk {
@@ -161,8 +175,29 @@ pub fn cert_status(cfg: &Config) -> CertStatus {
     if remaining < lifetime / 3 { CertStatus::NeedsRenewal } else { CertStatus::Valid { not_after: loaded.not_after } }
 }
 
+/// Whether a certificate with these DNS names serves `name` (`*.x` covers
+/// exactly one more label under `x`, and the name `*.x` itself).
+pub fn covers(dns_names: &[String], name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    dns_names.iter().any(|san| {
+        let san = san.to_ascii_lowercase();
+        if san == name {
+            return true;
+        }
+        match san.strip_prefix("*.") {
+            Some(base) if !name.starts_with("*.") => name
+                .strip_suffix(base)
+                .and_then(|p| p.strip_suffix('.'))
+                .is_some_and(|l| !l.is_empty() && !l.contains('.')),
+            _ => false,
+        }
+    })
+}
+
 struct LoadedFiles {
     certified: CertifiedKey,
+    /// The leaf's DNS subject alternative names.
+    dns_names: Vec<String>,
     not_before: i64,
     not_after: i64,
 }
@@ -188,6 +223,21 @@ fn load_files(dir: &Path) -> anyhow::Result<LoadedFiles> {
     let validity = leaf.validity();
     let not_before = validity.not_before.timestamp();
     let not_after = validity.not_after.timestamp();
+    let dns_names: Vec<String> = leaf
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|ext| {
+            ext.value
+                .general_names
+                .iter()
+                .filter_map(|n| match n {
+                    x509_parser::extensions::GeneralName::DNSName(d) => Some(d.to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| anyhow::anyhow!("unsupported private key in {}: {e}", dir.display()))?;
@@ -197,12 +247,23 @@ fn load_files(dir: &Path) -> anyhow::Result<LoadedFiles> {
         Err(e) => return Err(e).context("certificate and private key are inconsistent"),
     }
 
-    Ok(LoadedFiles { certified, not_before, not_after })
+    Ok(LoadedFiles { certified, dns_names, not_before, not_after })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcard_coverage() {
+        let sans = vec!["*.previews.example.net".to_string(), "ui.example.com".to_string()];
+        assert!(covers(&sans, "3000-abc.previews.example.net"));
+        assert!(covers(&sans, "*.previews.example.net"));
+        assert!(covers(&sans, "UI.example.com"));
+        assert!(!covers(&sans, "previews.example.net"), "the wildcard does not cover the apex");
+        assert!(!covers(&sans, "a.b.previews.example.net"), "one label only");
+        assert!(!covers(&sans, "api.example.com"));
+    }
 
     struct TestDir(PathBuf);
 

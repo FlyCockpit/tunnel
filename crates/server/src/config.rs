@@ -18,6 +18,16 @@ pub struct Config {
     pub api_host: String,
     pub tunnel_host: String,
     pub turn_host: String,
+    /// Host of the web UI (sign-in, machines, users). Never the preview zone
+    /// or a name under it. Unset: no web UI and no browser-approved logins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_host: Option<String>,
+    /// Secret for UI keys (CSRF tokens, sealing TOTP secrets); required with `ui_host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_secret: Option<String>,
+    /// Where to report abuse (an email address or URL), shown on the server's own pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abuse_contact: Option<String>,
     /// Sites allowed to show previews in an iframe: CSP `frame-ancestors` sources
     /// (`https://app.example.com`, `https://*.example.com`), or `*` for any site.
     /// The preview's own origin is always allowed; an empty list allows only it.
@@ -48,7 +58,12 @@ pub struct Config {
     pub public_ipv6: Option<Ipv6Addr>,
 
     pub acme: AcmeConfig,
+    /// The DNS zone (and provider) holding the server's names.
     pub dns: DnsConfig,
+    /// More zones, possibly at other providers: e.g. a preview domain on its
+    /// own registrable domain. Each name uses the most specific zone holding it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_dns: Vec<DnsConfig>,
     #[serde(default)]
     pub webrtc: WebrtcConfig,
     #[serde(default)]
@@ -61,6 +76,11 @@ pub struct AcmeConfig {
     /// Use the Let's Encrypt staging directory.
     #[serde(default)]
     pub staging: bool,
+    /// Bring your own certificate: never issue or renew; `fullchain.pem` and
+    /// `privkey.pem` in the data directory's `certs/` must cover every name
+    /// (they are reloaded within a minute of being replaced).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_certificate: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +167,18 @@ pub struct Limits {
     /// admin token is not restricted.
     #[serde(default)]
     pub allow_public_for_clients: bool,
+    /// Defaults for new members (admins can change them per user): live
+    /// tunnels across all their machines, and machines.
+    #[serde(default = "default_member_max_tunnels")]
+    pub member_max_tunnels: u32,
+    #[serde(default = "default_member_max_clients")]
+    pub member_max_clients: u32,
+    /// Longest tunnel lifetime a member's machine may set.
+    #[serde(default = "default_member_max_ttl")]
+    pub member_max_tunnel_ttl_s: u64,
+    /// Web UI sign-in attempts per IP and per username per minute.
+    #[serde(default = "default_login_rate")]
+    pub login_rate_per_min: u32,
 }
 
 impl Default for Limits {
@@ -160,6 +192,10 @@ impl Default for Limits {
             max_tunnel_ttl_s: default_max_tunnel_ttl(),
             tombstone_retention_s: default_tombstone_retention(),
             allow_public_for_clients: false,
+            member_max_tunnels: default_member_max_tunnels(),
+            member_max_clients: default_member_max_clients(),
+            member_max_tunnel_ttl_s: default_member_max_ttl(),
+            login_rate_per_min: default_login_rate(),
         }
     }
 }
@@ -215,13 +251,51 @@ fn default_max_tunnel_ttl() -> u64 {
 fn default_tombstone_retention() -> u64 {
     30 * 86_400
 }
+fn default_member_max_tunnels() -> u32 {
+    10
+}
+fn default_member_max_clients() -> u32 {
+    5
+}
+fn default_member_max_ttl() -> u64 {
+    7 * 86_400
+}
+fn default_login_rate() -> u32 {
+    10
+}
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: Self = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         cfg.normalize_frame_ancestors();
+        cfg.validate().with_context(|| format!("checking {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Rules the types cannot express.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(ui) = &self.ui_host {
+            let ui = ui.to_ascii_lowercase();
+            let zone = self.preview_zone.to_ascii_lowercase();
+            anyhow::ensure!(
+                ui != zone && !ui.ends_with(&format!(".{zone}")),
+                "ui_host {ui} must not be the preview zone or a name under it: previews there could read or \
+                 forge the UI's requests; use another name (see the README's \"Hosts and domains\")"
+            );
+            anyhow::ensure!(
+                self.ui_secret.as_deref().is_some_and(|s| s.len() >= 32),
+                "ui_host is set but ui_secret is missing or shorter than 32 characters"
+            );
+        }
+        Ok(())
+    }
+
+    /// `ui_host` and `preview_zone` share a registrable domain (same site), so
+    /// previews are same-site with the UI. Uses the last two labels, plus a
+    /// short list of common two-label public suffixes; see the README.
+    pub fn ui_same_site_as_previews(&self) -> bool {
+        self.ui_host.as_deref().is_some_and(|ui| registrable(ui) == registrable(&self.preview_zone))
     }
 
     /// Trim and deduplicate sources without broadening an empty policy.
@@ -267,12 +341,28 @@ impl Config {
             self.api_host.clone(),
             self.tunnel_host.clone(),
         ];
+        if let Some(ui) = &self.ui_host {
+            names.push(ui.clone());
+        }
         if self.webrtc.enabled && !self.covered_by_wildcard(&self.turn_host) {
             names.push(self.turn_host.clone());
         }
         names.sort();
         names.dedup();
         names
+    }
+
+    /// The DNS zone settings for `host`: the most specific configured zone
+    /// that holds it.
+    pub fn dns_for(&self, host: &str) -> Option<&DnsConfig> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        std::iter::once(&self.dns)
+            .chain(&self.extra_dns)
+            .filter(|d| {
+                let zone = d.zone.trim_end_matches('.').to_ascii_lowercase();
+                !zone.is_empty() && (host == zone || host.ends_with(&format!(".{zone}")))
+            })
+            .max_by_key(|d| d.zone.len())
     }
 
     /// `host` is one label below the preview zone, so `*.<zone>` (certificate
@@ -290,6 +380,45 @@ impl Config {
     pub fn host_template(&self, tunnel_id: &str) -> String {
         format!("{{port}}-{tunnel_id}.{}", self.preview_zone)
     }
+}
+
+/// Two-label public suffixes common enough to matter for the same-site
+/// warning. Not the Public Suffix List: operators of public multi-tenant
+/// servers should get their preview zone onto the real list (README).
+const TWO_LABEL_SUFFIXES: &[&str] = &[
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "gov.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "co.nz",
+    "co.jp",
+    "ne.jp",
+    "or.jp",
+    "com.br",
+    "com.cn",
+    "com.mx",
+    "co.in",
+    "co.kr",
+    "co.za",
+    "com.tr",
+    "com.tw",
+    "github.io",
+    "pages.dev",
+];
+
+/// The registrable domain of `host`: its public suffix plus one label.
+pub fn registrable(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let take = if labels.len() >= 3 && TWO_LABEL_SUFFIXES.contains(&labels[labels.len() - 2..].join(".").as_str()) {
+        3
+    } else {
+        2
+    };
+    labels[labels.len().saturating_sub(take)..].join(".")
 }
 
 /// Ensure a path has exactly `mode` permissions.

@@ -3,7 +3,7 @@
 use tunnel_protocol::ENROLL_CODE_PREFIX;
 
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, NewClientError};
 use crate::tokens::{self, now};
 
 /// How long a `client add` login code works.
@@ -23,6 +23,10 @@ pub struct Enrollment {
 pub enum AddError {
     Invalid(String),
     Taken,
+    /// The owning user already has as many machines as allowed.
+    Quota,
+    /// The owning user is unknown or disabled.
+    NoUser,
     Other(anyhow::Error),
 }
 
@@ -39,14 +43,25 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(format!("name must be 1..={MAX_NAME_LEN} characters: letters, digits, '.', '_', '-'")) }
 }
 
-/// Create client `name` and its one-time login command.
-pub async fn add(db: &Db, cfg: &Config, name: &str) -> Result<Enrollment, AddError> {
+/// Create client `name` owned by `user_id`, and its one-time login command.
+/// From the web UI, `session` is the requesting session's id hash, which must
+/// still be valid when the client is created.
+pub async fn add(
+    db: &Db,
+    cfg: &Config,
+    name: &str,
+    user_id: &str,
+    session: Option<String>,
+) -> Result<Enrollment, AddError> {
     validate_name(name).map_err(AddError::Invalid)?;
     let code = tokens::random_token(ENROLL_CODE_PREFIX);
     let expires_at = now() + ENROLL_TTL_S;
     let id = format!("cl{}", tokens::random_tunnel_id());
-    match db.create_client(id, name.to_string(), tokens::hash_token(&code), expires_at).await? {
-        Some(_) => {
+    match db
+        .create_client(id, name.to_string(), user_id.to_string(), tokens::hash_token(&code), expires_at, session)
+        .await?
+    {
+        Ok(_) => {
             let login_code = format!("{code}@{}", cfg.api_host);
             Ok(Enrollment {
                 name: name.to_string(),
@@ -55,7 +70,9 @@ pub async fn add(db: &Db, cfg: &Config, name: &str) -> Result<Enrollment, AddErr
                 expires_at,
             })
         }
-        None => Err(AddError::Taken),
+        Err(NewClientError::NameTaken) => Err(AddError::Taken),
+        Err(NewClientError::Quota) => Err(AddError::Quota),
+        Err(NewClientError::NoUser) => Err(AddError::NoUser),
     }
 }
 

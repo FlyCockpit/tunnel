@@ -28,6 +28,8 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Lowercased names used for routing, computed once.
 struct Hosts {
+    /// The web UI host, if configured (it also serves the API).
+    ui: Option<String>,
     api: String,
     tunnel: String,
     turn: String,
@@ -41,6 +43,7 @@ impl Hosts {
     fn new(state: &AppState) -> Self {
         let cfg = &state.config;
         Self {
+            ui: cfg.ui_host.as_ref().map(|h| h.to_ascii_lowercase()),
             api: cfg.api_host.to_ascii_lowercase(),
             tunnel: cfg.tunnel_host.to_ascii_lowercase(),
             turn: cfg.turn_host.to_ascii_lowercase(),
@@ -54,7 +57,11 @@ impl Hosts {
     }
 
     fn is_ours(&self, host: &str) -> bool {
-        host == self.api || host == self.tunnel || host == self.zone || self.preview_label(host).is_some()
+        self.ui.as_deref() == Some(host)
+            || host == self.api
+            || host == self.tunnel
+            || host == self.zone
+            || self.preview_label(host).is_some()
     }
 }
 
@@ -155,6 +162,9 @@ async fn route_host(state: Arc<AppState>, hosts: &Hosts, peer: SocketAddr, req: 
     }
     if host == hosts.zone && gatehost::handles(req.uri().path()) {
         return gatehost::handle(state, peer, req).await;
+    }
+    if hosts.ui.as_deref() == Some(host.as_str()) {
+        return crate::ui::handle(state, peer, req).await;
     }
     if host == hosts.api {
         let mut req = req;

@@ -33,9 +33,12 @@ are welcome. Upgrade to the latest supported patch release when fixes ship.
 - The built-in STUN/TURN relay: authentication, tunnel deletion, quotas and
   prevention of relay access to local, private or otherwise forbidden peers.
 - DNS-01 setup, certificate handling, backups, restore and service permissions.
-- The release workflow and installer: signed checksums, asset integrity and
-  installation boundaries. The installer deliberately refuses its placeholder
-  signing key unless `TUNNEL_ALLOW_UNSIGNED=1` is explicitly set.
+- The release workflow and installers: checksums (`sha256.sum`, checked fail
+  closed by both installers), build provenance attestations, asset integrity
+  and installation boundaries.
+- The web UI and its accounts: sign-in, two-factor codes, sessions, CSRF and
+  same-site defenses, invites, roles and per-user isolation, and the
+  browser-approved machine login.
 
 An owner deliberately making a tunnel public grants visitors access to that
 application. An application can still have its own vulnerabilities; report a

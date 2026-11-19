@@ -68,6 +68,31 @@ jobs:
       - if: runner.os == 'macOS'
         run: nice -n 10 cargo test -p tunnel-client -p tunnel-protocol --locked -- --test-threads=3
 
+  web:
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/web.yml
+
+  # The server with the embedded UI, from the web job's artifact.
+  server-ui:
+    if: github.event_name != 'schedule'
+    needs: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: crates/web/dist
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (rolling branch)
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: nice -n 10 cargo clippy -p tunnel-server --all-targets --all-features --locked -- -D warnings
+      - run: nice -n 10 cargo test -p tunnel-server --features ui --locked -- --test-threads=3 ui::
+
   msrv:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -91,6 +116,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check bans licenses sources
+      # The web UI is its own workspace with its own (wasm32) policy.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: crates/web/Cargo.toml
+          command: check
+          command-arguments: --config crates/web/deny.toml bans licenses sources
 
   advisories:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

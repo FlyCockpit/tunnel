@@ -10,6 +10,10 @@ repository.workspace = true
 homepage.workspace = true
 description = "Self-hosted Tunnel edge server: TLS, access gate, management API and built-in TURN relay."
 
+[features]
+# Embed the web UI built by crates/web/build.sh (CI and release builds turn it on).
+ui = []
+
 [[bin]]
 name = "tunnel-server"
 path = "src/main.rs"
@@ -60,6 +64,8 @@ async-trait = "0.1"
 utoipa = "6.0.0"
 x509-parser = "0.18.1"
 stun = "0.17.3"
+ring = "0.17.14"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 h2 = "0.4"

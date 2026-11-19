@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::commands::{Answer, ask};
 use crate::ipc::{Request, Response, Status, host_for};
-use crate::login::{Api, Login, enroll, parse_login_arg};
+use crate::login::{Api, Login, enroll};
 use crate::paths::{Paths, env_nonempty, terminal_text};
 use crate::state::{Persisted, write_atomic};
 
@@ -46,13 +46,18 @@ pub fn forget_shared(paths: &Paths) {
     let _ = std::fs::remove_file(shared_path(paths));
 }
 
-pub async fn login(arg: Option<&str>) -> anyhow::Result<i32> {
+pub async fn login(arg: Option<&str>, name: Option<&str>, open_browser: bool) -> anyhow::Result<i32> {
     let arg = match arg.filter(|a| *a != "-") {
         Some(a) => a.to_string(),
-        None => read_secret_line("Login code (from `tunnel-server client add`): ")?,
+        None => read_secret_line("Server (https://…) or login code (from `tunnel-server client add`): ")?,
     };
-    let (code, host) = parse_login_arg(&arg)?;
-    let login = enroll(&code, &host).await?;
+    let login = match crate::login::parse_login_target(&arg)? {
+        crate::login::LoginTarget::Code { code, host } => enroll(&code, &host).await?,
+        crate::login::LoginTarget::Browser { origin } => {
+            let name = name.map(str::to_string).unwrap_or_else(crate::login::default_machine_name);
+            crate::login::device_login(&origin, &name, open_browser).await?
+        }
+    };
     login.save()?;
     println!("Logged in to {} as {}.", terminal_text(&login.api), terminal_text(&login.name));
     println!("Share a local port with: tunnel share <PORT>");

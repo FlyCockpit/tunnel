@@ -56,7 +56,8 @@ Outside a sandbox, a machine can create its own tunnels instead of receiving a
 tunnel token:
 
 ```sh
-tunnel login                                             # paste the code from `tunnel-server client add <name>`
+tunnel login https://tunnel.example.com                  # approve this machine in the browser (--name, --no-browser)
+tunnel login                                             # or paste the code from `tunnel-server client add <name>`
 tunnel share 3000 [5173 …]                               # link-only; prints a one-time link per port
 tunnel share 3000 --public                               # anyone with the URL (if the server allows it)
 TUNNEL_SHARE_PASSWORD=… tunnel share 3000 --password [--username bob]
@@ -65,6 +66,11 @@ tunnel link [--port 3000] [--reusable] [--ttl 1h]
 tunnel stop                                              # also deletes the shared tunnel
 tunnel logout
 ```
+
+Browser login prints a code and the approval page (`https://<ui host>/device`);
+sign in there, type the code, check the machine name and address, and approve.
+It works from SSH sessions too (the page opens on any device). The machine
+then belongs to the approving account.
 
 The login (server and client token) is saved in
 `$XDG_CONFIG_HOME/tunnel/login.json` (default
