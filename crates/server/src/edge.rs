@@ -131,8 +131,16 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
                 .then(|| req.uri().path_and_query().map(|p| gate::safe_next(p.as_str())).unwrap_or_default());
             if !reserved && is_same_tunnel_preflight(&req, &state.config.preview_zone, id) {
                 // Preflights never carry credentials; forward without any cookie.
+                // Still watched: any gate epoch rotation (a revoked link, a
+                // traffic cap reached) cuts a preflight response in flight.
                 if let Some(req) = preflight_only(req) {
-                    return forward_live(state, tunnel, port, req, None, peer, None, None).await;
+                    let watch = gate::Authorization {
+                        session_hash: None,
+                        candidates: Default::default(),
+                        expires_at: None,
+                        cancel: state.registry.gate_epoch(id),
+                    };
+                    return forward_live(state, tunnel, port, req, None, peer, None, Some(watch)).await;
                 }
             }
             Metrics::inc(&state.metrics.gate_denials);
@@ -282,7 +290,20 @@ async fn forward_live(
     let Some(live) = state.registry.get(&tunnel.id).filter(|l| l.has_port(port)) else {
         return pages::offline();
     };
-    proxy::forward(state, tunnel, live, port, req, cookie, peer, session_subject, authorization).await
+    // After the gate, so only visitors with access learn of it, and refused
+    // requests are never counted.
+    let bytes = match crate::traffic::counter(state, tunnel).await {
+        Ok(bytes) => bytes,
+        // Never relayed uncounted: without the owner's usage, no cap could apply.
+        Err(e) => {
+            tracing::warn!(tunnel = %tunnel.id, error = %format!("{e:#}"), "loading traffic usage failed");
+            return pages::server_busy();
+        }
+    };
+    if bytes.blocked() {
+        return pages::traffic_limit();
+    }
+    proxy::forward(state, tunnel, live, port, req, cookie, peer, session_subject, authorization, bytes).await
 }
 
 /// CORS preflight from another `{port}-{id}` host of the same tunnel.

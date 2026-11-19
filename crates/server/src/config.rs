@@ -176,6 +176,10 @@ pub struct Limits {
     /// Longest tunnel lifetime a member's machine may set.
     #[serde(default = "default_member_max_ttl")]
     pub member_max_tunnel_ttl_s: u64,
+    /// Monthly traffic cap (GB, 10^9 bytes, both directions) given to new
+    /// members; admins change it per user. Unset: no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_monthly_traffic_gb: Option<u64>,
     /// Web UI sign-in attempts per IP and per username per minute.
     #[serde(default = "default_login_rate")]
     pub login_rate_per_min: u32,
@@ -195,6 +199,7 @@ impl Default for Limits {
             member_max_tunnels: default_member_max_tunnels(),
             member_max_clients: default_member_max_clients(),
             member_max_tunnel_ttl_s: default_member_max_ttl(),
+            member_monthly_traffic_gb: None,
             login_rate_per_min: default_login_rate(),
         }
     }
@@ -275,6 +280,10 @@ impl Config {
 
     /// Rules the types cannot express.
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.limits.member_monthly_traffic_gb.is_none_or(|gb| (1..=1_000_000).contains(&gb)),
+            "limits.member_monthly_traffic_gb must be within 1..=1000000 (or unset for no cap)"
+        );
         if let Some(ui) = &self.ui_host {
             let ui = ui.to_ascii_lowercase();
             let zone = self.preview_zone.to_ascii_lowercase();

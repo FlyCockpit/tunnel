@@ -1180,7 +1180,7 @@ async fn admin_changes_are_authorized_inside_the_transaction() {
         .await
         .unwrap();
     let olivia = state.db.user_by_name("olivia".into()).await.unwrap().unwrap().id;
-    let member = super::store::MemberDefaults { max_tunnels: 10, max_clients: 5 };
+    let member = super::store::MemberDefaults { max_tunnels: 10, max_clients: 5, traffic_cap: None };
     let promote = super::store::UserPatch { role: Some(Role::Admin), ..Default::default() };
     // The session ends (an owner recovery) while the request is in flight.
     state.db.delete_user_sessions(olivia.clone(), None).await.unwrap();
@@ -1384,4 +1384,239 @@ async fn machines_are_renamed_by_whoever_may_manage_them() {
     assert_eq!(r.status, StatusCode::CONFLICT);
     let r = bearer(&state, "PATCH", "/v1/clients/srv", &ann_token, Some(json!({ "name": "mine" }))).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "machine tokens cannot manage clients");
+}
+
+fn user_id(users: &Value, name: &str) -> String {
+    users["users"].as_array().unwrap().iter().find(|u| u["username"] == name).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn listed<'a>(users: &'a Value, name: &str) -> &'a Value {
+    users["users"].as_array().unwrap().iter().find(|u| u["username"] == name).unwrap()
+}
+
+#[tokio::test]
+async fn traffic_is_counted_capped_cut_reset_and_flushed() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let token = approve_machine(&state, &mut ann, "laptop").await;
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    let ann_id = user_id(&users.body, "ann");
+    // Public, so a recheck needs no session: only the traffic block can refuse it.
+    let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "can_public": true }))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let t = create_tunnel(&state, &token, json!({ "mode": "public" })).await;
+    let id = t.body["id"].as_str().unwrap().to_string();
+    assert_eq!(t.body["traffic_limited"], false);
+    let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
+    assert_eq!(row.user_id.as_deref(), Some(ann_id.as_str()));
+
+    // Counting: per tunnel and for the user (memory first, then the flush).
+    let bytes = crate::traffic::counter(&state, &row).await.unwrap();
+    bytes.count(300, false);
+    bytes.count(200, true);
+    let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &token, None).await;
+    assert_eq!((view.body["bytes_in"].clone(), view.body["bytes_out"].clone()), (json!(300), json!(200)));
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    assert_eq!(listed(&users.body, "ann")["traffic_bytes"], 500);
+    crate::traffic::flush(&state).await.unwrap();
+    let stored = state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap();
+    assert_eq!(stored, (None, 500));
+    let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
+    assert_eq!((row.bytes_in, row.bytes_out), (300, 200));
+    // Nothing new: the next flush writes nothing (and the figures stay).
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap(), (None, 500));
+    let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &token, None).await;
+    assert_eq!(view.body["bytes_in"], 300);
+
+    // Caps: validated, admins only, never the owner or oneself.
+    for bad in [json!(0), json!(999_999), json!(-1), json!("10")] {
+        let r =
+            owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": bad }))).await;
+        assert!(matches!(r.status, StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST), "{bad}: {}", r.status);
+    }
+    let olivia = user_id(&users.body, "olivia");
+    let r = owner
+        .call(&state, "PATCH", &format!("/ui/api/users/{olivia}"), Some(json!({ "traffic_cap": 2_000_000 })))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "nobody caps the owner");
+    let r = ann.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": null }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "members cannot lift their own cap");
+    let r = ann.call(&state, "POST", &format!("/ui/api/users/{ann_id}/traffic/reset"), Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "members cannot reset their own traffic");
+
+    let r = owner
+        .call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": 1_000_000 })))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["user"]["traffic_cap"], 1_000_000);
+    assert!(!bytes.blocked());
+    let me = ann.call(&state, "GET", "/ui/api/session", None).await;
+    assert_eq!(me.body["traffic"]["used_bytes"], 500);
+    assert_eq!(me.body["traffic"]["cap_bytes"], 1_000_000);
+
+    // Crossing the cap blocks at once (`gate::reauthorize` refuses blocked
+    // tunnels, which cuts what is in flight once the enforcer rotates the epoch).
+    assert!(!crate::traffic::tunnel_blocked(&state, &id));
+    bytes.count(999_500, true);
+    assert!(bytes.blocked() && crate::traffic::tunnel_blocked(&state, &id));
+    let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &token, None).await;
+    assert_eq!(view.body["traffic_limited"], true);
+    let info = bearer(&state, "GET", "/v1/server", &token, None).await;
+    assert_eq!(info.body["limits"]["traffic"]["limited"], true, "{}", info.body);
+    assert_eq!(info.body["limits"]["traffic"]["used_bytes"], 1_000_000);
+    let t2 = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
+    assert_eq!((t2.status, t2.body["traffic_limited"].clone()), (StatusCode::CREATED, json!(true)));
+    let page = crate::pages::traffic_limit();
+    assert_eq!(page.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+
+    // Raising (here: removing) the cap unblocks; lowering it below the total blocks again.
+    let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": null }))).await;
+    assert_eq!((r.status, r.body["user"]["traffic_cap"].clone()), (StatusCode::OK, Value::Null));
+    assert!(!bytes.blocked());
+    let r = owner
+        .call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": 1_000_000 })))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(bytes.blocked());
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.users_over_cap(state.traffic.month()).await.unwrap(), vec![ann_id.clone()]);
+
+    // A reset starts the month again (stored and in memory); the tunnel's own
+    // total is not touched.
+    bytes.count(7, false);
+    let r = owner.call(&state, "POST", &format!("/ui/api/users/{ann_id}/traffic/reset"), Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["traffic"]["used_bytes"], 0);
+    assert!(!bytes.blocked());
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap(), (Some(1_000_000), 0));
+    assert!(state.db.users_over_cap(state.traffic.month()).await.unwrap().is_empty());
+    let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
+    assert_eq!((row.bytes_in, row.bytes_out), (300 + 7, 200 + 999_500));
+
+    // A new month starts from zero for everyone.
+    bytes.count(999_999, false);
+    assert!(!bytes.blocked());
+    bytes.count(1, false);
+    assert!(bytes.blocked());
+    let next = if state.traffic.month() % 100 == 12 { state.traffic.month() + 89 } else { state.traffic.month() + 1 };
+    let old = state.traffic.month();
+    crate::traffic::flush_or_roll_over(&state, next).await.unwrap();
+    assert!(!bytes.blocked());
+    assert_eq!(crate::traffic::view(&state, &ann_id).await.unwrap().used_bytes, 0);
+    // The rollover's flush closed the old month with everything counted before it.
+    assert_eq!(state.db.user_traffic(ann_id.clone(), old).await.unwrap(), (Some(1_000_000), 1_000_000));
+
+    // A deleted tunnel's last bytes still reach the user's month.
+    bytes.count(42, true);
+    assert_eq!(
+        bearer(&state, "DELETE", &format!("/v1/tunnels/{id}"), &token, None).await.status,
+        StatusCode::NO_CONTENT
+    );
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.user_traffic(ann_id.clone(), next).await.unwrap(), (Some(1_000_000), 42));
+
+    let log = owner.call(&state, "GET", "/ui/api/audit", None).await;
+    let actions: Vec<&str> =
+        log.body["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert!(actions.contains(&"traffic_cap_set") && actions.contains(&"traffic_reset"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn new_members_get_the_configured_cap_and_admins_none() {
+    let state = state_with(|c| c.limits.member_monthly_traffic_gb = Some(5));
+    let mut owner = owner(&state).await;
+    let _ann = member(&state, &mut owner, "ann", 2).await;
+    let r = owner.call(&state, "POST", "/ui/api/invites", Some(json!({ "role": "admin" }))).await;
+    let token = r.body["url"].as_str().unwrap().split_once('#').unwrap().1.to_string();
+    let _adam = sign_up(&state, &token, "adam", 3).await;
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    assert_eq!(listed(&users.body, "ann")["traffic_cap"], 5_000_000_000u64);
+    assert_eq!(listed(&users.body, "adam")["traffic_cap"], Value::Null);
+    assert_eq!(listed(&users.body, "olivia")["traffic_cap"], Value::Null);
+    assert!(users.body["month"].as_str().unwrap().len() == 7);
+    // Demoting an admin gives them the member default.
+    let adam = user_id(&users.body, "adam");
+    let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{adam}"), Some(json!({ "role": "member" }))).await;
+    assert_eq!((r.status, r.body["user"]["traffic_cap"].clone()), (StatusCode::OK, json!(5_000_000_000u64)));
+    let status = owner.call(&state, "GET", "/ui/api/status", None).await;
+    assert_eq!(status.body["limits"]["member_monthly_traffic_gb"], 5);
+}
+
+#[tokio::test]
+async fn services_and_the_owner_are_counted_but_never_capped() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let owner_token = approve_machine(&state, &mut owner, "server").await;
+    let t = create_tunnel(&state, &owner_token, json!({ "mode": "link" })).await;
+    let row = state.db.get_tunnel(t.body["id"].as_str().unwrap().to_string()).await.unwrap().unwrap();
+    let bytes = crate::traffic::counter(&state, &row).await.unwrap();
+    bytes.count(5_000_000_000, true);
+    assert!(!bytes.blocked());
+    assert_eq!(bytes.owner().unwrap().cap(), None);
+    // The owner's month is stored like anyone's and reloads with its total.
+    crate::traffic::flush(&state).await.unwrap();
+    let owner_id = row.user_id.clone().unwrap();
+    assert_eq!(state.db.user_traffic(owner_id, state.traffic.month()).await.unwrap(), (None, 5_000_000_000));
+    let svc =
+        bearer(&state, "POST", "/v1/services", ADMIN_CREDENTIAL, Some(json!({ "name": "wssp", "max_tunnels": 5 })))
+            .await;
+    let svc_token = svc.body["token"].as_str().unwrap().to_string();
+    let t = create_tunnel(&state, &svc_token, json!({ "mode": "link" })).await;
+    let row = state.db.get_tunnel(t.body["id"].as_str().unwrap().to_string()).await.unwrap().unwrap();
+    assert!(row.user_id.is_none());
+    let bytes = crate::traffic::counter(&state, &row).await.unwrap();
+    bytes.count(10, false);
+    assert!(bytes.owner().is_none() && !bytes.blocked());
+    crate::traffic::flush(&state).await.unwrap();
+    let row = state.db.get_tunnel(row.id).await.unwrap().unwrap();
+    assert_eq!(row.bytes_in, 10, "services' tunnels are counted per tunnel");
+}
+
+#[tokio::test]
+async fn sign_in_says_how_to_claim_an_owner_without_a_password() {
+    let state = state();
+    let s = Browser::new(1).call(&state, "GET", "/ui/api/session", None).await;
+    assert_eq!(s.body["owner_exists"], false);
+    // An owner created for machines before anyone signed up cannot sign in yet.
+    state.db.ensure_owner().await.unwrap();
+    let s = Browser::new(1).call(&state, "GET", "/ui/api/session", None).await;
+    assert_eq!(s.body["owner_exists"], false, "the hint stays until the owner is claimed");
+    let _owner = owner(&state).await;
+    let s = Browser::new(1).call(&state, "GET", "/ui/api/session", None).await;
+    assert_eq!(s.body["owner_exists"], true);
+}
+
+#[tokio::test]
+async fn a_deleted_tunnels_counter_in_use_keeps_reaching_the_month() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let token = approve_machine(&state, &mut ann, "laptop").await;
+    let t = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
+    let id = t.body["id"].as_str().unwrap().to_string();
+    let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
+    let ann_id = row.user_id.clone().unwrap();
+    // An exchange in flight holds the counter while the tunnel is deleted.
+    let held = crate::traffic::counter(&state, &row).await.unwrap();
+    assert_eq!(
+        bearer(&state, "DELETE", &format!("/v1/tunnels/{id}"), &token, None).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let month = state.traffic.month();
+    held.count(10, true);
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.user_traffic(ann_id.clone(), month).await.unwrap().1, 10);
+    held.count(5, false);
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.user_traffic(ann_id.clone(), month).await.unwrap().1, 15, "counted while still in use");
+    drop(held);
+    crate::traffic::flush(&state).await.unwrap();
+    assert!(state.metrics.get(&id).is_none(), "a deleted tunnel's counter is gone");
 }

@@ -64,5 +64,10 @@ async fn purge_once(state: &AppState) -> anyhow::Result<()> {
     if accounts > 0 {
         tracing::info!(rows = accounts, "purge removed expired UI sessions, logins, invites and old audit entries");
     }
+    // A year of monthly traffic is kept (this month and the twelve before).
+    let traffic = state.db.purge_traffic(state.traffic.month() - 100).await?;
+    if traffic > 0 {
+        tracing::info!(rows = traffic, "purge removed monthly traffic older than a year");
+    }
     Ok(())
 }

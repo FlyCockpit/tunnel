@@ -179,6 +179,10 @@ struct ShareOutput {
     expires_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
+    /// Present (true) when the account reached its monthly traffic cap:
+    /// visitors see "Traffic limit reached".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    traffic_limited: bool,
     links: Vec<LinkOutput>,
 }
 
@@ -259,12 +263,12 @@ pub async fn share(
         && let Some(token) = persisted_share_token(&s, running)
         && let Some(info) = api.tunnel(&s.tunnel_id).await?.filter(|i| !i.expired)
     {
-        reuse = Some((s.tunnel_id, token, info.access.mode, info.expires_at));
+        reuse = Some((s.tunnel_id, token, info.access.mode, info.expires_at, info.traffic_limited));
     }
 
     let Some(fg) = foreground else {
-        let (tunnel_id, token, mode, expires_at) = match reuse {
-            Some((id, token, current_mode, expires_at)) => {
+        let (tunnel_id, token, mode, expires_at, limited) = match reuse {
+            Some((id, token, current_mode, expires_at, limited)) => {
                 let mode = if access.explicit() {
                     let wanted = access.to_json()?;
                     api.set_access(&id, &wanted).await?;
@@ -272,16 +276,16 @@ pub async fn share(
                 } else {
                     current_mode
                 };
-                (id, token, mode, expires_at)
+                (id, token, mode, expires_at, limited)
             }
             None => {
                 let wanted = access.to_json()?;
-                let (shared, expires_at) = create_shared(&api, &login, &paths, label, ttl_s, &wanted).await?;
+                let (shared, expires_at, limited) = create_shared(&api, &login, &paths, label, ttl_s, &wanted).await?;
                 let mode = wanted["mode"].as_str().unwrap_or("link").to_string();
-                (shared.tunnel_id, shared.token.unwrap_or_default(), mode, expires_at)
+                (shared.tunnel_id, shared.token.unwrap_or_default(), mode, expires_at, limited)
             }
         };
-        let plan = Plan { ports, token, server: login.server.clone(), target, tunnel_id, mode, expires_at };
+        let plan = Plan { ports, token, server: login.server.clone(), target, tunnel_id, mode, expires_at, limited };
         return match expose_and_show(&api, plan, &out, None, report).await? {
             Ok(_) => Ok(0),
             Err(code) => Ok(code),
@@ -299,7 +303,7 @@ pub async fn share(
     // Prompt (for --password) before catching signals, so Ctrl-C still works there.
     let wanted = access.to_json()?;
     let mut signals = Signals::install()?;
-    let (shared, expires_at) = create_shared(&api, &login, &paths, label, fg.duration_s, &wanted).await?;
+    let (shared, expires_at, limited) = create_shared(&api, &login, &paths, label, fg.duration_s, &wanted).await?;
     let created = Instant::now();
     let plan = Plan {
         ports,
@@ -309,6 +313,7 @@ pub async fn share(
         tunnel_id: shared.tunnel_id.clone(),
         mode: wanted["mode"].as_str().unwrap_or("link").to_string(),
         expires_at,
+        limited,
     };
     let end = End { created, duration_s: fg.duration_s, expires_at };
     let setup = tokio::select! {
@@ -351,6 +356,8 @@ struct Plan {
     tunnel_id: String,
     mode: String,
     expires_at: i64,
+    /// The account reached its monthly traffic cap.
+    limited: bool,
 }
 
 /// Create a tunnel and record it in `share.json` (deleting it again if that fails).
@@ -361,7 +368,7 @@ async fn create_shared(
     label: Option<String>,
     ttl_s: u64,
     access: &Value,
-) -> anyhow::Result<(Shared, i64)> {
+) -> anyhow::Result<(Shared, i64, bool)> {
     let label = label.unwrap_or_else(|| format!("share-{}", hostname()));
     let created = api.create_tunnel(&label, ttl_s, access).await?;
     let shared = Shared { tunnel_id: created.id.clone(), api: login.api.clone(), token: Some(created.tunnel_token) };
@@ -374,7 +381,7 @@ async fn create_shared(
         }
         return Err(e);
     }
-    Ok((shared, created.expires_at))
+    Ok((shared, created.expires_at, created.traffic_limited))
 }
 
 /// Expose the ports, mint links, print. `Ok(Err(code))`: the tunnel is gone (already reported).
@@ -385,7 +392,13 @@ async fn expose_and_show(
     foreground: Option<&Foreground>,
     report: Report,
 ) -> anyhow::Result<Result<ShareOutput, i32>> {
-    let Plan { ports, token, server, target, tunnel_id, mode, expires_at } = plan;
+    let Plan { ports, token, server, target, tunnel_id, mode, expires_at, limited } = plan;
+    if limited {
+        eprintln!(
+            "tunnel: warning: this account reached its monthly traffic limit; visitors see \"Traffic limit reached\" \
+             until an admin raises the limit or the month ends"
+        );
+    }
     let req = Request::Expose { ports: ports.clone(), token: Some(token), server: Some(server), target };
     let status = match ask(req, true, report).await? {
         Answer::Response(Response::Status { status }) => status,
@@ -422,7 +435,7 @@ async fn expose_and_show(
             LinkOutput { port, url, connected, id: None, expires_at: None, single_use: None }
         });
     }
-    let shown = ShareOutput { tunnel: tunnel_id, mode, expires_at, username, links };
+    let shown = ShareOutput { tunnel: tunnel_id, mode, expires_at, username, traffic_limited: limited, links };
     print_share(&shown, out, foreground)?;
     Ok(Ok(shown))
 }
@@ -648,6 +661,7 @@ pub async fn link(
             mode: info.access.mode,
             expires_at: info.expires_at,
             username: None,
+            traffic_limited: info.traffic_limited,
             links: vec![LinkOutput {
                 port,
                 url: link.url,
@@ -910,8 +924,14 @@ mod tests {
             expires_at: Some(5),
             single_use: Some(true),
         };
-        let shown =
-            ShareOutput { tunnel: "t".into(), mode: "link".into(), expires_at: 9, username: None, links: vec![link] };
+        let shown = ShareOutput {
+            tunnel: "t".into(),
+            mode: "link".into(),
+            expires_at: 9,
+            username: None,
+            traffic_limited: false,
+            links: vec![link],
+        };
         assert_eq!(
             serde_json::to_value(&shown).unwrap(),
             json!({"tunnel":"t","mode":"link","expires_at":9,"links":[
@@ -930,11 +950,12 @@ mod tests {
             mode: "password".into(),
             expires_at: 9,
             username: Some("bob".into()),
+            traffic_limited: true,
             links: vec![public],
         };
         assert_eq!(
             serde_json::to_value(&shown).unwrap(),
-            json!({"tunnel":"t","mode":"password","expires_at":9,"username":"bob","links":[
+            json!({"tunnel":"t","mode":"password","expires_at":9,"username":"bob","traffic_limited":true,"links":[
                 {"port":80,"url":"https://80-t.example/","connected":false}]})
         );
     }

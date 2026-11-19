@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::api::{self, ApiError};
 use crate::types::*;
-use crate::ui::{Copy, Empty, ErrorBox, relative, when};
+use crate::ui::{Copy, Empty, ErrorBox, bytes, gb_text, parse_gb, relative, traffic_text, when};
 use crate::{ctx, navigate, refresh_session};
 
 pub fn route(path: String) -> AnyView {
@@ -302,7 +302,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
                     <div class="card card-tight table-wrap">
                         <table class="table">
                             <thead><tr>
-                                <th>"Tunnel"</th><th>"Ports"</th><th>"Access"</th><th>"Machine"</th><th>"Expires"</th><th></th>
+                                <th>"Tunnel"</th><th>"Ports"</th><th>"Access"</th><th>"Machine"</th><th>"Traffic"</th><th>"Expires"</th><th></th>
                             </tr></thead>
                             <tbody>
                                 {list.into_iter().map(|t| {
@@ -329,6 +329,10 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                             <td>{ports}</td>
                                             <td><span class="badge">{t.access.mode.clone()}</span></td>
                                             <td>{owner}</td>
+                                            <td title=format!("in {} / out {}", bytes(t.bytes_in), bytes(t.bytes_out))>
+                                                {bytes(t.bytes_in + t.bytes_out)}
+                                                {t.traffic_limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}
+                                            </td>
                                             <td title=when(t.expires_at)>{relative(t.expires_at)}</td>
                                             <td class="actions">
                                                 <button class="btn btn-outline btn-sm" on:click=move |_| {
@@ -339,7 +343,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                             </td>
                                         </tr>
                                         <Show when=is_open.clone()>
-                                            <tr><td colspan="6" class="links-panel"><Links tunnel=t2.clone() /></td></tr>
+                                            <tr><td colspan="7" class="links-panel"><Links tunnel=t2.clone() /></td></tr>
                                         </Show>
                                     }
                                 }).collect_view()}
@@ -788,6 +792,8 @@ fn Account() -> impl IntoView {
     let setup = RwSignal::new(None::<Value>);
     let recovery = RwSignal::new(None::<Vec<String>>);
     let sessions = RwSignal::new(Vec::<SessionRow>::new());
+    // The session carries this month's traffic: fetch it fresh on every visit.
+    spawn_local(async move { refresh_session().await });
     let load_sessions = move || {
         spawn_local(async move {
             if let Ok(v) = api::get::<Value>("/ui/api/account/sessions").await {
@@ -857,6 +863,16 @@ fn Account() -> impl IntoView {
             </div></div>
             <ErrorBox error=error />
             {move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}
+            {move || c.session.get().and_then(|s| s.traffic).map(|t| view! {
+                <div class="card stack">
+                    <h2>"Traffic this month"</h2>
+                    <p>{traffic_text(t.used_bytes, t.cap_bytes)}" in " {t.month.clone()} " (UTC)."</p>
+                    {t.limited.then(|| view! {
+                        <div class="alert alert-warning">"Your monthly traffic limit is reached: visitors of your tunnels see \"Traffic limit reached\" until next month or until an admin raises the limit."</div>
+                    })}
+                    <p class="muted small">"Counts what your tunnels relay in both directions (request and response bodies, WebSocket messages)."</p>
+                </div>
+            })}
             <div class="grid2">
                 <form class="card stack" on:submit=change_password>
                     <h2>"Password"</h2>
@@ -957,10 +973,14 @@ fn Users(me: User) -> impl IntoView {
     let busy = RwSignal::new(false);
     let role = RwSignal::new("member".to_string());
     let new_url = RwSignal::new(None::<String>);
+    let month = RwSignal::new(String::new());
+    // Loading the lists does not disable the invite button (only a submit in flight does).
+    let loading = RwSignal::new(false);
     let load = move || {
-        run(error, busy, async move {
+        run(error, loading, async move {
             let u = api::get::<Value>("/ui/api/users").await?;
             users.set(serde_json::from_value(u["users"].clone()).unwrap_or_default());
+            month.set(u["month"].as_str().unwrap_or_default().to_string());
             let i = api::get::<Value>("/ui/api/invites").await?;
             invites.set(serde_json::from_value(i["invites"].clone()).unwrap_or_default());
             let s = api::get::<Value>("/ui/api/services").await?;
@@ -982,6 +1002,13 @@ fn Users(me: User) -> impl IntoView {
     let update = move |id: String, body: Value| {
         run(error, busy, async move {
             api::patch::<Value>(&format!("/ui/api/users/{id}"), &body).await?;
+            load();
+            Ok(())
+        });
+    };
+    let reset_traffic = move |id: String| {
+        run(error, busy, async move {
+            api::post::<Value>(&format!("/ui/api/users/{id}/traffic/reset"), &json!({})).await?;
             load();
             Ok(())
         });
@@ -1019,12 +1046,33 @@ fn Users(me: User) -> impl IntoView {
             </form>
             <div class="card card-tight table-wrap">
                 <table class="table">
-                    <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th><th>"Public previews"</th><th>"2FA"</th><th></th></tr></thead>
+                    <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
+                        <th>{move || format!("Traffic {}", month.get())}</th><th>"Public previews"</th><th>"2FA"</th><th></th></tr></thead>
                     <tbody>
                     {move || users.get().into_iter().map(|row| {
                         let u = row.user.clone();
                         let editable = u.role != "owner" && u.id != me_id && (owner || u.role == "member");
                         let (id1, id2, id3, id4) = (u.id.clone(), u.id.clone(), u.id.clone(), u.id.clone());
+                        let (id5, id6) = (u.id.clone(), u.id.clone());
+                        let cap_input_id = format!("cap-{}", u.id);
+                        let cap = u.traffic_cap;
+                        let limited = cap.is_some_and(|c| row.traffic_bytes >= c);
+                        // The cap in GB as typed; empty: no cap.
+                        let cap_gb = RwSignal::new(cap.map(gb_text).unwrap_or_default());
+                        let set_cap = move |ev: leptos::ev::SubmitEvent| {
+                            ev.prevent_default();
+                            let typed = cap_gb.get_untracked();
+                            let typed = typed.trim();
+                            let cap = if typed.is_empty() {
+                                Value::Null
+                            } else {
+                                match parse_gb(typed) {
+                                    Some(b) => json!(b),
+                                    None => { error.set(Some("Enter the cap in GB, e.g. 50 or 0.5, or leave it empty for no cap.".into())); return; }
+                                }
+                            };
+                            update(id5.clone(), json!({ "traffic_cap": cap }));
+                        };
                         let can_public = u.can_public;
                         let disabled = u.disabled;
                         let is_admin = u.role == "admin";
@@ -1033,6 +1081,21 @@ fn Users(me: User) -> impl IntoView {
                             <td>{u.role.clone()}</td>
                             <td>{format!("{} / {}", row.clients, u.max_clients)}</td>
                             <td>{format!("{} / {}", row.tunnels, u.max_tunnels)}</td>
+                            <td>
+                                <div>{traffic_text(row.traffic_bytes, cap)}
+                                    {limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}</div>
+                                {editable.then(|| view! {
+                                    <form class="row" on:submit=set_cap>
+                                        <label class="sr-only" for=cap_input_id.clone()>"Monthly traffic cap (GB)"</label>
+                                        <input id=cap_input_id.clone() class="input input-sm input-num" inputmode="decimal" placeholder="no cap"
+                                            prop:value=move || cap_gb.get() on:input=move |ev| cap_gb.set(value(&ev)) />
+                                        <span class="muted small">"GB"</span>
+                                        <button class="btn btn-outline btn-sm" type="submit" disabled=move || busy.get()>"Set cap"</button>
+                                        <button class="btn btn-ghost btn-sm" type="button" disabled=move || busy.get()
+                                            on:click=move |_| reset_traffic(id6.clone())>"Reset month"</button>
+                                    </form>
+                                })}
+                            </td>
                             <td>{if u.role == "member" {
                                 if editable { view! {
                                     <label class="check"><input type="checkbox" prop:checked=can_public
@@ -1159,6 +1222,10 @@ fn Status() -> impl IntoView {
                         <tr><th>"Access links"</th><td>{field(&["counts", "access_links"])}</td></tr>
                         <tr><th>"Member tunnels / machines"</th><td>{move || format!("{} / {}", field(&["limits", "member_max_tunnels"])(), field(&["limits", "member_max_clients"])())}</td></tr>
                         <tr><th>"Public previews for everyone"</th><td>{field(&["limits", "allow_public_for_clients"])}</td></tr>
+                        <tr><th>"New members' monthly traffic"</th><td>{move || status.get()
+                            .and_then(|s| s["limits"]["member_monthly_traffic_gb"].as_u64())
+                            .map(|gb| format!("{gb} GB"))
+                            .unwrap_or_else(|| "no cap".into())}</td></tr>
                     </table>
                 </div>
             </div>

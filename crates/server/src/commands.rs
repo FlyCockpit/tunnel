@@ -46,6 +46,11 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     tokio::spawn(tls::watch(certs));
     tokio::spawn(acme::renew_loop(state.clone()));
     tokio::spawn(purge::run(state.clone()));
+    if let Err(e) = crate::traffic::preload(&state).await {
+        tracing::warn!(error = %format!("{e:#}"), "loading users over their traffic cap failed");
+    }
+    tokio::spawn(crate::traffic::run(state.clone()));
+    tokio::spawn(crate::traffic::enforce(state.clone()));
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -66,6 +71,12 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
                 live.close(CloseReason::Shutdown);
             }
             tokio::time::sleep(SHUTDOWN_GRACE).await;
+            // Keep the last minute of traffic counts.
+            match tokio::time::timeout(Duration::from_secs(5), crate::traffic::flush(&state)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "final traffic flush failed"),
+                Err(_) => tracing::warn!("final traffic flush timed out"),
+            }
         }
     }
     Ok(())
@@ -446,7 +457,7 @@ pub async fn user_list(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
     let db = Db::open(&cfg.db_path())?;
-    let users = db.list_users().await;
+    let users = db.list_users(crate::traffic::month_of(crate::tokens::now())).await;
     drop(db);
     restore_ownership(config_path, &cfg)?;
     let users = users?;

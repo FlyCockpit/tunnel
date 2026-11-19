@@ -79,7 +79,9 @@ and `link --json` print one line (errors and notes go to stderr):
  "links":[{"port":3000,"url":"https://…","connected":true,"id":"lk…","expires_at":1795370000,"single_use":true}]}
 ```
 
-`link --json` always describes the one new access link. For `share --json`
+`"traffic_limited": true` is added when the account has reached its monthly
+traffic cap (visitors then see "Traffic limit reached"; `share` also warns on
+stderr). `link --json` always describes the one new access link. For `share --json`
 in `public` and `password` mode each entry has the preview URL instead of a
 link (no `id`), and `password` adds `"username"`. With `share --for --json`
 that line is the only output on stdout; the process then waits and exits

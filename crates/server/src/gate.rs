@@ -140,6 +140,10 @@ pub async fn reauthorize(
     if cancel.is_cancelled() {
         return Ok(None);
     }
+    // Before any database work: blocking a user rotates all their tunnels at once.
+    if crate::traffic::tunnel_blocked(state, tunnel_id) {
+        return Ok(None);
+    }
     let tunnel = state.tunnel(tunnel_id).await?;
     let crate::db::TunnelLookup::Live(tunnel) = tunnel.as_ref() else {
         return Ok(None);

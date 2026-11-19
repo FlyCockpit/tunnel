@@ -20,6 +20,22 @@ pub struct User {
     pub totp: bool,
     #[serde(default)]
     pub created_at: i64,
+    /// Monthly traffic cap in bytes; `None`: no cap.
+    #[serde(default)]
+    pub traffic_cap: Option<u64>,
+}
+
+/// A user's traffic this month.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Traffic {
+    #[serde(default)]
+    pub month: String,
+    #[serde(default)]
+    pub used_bytes: u64,
+    #[serde(default)]
+    pub cap_bytes: Option<u64>,
+    #[serde(default)]
+    pub limited: bool,
 }
 
 impl User {
@@ -56,6 +72,8 @@ pub struct SessionInfo {
     pub owner_exists: bool,
     #[serde(default)]
     pub server: Server,
+    #[serde(default)]
+    pub traffic: Option<Traffic>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -91,6 +109,12 @@ pub struct Tunnel {
     pub owner: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(default)]
+    pub bytes_in: u64,
+    #[serde(default)]
+    pub bytes_out: u64,
+    #[serde(default)]
+    pub traffic_limited: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -130,6 +154,9 @@ pub struct UserRow {
     pub clients: i64,
     #[serde(default)]
     pub tunnels: i64,
+    /// Bytes this month.
+    #[serde(default)]
+    pub traffic_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

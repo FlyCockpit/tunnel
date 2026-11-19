@@ -160,6 +160,58 @@ pub fn when(unix: i64) -> String {
     )
 }
 
+/// `0 B`, `12.3 MB`, `4.56 GB` (decimal units, like the caps). Integer
+/// arithmetic only: float formatting would add tens of kB to the WASM.
+pub fn bytes(n: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
+    let (mut unit, mut base) = (0, 1u64);
+    while unit < UNITS.len() - 1 && n / base >= 1000 {
+        base *= 1000;
+        unit += 1;
+    }
+    let (whole, rem, u) = (n / base, n % base, UNITS[unit]);
+    match unit {
+        0 => format!("{n} B"),
+        _ if whole >= 100 => format!("{whole} {u}"),
+        _ if whole >= 10 => format!("{whole}.{} {u}", rem * 10 / base),
+        _ => format!("{whole}.{:02} {u}", rem / (base / 100)),
+    }
+}
+
+/// Bytes as GB for an input field: `50`, `0.5`, `1.25`.
+pub fn gb_text(n: u64) -> String {
+    let (whole, rem) = (n / 1_000_000_000, n % 1_000_000_000);
+    if rem == 0 {
+        return whole.to_string();
+    }
+    let digits = format!("{rem:09}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
+}
+
+/// `50`, `0.5`, `1.25` (GB) as bytes; `None` unless a positive number with
+/// at most nine decimals.
+pub fn parse_gb(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if (whole.is_empty() && frac.is_empty())
+        || frac.len() > 9
+        || !(whole.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<9}").parse().ok()? };
+    whole.checked_mul(1_000_000_000)?.checked_add(frac).filter(|b| *b > 0)
+}
+
+/// `used of cap`, or `used (no cap)`.
+pub fn traffic_text(used: u64, cap: Option<u64>) -> String {
+    match cap {
+        Some(c) => format!("{} of {}", bytes(used), bytes(c)),
+        None => format!("{} (no cap)", bytes(used)),
+    }
+}
+
 /// `in 3 h`, `5 min ago`.
 pub fn relative(unix: i64) -> String {
     if unix <= 0 {

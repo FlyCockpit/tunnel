@@ -47,6 +47,8 @@ pub struct User {
     pub max_clients: u32,
     pub totp: bool,
     pub created_at: i64,
+    /// Monthly traffic cap in bytes (both directions); `None`: no cap.
+    pub traffic_cap: Option<u64>,
 }
 
 /// A user with the secrets needed to sign them in.
@@ -76,6 +78,7 @@ pub const FACTOR_LOCK_S: i64 = 15 * 60;
 pub struct MemberDefaults {
     pub max_tunnels: u32,
     pub max_clients: u32,
+    pub traffic_cap: Option<u64>,
 }
 
 /// A user in the admin list, with usage.
@@ -85,6 +88,8 @@ pub struct UserSummary {
     pub user: User,
     pub clients: i64,
     pub tunnels: i64,
+    /// Bytes this calendar month (UTC), both directions.
+    pub traffic_bytes: u64,
 }
 
 pub struct NewUser {
@@ -94,6 +99,7 @@ pub struct NewUser {
     pub can_public: bool,
     pub max_tunnels: u32,
     pub max_clients: u32,
+    pub traffic_cap: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -102,6 +108,14 @@ pub struct UserPatch {
     pub can_public: Option<bool>,
     pub max_tunnels: Option<u32>,
     pub max_clients: Option<u32>,
+    /// `Some(None)`: remove the cap; absent: unchanged.
+    #[serde(default, deserialize_with = "some_or_null")]
+    pub traffic_cap: Option<Option<u64>>,
+}
+
+/// Tells a JSON `null` (`Some(None)`) from a missing field (`None`).
+fn some_or_null<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// A signed-in (or half signed-in) UI session.
@@ -273,7 +287,9 @@ pub struct LinkSummary {
 }
 
 const USER_COLUMNS: &str = "u.id, u.username, u.role, u.disabled_at IS NOT NULL, u.can_public, u.max_tunnels, \
-     u.max_clients, u.totp_secret_sealed IS NOT NULL, u.created_at";
+     u.max_clients, u.totp_secret_sealed IS NOT NULL, u.created_at, u.traffic_cap";
+/// Columns `user_from_row` reads; queries add theirs after these.
+const USER_COLS: usize = 10;
 
 fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
@@ -286,6 +302,7 @@ fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         max_clients: r.get(6)?,
         totp: r.get(7)?,
         created_at: r.get(8)?,
+        traffic_cap: r.get::<_, Option<i64>>(9)?.map(|b| b.max(0) as u64),
     })
 }
 
@@ -354,12 +371,12 @@ impl Db {
             Ok(c.query_row(&sql, params![username, id], |r| {
                 Ok(Credentials {
                     user: user_from_row(r)?,
-                    password_hash: r.get(9)?,
-                    totp_sealed: r.get(10)?,
-                    totp_pending_sealed: r.get(11)?,
-                    totp_last_step: r.get(12)?,
-                    auth_epoch: r.get(13)?,
-                    factor_locked_until: r.get(14)?,
+                    password_hash: r.get(USER_COLS)?,
+                    totp_sealed: r.get(USER_COLS + 1)?,
+                    totp_pending_sealed: r.get(USER_COLS + 2)?,
+                    totp_last_step: r.get(USER_COLS + 3)?,
+                    auth_epoch: r.get(USER_COLS + 4)?,
+                    factor_locked_until: r.get(USER_COLS + 5)?,
                 })
             })
             .optional()?)
@@ -367,18 +384,25 @@ impl Db {
         .await
     }
 
-    pub async fn list_users(&self) -> anyhow::Result<Vec<UserSummary>> {
-        self.call(|c| {
+    /// Every user, with machines, live tunnels and the stored traffic of `month`.
+    pub async fn list_users(&self, month: u32) -> anyhow::Result<Vec<UserSummary>> {
+        self.call(move |c| {
             let mut stmt = c.prepare(&format!(
                 "SELECT {USER_COLUMNS},
                         (SELECT COUNT(*) FROM clients c WHERE c.user_id = u.id),
                         (SELECT COUNT(*) FROM tunnels t JOIN clients c ON c.id = t.client_id
-                         WHERE c.user_id = u.id AND t.expires_at > ?1)
+                         WHERE c.user_id = u.id AND t.expires_at > ?1),
+                        COALESCE((SELECT bytes_in + bytes_out FROM traffic WHERE user_id = u.id AND month = ?2), 0)
                  FROM users u ORDER BY u.username"
             ))?;
             Ok(stmt
-                .query_map(params![now()], |r| {
-                    Ok(UserSummary { user: user_from_row(r)?, clients: r.get(9)?, tunnels: r.get(10)? })
+                .query_map(params![now(), month], |r| {
+                    Ok(UserSummary {
+                        user: user_from_row(r)?,
+                        clients: r.get(USER_COLS)?,
+                        tunnels: r.get(USER_COLS + 1)?,
+                        traffic_bytes: r.get::<_, i64>(USER_COLS + 2)?.max(0) as u64,
+                    })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
         })
@@ -431,8 +455,8 @@ impl Db {
                 tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![id])?;
                 if new_role == Role::Member {
                     tx.execute(
-                        "UPDATE users SET can_public = 0, max_tunnels = ?2, max_clients = ?3 WHERE id = ?1",
-                        params![id, member.max_tunnels, member.max_clients],
+                        "UPDATE users SET can_public = 0, max_tunnels = ?2, max_clients = ?3, traffic_cap = ?4 WHERE id = ?1",
+                        params![id, member.max_tunnels, member.max_clients, member.traffic_cap.map(|b| b as i64)],
                     )?;
                     tx.execute("DELETE FROM invites WHERE created_by = ?1 AND used_at IS NULL", params![id])?;
                 }
@@ -445,6 +469,9 @@ impl Db {
             }
             if let Some(v) = patch.max_clients {
                 tx.execute("UPDATE users SET max_clients = ?2 WHERE id = ?1", params![id, v])?;
+            }
+            if let Some(v) = patch.traffic_cap {
+                tx.execute("UPDATE users SET traffic_cap = ?2 WHERE id = ?1", params![id, v.map(|b| b as i64)])?;
             }
             let mut tunnels = Vec::new();
             match disabled {
@@ -745,12 +772,12 @@ impl Db {
                             Session {
                                 id_hash: id_hash.clone(),
                                 user: user_from_row(r)?,
-                                pending: r.get(9)?,
-                                auth_at: r.get(11)?,
-                                auth_epoch: r.get(14)?,
+                                pending: r.get(USER_COLS)?,
+                                auth_at: r.get(USER_COLS + 2)?,
+                                auth_epoch: r.get(USER_COLS + 5)?,
                             },
-                            r.get::<_, i64>(12)?,
-                            r.get::<_, i64>(13)?,
+                            r.get::<_, i64>(USER_COLS + 3)?,
+                            r.get::<_, i64>(USER_COLS + 4)?,
                         ))
                     },
                 )
@@ -1447,7 +1474,7 @@ impl Db {
         self.call(move |c| {
             let sql = "SELECT t.id, t.label, t.metadata, t.max_ports, t.host_header, t.inject_ice, t.created_at, t.expires_at,
                         t.last_seen_at, t.access_mode, t.password_user, t.password_hash, t.client_id,
-                        COALESCE(c.name, s.name), u.username
+                        t.bytes_in, t.bytes_out, c.user_id, COALESCE(c.name, s.name), u.username
                  FROM tunnels t
                  LEFT JOIN clients c ON c.id = t.client_id
                  LEFT JOIN users u ON u.id = c.user_id
@@ -1457,7 +1484,8 @@ impl Db {
             let mut stmt = c.prepare(sql)?;
             Ok(stmt
                 .query_map(params![user_id, now()], |r| {
-                    Ok((crate::db::tunnel_from_row(r)?, r.get(13)?, r.get(14)?))
+                    let n = crate::db::TUNNEL_COLUMNS;
+                    Ok((crate::db::tunnel_from_row(r)?, r.get(n)?, r.get(n + 1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
         })
@@ -1613,9 +1641,19 @@ pub(crate) fn authorized(
 /// Insert `u` with `role`; `None` if the username is taken.
 fn insert_user(tx: &rusqlite::Transaction<'_>, u: NewUser, role: Role, t: i64) -> anyhow::Result<Option<String>> {
     let inserted = tx.execute(
-        "INSERT INTO users (id, username, password_hash, role, can_public, max_tunnels, max_clients, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(username) DO NOTHING",
-        params![u.id, u.username, u.password_hash, role.as_str(), u.can_public, u.max_tunnels, u.max_clients, t],
+        "INSERT INTO users (id, username, password_hash, role, can_public, max_tunnels, max_clients, traffic_cap, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(username) DO NOTHING",
+        params![
+            u.id,
+            u.username,
+            u.password_hash,
+            role.as_str(),
+            u.can_public,
+            u.max_tunnels,
+            u.max_clients,
+            u.traffic_cap.map(|b| b as i64),
+            t
+        ],
     )?;
     Ok((inserted == 1).then_some(u.id))
 }

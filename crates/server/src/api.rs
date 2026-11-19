@@ -408,6 +408,10 @@ pub struct CreateTunnelResponse {
     pub host_template: String,
     /// Unix seconds.
     pub expires_at: i64,
+    /// The creating machine's account has reached its monthly traffic cap:
+    /// visitors see "traffic limit reached" until it is raised or the month ends.
+    #[serde(default)]
+    pub traffic_limited: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
@@ -456,6 +460,12 @@ pub struct TunnelView {
     pub created_at: i64,
     pub expires_at: i64,
     pub last_seen_at: Option<i64>,
+    /// Proxied bytes visitor → app (request bodies, WebSocket messages).
+    pub bytes_in: u64,
+    /// Proxied bytes app → visitor.
+    pub bytes_out: u64,
+    /// The owning machine's account has reached its monthly traffic cap.
+    pub traffic_limited: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -576,6 +586,7 @@ pub struct TurnCredentialsResponse {
         AccessLinkList,
         ServerInfo,
         ServerLimits,
+        crate::traffic::TrafficView,
         crate::device::DeviceCodeRequest,
         crate::device::DeviceCodeResponse,
         crate::device::DeviceTokenRequest,
@@ -696,14 +707,21 @@ pub struct ServerLimits {
     pub default_session_ttl_s: u64,
     /// Whether this caller may create public previews.
     pub public_allowed: bool,
+    /// This month's traffic of the caller's account (machine callers only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<crate::traffic::TrafficView>,
 }
 
 /// Any bearer caller: where things live and what this caller may do.
 #[utoipa::path(get, path = "/v1/server", responses((status = 200, body = ServerInfo), (status = 401, body = ErrorBody)))]
-async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> Json<ServerInfo> {
+async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> ApiResult<Json<ServerInfo>> {
     let cfg = &state.config;
     let limits = &cfg.limits;
-    Json(ServerInfo {
+    let traffic = match &caller {
+        Caller::Client { user, .. } => Some(crate::traffic::view(&state, &user.id).await?),
+        _ => None,
+    };
+    Ok(Json(ServerInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         api_origin: format!("https://{}", cfg.api_host),
         control_origin: format!("wss://{}", cfg.tunnel_host),
@@ -718,8 +736,9 @@ async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> Json
             hard_max_ports: limits.hard_max_ports,
             default_session_ttl_s: limits.default_session_ttl_s,
             public_allowed: caller.check_public(AccessMode::Public, limits).is_ok(),
+            traffic,
         },
-    })
+    }))
 }
 
 async fn fallback() -> ApiError {
@@ -814,6 +833,7 @@ async fn create_tunnel(
         StatusCode::CREATED,
         Json(CreateTunnelResponse {
             host_template: state.config.host_template(&row.id),
+            traffic_limited: row.user_id.as_deref().is_some_and(|u| state.traffic.user_blocked(u)),
             id: row.id,
             tunnel_token: token,
             expires_at: row.expires_at,
@@ -875,6 +895,8 @@ async fn list_tunnels(
     let Query(query) = query.map_err(|e| ApiError::validation(e.body_text()))?;
     validate_label(query.label.as_deref())?;
     let (limit, cursor) = page_bounds(Pagination { limit: query.limit, cursor: query.cursor }, false)?;
+    // Stored bytes and unflushed ones from the same side of any flush.
+    let _reading = state.traffic.reading().await;
     let mut rows =
         state.db.list_tunnels_page(caller.owner_id().map(str::to_string), query.label, cursor, limit).await?;
     let has_more = rows.len() > limit as usize;
@@ -895,6 +917,7 @@ async fn get_tunnel(
     caller: Caller,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TunnelView>> {
+    let _reading = state.traffic.reading().await;
     let row = find_tunnel(&state, &caller, &id).await?;
     Ok(Json(tunnel_view(&state, &row)))
 }
@@ -943,6 +966,7 @@ async fn patch_tunnel(
         // switch into public is refused, so a public tunnel stays editable.
         owner_policy: caller.owner_id().map(|o| (o.to_string(), policy(&state.config.limits))),
     };
+    let _reading = state.traffic.reading().await;
     let updated = state.db.update_tunnel(id.clone(), patch).await.map_err(|e| {
         if e.is::<PasswordRequired>() {
             ApiError::validation(e.to_string())
@@ -1807,6 +1831,7 @@ async fn active_tunnel(state: &AppState, caller: &Caller, id: &str) -> ApiResult
 
 pub(crate) fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
     let live = state.registry.get(&row.id);
+    let unflushed = crate::traffic::unflushed(state, &row.id);
     let ports = live
         .as_ref()
         .map(|l| {
@@ -1832,6 +1857,9 @@ pub(crate) fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
         created_at: row.created_at,
         expires_at: row.expires_at,
         last_seen_at: row.last_seen_at,
+        bytes_in: row.bytes_in.max(0) as u64 + unflushed.0,
+        bytes_out: row.bytes_out.max(0) as u64 + unflushed.1,
+        traffic_limited: row.user_id.as_deref().is_some_and(|u| state.traffic.user_blocked(u)),
     }
 }
 

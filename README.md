@@ -297,6 +297,24 @@ owner would make one) and `user delete <name>` removes an account other than
 the owner, with its sessions and machines. There is no open sign-up, no email
 and no SSO.
 
+**Traffic.** The server counts what each tunnel relays (request and response
+bodies and WebSocket messages, both directions; headers are not counted) per
+tunnel and, for tunnels of a user's machines, per user and calendar month
+(UTC). Counters live in memory and are written to the database about once a
+minute (nothing is written while idle; a restart may lose the last minute,
+in the user's favour). Admins can give a member a monthly cap (the owner can
+also cap admins; nobody caps the owner) in the Users page, and new members
+get `limits.member_monthly_traffic_gb` if it is set (default: no cap). Once a
+user reaches their cap, their tunnels answer **503 "Traffic limit reached"**
+(no caching) and what they were relaying is cut at once (downloads, uploads,
+WebSockets); their machines can still sign in and create tunnels, and the
+API's tunnel views and `GET /v1/server` say `traffic_limited`. Raising or
+removing the cap, "Reset month" (audited) or the next month lifts it. Members
+see their month on the Account page; tunnel lists show each tunnel's traffic.
+Service and admin-token tunnels are counted per tunnel and never capped. On a
+public tunnel anyone with the URL spends its owner's traffic. Monthly figures
+are kept for a year.
+
 **Machines.** `tunnel login https://<ui_host>` on a machine prints a code and
 opens the approval page (RFC 8628 device flow); the user signs in, types the
 code (it never appears in a link, so nobody can send you a link that approves

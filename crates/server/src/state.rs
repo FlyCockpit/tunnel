@@ -91,6 +91,7 @@ pub struct AppState {
     pub registry: Registry,
     pub certs: Arc<CertStore>,
     pub metrics: Metrics,
+    pub traffic: crate::traffic::Traffic,
     /// Per-IP limiter for `/__access/*`.
     pub access_limiter: RateLimiter,
     /// Web UI keys and limiters.
@@ -116,6 +117,7 @@ impl AppState {
             registry: Registry::default(),
             certs,
             metrics: Metrics::default(),
+            traffic: crate::traffic::Traffic::default(),
             access_limiter,
             tunnel_cache: Cache::new(TUNNEL_CACHE_TTL),
             session_cache: Cache::new(SESSION_CACHE_TTL),

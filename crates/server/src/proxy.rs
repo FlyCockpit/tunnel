@@ -81,6 +81,7 @@ pub async fn forward(
     peer: SocketAddr,
     session_subject: Option<String>,
     authorization: Option<crate::gate::Authorization>,
+    bytes: Arc<TunnelBytes>,
 ) -> Response<Body> {
     let cfg = &state.config;
     let ws = websocket_kind(&req);
@@ -112,7 +113,6 @@ pub async fn forward(
         inject_subject.is_some(),
     );
 
-    let bytes = state.metrics.tunnel_bytes(&tunnel.id);
     let req_body = if ws.is_some() {
         // Upgrade requests carry no body; for Extended CONNECT the stream
         // itself becomes the tunnel after the response.
@@ -221,14 +221,13 @@ pub async fn forward(
                             return;
                         }
                     };
-                    let mut visitor = Gated { io: TokioIo::new(visitor), exchange: &exchange, side: Side::ToVisitor };
-                    let mut origin = Gated { io: TokioIo::new(origin), exchange: &exchange, side: Side::ToOrigin };
-                    match tokio::io::copy_bidirectional(&mut visitor, &mut origin).await {
-                        Ok((to_origin, to_visitor)) => {
-                            bytes.bytes_in.fetch_add(to_origin, Ordering::Relaxed);
-                            bytes.bytes_out.fetch_add(to_visitor, Ordering::Relaxed);
-                        }
-                        Err(e) => tracing::debug!(tunnel = %splice_tunnel, error = %e, "websocket splice ended"),
+                    let mut visitor =
+                        Gated { io: TokioIo::new(visitor), exchange: &exchange, side: Side::ToVisitor, bytes: &bytes };
+                    let mut origin =
+                        Gated { io: TokioIo::new(origin), exchange: &exchange, side: Side::ToOrigin, bytes: &bytes };
+                    // Bytes were counted as they were written, also when the splice fails or is cut.
+                    if let Err(e) = tokio::io::copy_bidirectional(&mut visitor, &mut origin).await {
+                        tracing::debug!(tunnel = %splice_tunnel, error = %e, "websocket splice ended");
                     }
                 };
                 if guarded(&exchange, splice).await.is_none() {
@@ -323,6 +322,8 @@ struct Gated<'a, T> {
     exchange: &'a Exchange,
     /// The side whose waker this writer registers.
     side: Side,
+    /// Written bytes are counted as they go (toward the visitor: outbound).
+    bytes: &'a TunnelBytes,
 }
 
 impl<T: Unpin> Gated<'_, T> {
@@ -350,7 +351,11 @@ impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Gated<'_, T> {
 impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Gated<'_, T> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         std::task::ready!(self.poll_gate(cx))?;
-        Pin::new(&mut self.io).poll_write(cx, buf)
+        let written = Pin::new(&mut self.io).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &written {
+            self.bytes.count(*n as u64, matches!(self.side, Side::ToVisitor));
+        }
+        written
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -867,8 +872,7 @@ impl HttpBody for Counted {
         if let Poll::Ready(Some(Ok(frame))) = &poll
             && let Some(data) = frame.data_ref()
         {
-            let counter = if this.outbound { &this.bytes.bytes_out } else { &this.bytes.bytes_in };
-            counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+            this.bytes.count(data.len() as u64, this.outbound);
         }
         poll
     }
@@ -1160,12 +1164,15 @@ mod tests {
                 Ok::<_, std::io::Error>(Bytes::from_static(b"x"))
             });
             let mut source = tokio_util::io::StreamReader::new(Box::pin(source));
-            let mut dest = Gated { io: near, exchange: &exchange, side: Side::ToVisitor };
+            let bytes = TunnelBytes::default();
+            let mut dest = Gated { io: near, exchange: &exchange, side: Side::ToVisitor, bytes: &bytes };
             let mut copy = Box::pin(tokio::io::copy(&mut source, &mut dest));
             assert!(futures_util::poll!(copy.as_mut()).is_pending());
             settle(&exchange, keep);
             assert_eq!(copy.await.is_ok(), keep);
             drop(dest);
+            // Counted as written: one byte toward the visitor, or none when cut.
+            assert_eq!(bytes.totals(), (0, u64::from(keep)));
             let mut seen = Vec::new();
             far.read_to_end(&mut seen).await.unwrap();
             assert_eq!(seen, if keep { &b"x"[..] } else { &b""[..] }, "keep={keep}");

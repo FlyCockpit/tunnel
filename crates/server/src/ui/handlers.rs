@@ -59,6 +59,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/ui/api/device/decide", post(device_decide))
         .route("/ui/api/users", get(list_users))
         .route("/ui/api/users/{id}", patch(update_user))
+        .route("/ui/api/users/{id}/traffic/reset", post(reset_user_traffic))
         .route("/ui/api/invites", get(list_invites).post(create_invite))
         .route("/ui/api/invites/{id}", delete(delete_invite))
         .route("/ui/api/services", get(list_services))
@@ -275,12 +276,15 @@ fn server_summary(state: &AppState) -> ServerSummary {
 }
 
 async fn session(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Json<Value>> {
-    let owner_exists = state.db.owner_exists().await?;
+    // An owner someone can sign in as: one created for machines before anyone
+    // signed up has no password yet, and the sign-in page should say how to claim it.
+    let owner_exists = state.db.owner_exists().await? && !state.db.owner_without_password().await?;
     let server = server_summary(&state);
     Ok(Json(match &ctx.session {
         Some((id, s)) if !s.pending => json!({
             "user": s.user, "pending": false, "csrf": keys(&state)?.csrf_token(id),
             "owner_exists": owner_exists, "server": server,
+            "traffic": crate::traffic::view(&state, &s.user.id).await?,
         }),
         Some((_, s)) => {
             json!({ "user": null, "pending": true, "pending_user": s.user.username, "csrf": null, "owner_exists": owner_exists, "server": server })
@@ -462,6 +466,7 @@ async fn invite_accept(
             can_public: false,
             max_tunnels: if member { limits.member_max_tunnels } else { 1000 },
             max_clients: if member { limits.member_max_clients } else { 100 },
+            traffic_cap: if member { member_traffic_cap(limits) } else { None },
         })
     };
     let (user_id, epoch, tunnels) = match state.db.accept_invite(hash, acceptance).await? {
@@ -797,6 +802,8 @@ struct UiTunnel {
 }
 
 async fn list_tunnels(State(state): State<Arc<AppState>>, s: Signed, q: Query<AllQuery>) -> ApiResult<Json<Value>> {
+    // Stored bytes and unflushed ones from the same side of any flush.
+    let _reading = state.traffic.reading().await;
     let rows = state.db.list_user_tunnels(scope(&s, &q)?).await?;
     let tunnels: Vec<UiTunnel> = rows
         .into_iter()
@@ -938,7 +945,11 @@ async fn device_decide(
 // -------------------------------------------------------------------- admin
 
 async fn list_users(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({ "users": state.db.list_users().await? })))
+    let mut users = state.db.list_users(state.traffic.month()).await?;
+    for u in &mut users {
+        u.traffic_bytes = crate::traffic::used_or(&state, &u.user.id, u.traffic_bytes);
+    }
+    Ok(Json(json!({ "users": users, "month": crate::traffic::month_label(state.traffic.month()) })))
 }
 
 #[derive(Deserialize)]
@@ -952,8 +963,21 @@ struct UserUpdate {
     max_tunnels: Option<u32>,
     #[serde(default)]
     max_clients: Option<u32>,
+    /// Monthly traffic cap in bytes; `null` removes it.
+    #[serde(default, deserialize_with = "some_or_null")]
+    traffic_cap: Option<Option<u64>>,
     #[serde(default)]
     disabled: Option<bool>,
+}
+
+/// Tells a JSON `null` (`Some(None)`) from a missing field (`None`).
+fn some_or_null<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// The cap new members get, in bytes.
+fn member_traffic_cap(limits: &crate::config::Limits) -> Option<u64> {
+    limits.member_monthly_traffic_gb.map(|gb| gb * 1_000_000_000)
 }
 
 async fn update_user(
@@ -979,22 +1003,56 @@ async fn update_user(
     if req.max_tunnels.is_some_and(|n| n > 10_000) || req.max_clients.is_some_and(|n| n > 1000) {
         return Err(ApiError::validation("max_tunnels must be 0..=10000 and max_clients 0..=1000"));
     }
+    if let Some(Some(cap)) = req.traffic_cap
+        && !(crate::traffic::MIN_CAP..=crate::traffic::MAX_CAP).contains(&cap)
+    {
+        return Err(ApiError::validation("traffic_cap must be at least 1000000 bytes (1 MB), or null for no cap"));
+    }
     let patch = UserPatch {
         role: req.role,
         can_public: req.can_public,
         max_tunnels: req.max_tunnels,
         max_clients: req.max_clients,
+        traffic_cap: req.traffic_cap,
     };
     let limits = &state.config.limits;
-    let member =
-        super::store::MemberDefaults { max_tunnels: limits.member_max_tunnels, max_clients: limits.member_max_clients };
+    let member = super::store::MemberDefaults {
+        max_tunnels: limits.member_max_tunnels,
+        max_clients: limits.member_max_clients,
+        traffic_cap: member_traffic_cap(limits),
+    };
     // The checks above give clear errors; this transaction is the authority
     // (the session may have ended, or roles changed, since they ran).
-    let (user, tunnels) = match state
-        .db
-        .admin_update_user(actor.id.clone(), s.session.id_hash.clone(), id.clone(), patch, req.disabled, member)
-        .await?
-    {
+    // The new cap takes effect in memory in the same task as the commit, so
+    // a cancelled request cannot leave the old one enforced.
+    // The traffic lock is held from the commit until the cap is applied, so
+    // two changes apply in commit order; the cap's audit entry is written in
+    // the same task.
+    let cap_changed = req.traffic_cap.is_some() || req.role.is_some();
+    let cap_audit = req.traffic_cap.map(|cap| {
+        let cap = cap.map_or_else(|| "none".to_string(), |b| format!("{b} bytes"));
+        format!("{} {cap}", target.username)
+    });
+    let task = {
+        let (state, actor, session, id, disabled, ip) =
+            (state.clone(), actor.id.clone(), s.session.id_hash.clone(), id.clone(), req.disabled, s.ctx.ip_string());
+        tokio::spawn(async move {
+            let changes = state.traffic.changes().await;
+            let updated = state.db.admin_update_user(actor.clone(), session, id, patch, disabled, member).await?;
+            if let Ok((user, _)) = &updated {
+                if cap_changed {
+                    crate::traffic::set_cap(&state, &changes, &user.id, user.traffic_cap).await?;
+                }
+                if let Some(target) = cap_audit
+                    && let Err(e) = state.db.audit(Some(actor), "traffic_cap_set", Some(target), ip).await
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "audit write failed");
+                }
+            }
+            anyhow::Ok(updated)
+        })
+    };
+    let (user, tunnels) = match task.await.map_err(|e| ApiError::internal(e.into()))?? {
         Ok(found) => found,
         Err(super::store::AdminError::NotFound) => return Err(ApiError::not_found("user")),
         Err(super::store::AdminError::Forbidden) => {
@@ -1011,6 +1069,31 @@ async fn update_user(
         audit(&state, Some(&actor.id), action, Some(target.username.clone()), &s.ctx).await;
     }
     Ok(Json(json!({ "user": user })))
+}
+
+/// Start the user's traffic for this month again from zero (audited).
+async fn reset_user_traffic(
+    State(state): State<Arc<AppState>>,
+    AdminSigned(s): AdminSigned,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let actor = s.user().clone();
+    let reset = crate::traffic::reset_month(
+        state.clone(),
+        id.clone(),
+        actor.id.clone(),
+        s.session.id_hash.clone(),
+        s.ctx.ip_string(),
+    )
+    .await?;
+    match reset {
+        Ok(_) => Ok(Json(json!({ "traffic": crate::traffic::view(&state, &id).await? }))),
+        Err(super::store::AdminError::NotFound) => Err(ApiError::not_found("user")),
+        Err(super::store::AdminError::Forbidden) => {
+            Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you may not change this user"))
+        }
+        Err(super::store::AdminError::SignedOut) => Err(changed_meanwhile()),
+    }
 }
 
 async fn list_invites(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiResult<Json<Value>> {
@@ -1123,7 +1206,9 @@ async fn status(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiResul
             "member_max_tunnel_ttl_s": limits.member_max_tunnel_ttl_s,
             "max_tunnel_ttl_s": limits.max_tunnel_ttl_s,
             "allow_public_for_clients": limits.allow_public_for_clients,
+            "member_monthly_traffic_gb": limits.member_monthly_traffic_gb,
         },
+        "traffic_month": crate::traffic::month_label(state.traffic.month()),
         "abuse_contact": cfg.abuse_contact,
     })))
 }

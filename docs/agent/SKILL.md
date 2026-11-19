@@ -35,6 +35,9 @@ tunnel share 3000 5173 --ttl 1h --json  # several ports, shorter lifetime
   minutes. For another person, make another link (one link per person).
 - `"connected": false` means the port is not reachable yet: check that the
   app is running, then `tunnel status --json`.
+- `"traffic_limited": true` means the user's account has used its monthly
+  traffic: visitors will see "Traffic limit reached". Tell the user; only a
+  server admin can raise the limit.
 - Never use `--public` unless the user explicitly asked for a public URL.
   Members' public previews are refused unless an admin allowed them; do not
   look for workarounds.

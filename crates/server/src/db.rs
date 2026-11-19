@@ -31,7 +31,11 @@ CREATE TABLE IF NOT EXISTS tunnels (
     password_hash TEXT,
     -- The owner: the client (`cl…`) or service (`sv…`) that created the
     -- tunnel; NULL for the admin token.
-    client_id    TEXT
+    client_id    TEXT,
+    -- Proxied body and WebSocket bytes (visitor -> app, app -> visitor),
+    -- flushed from memory about once a minute.
+    bytes_in     INTEGER NOT NULL DEFAULT 0,
+    bytes_out    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tunnels_expires_at ON tunnels(expires_at);
 CREATE INDEX IF NOT EXISTS tunnels_client ON tunnels(client_id, expires_at);
@@ -114,6 +118,8 @@ CREATE TABLE IF NOT EXISTS users (
     can_public         INTEGER NOT NULL DEFAULT 0,
     max_tunnels        INTEGER NOT NULL,
     max_clients        INTEGER NOT NULL,
+    -- Monthly traffic cap in bytes (both directions); NULL: none.
+    traffic_cap        INTEGER,
     created_at         INTEGER NOT NULL,
     -- Bumped by every change to how the user signs in (password, TOTP, role,
     -- disabling): a session is issued only if it is unchanged since the check.
@@ -171,6 +177,14 @@ CREATE TABLE IF NOT EXISTS device_logins (
     last_poll_at     INTEGER,
     status           TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
     user_id          TEXT REFERENCES users(id) ON DELETE CASCADE
+);
+-- Traffic per user and calendar month (UTC, `YYYYMM`), from their machines' tunnels.
+CREATE TABLE IF NOT EXISTS traffic (
+    user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    month     INTEGER NOT NULL,
+    bytes_in  INTEGER NOT NULL DEFAULT 0,
+    bytes_out INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, month)
 );
 CREATE TABLE IF NOT EXISTS audit (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,6 +295,11 @@ pub struct TunnelRow {
     /// Owner: the creating client's or service's id; `None` for tunnels
     /// created with the admin token.
     pub client_id: Option<String>,
+    /// The user whose machine created it (`None` for services and the admin token).
+    pub user_id: Option<String>,
+    /// Flushed traffic (see `traffic`); add the unflushed part for a current figure.
+    pub bytes_in: i64,
+    pub bytes_out: i64,
 }
 
 impl TunnelRow {
@@ -453,6 +472,9 @@ pub enum Redemption {
 
 /// A tunnel id's lifecycle state, resolved in one database call.
 #[derive(Debug, Clone)]
+// Held in an `Arc` by the tunnel cache, so the live row's size costs one
+// allocation either way.
+#[allow(clippy::large_enum_variant)]
 pub enum TunnelLookup {
     Live(TunnelRow),
     Tombstoned,
@@ -519,6 +541,19 @@ impl Db {
         anyhow::ensure!(
             !clients_table || has_owner,
             "database predates user accounts (`clients.user_id` is missing); see the CHANGELOG entry for the one-time upgrade"
+        );
+        let lacks = |table: &str, column: &str| -> rusqlite::Result<bool> {
+            tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)
+                    AND NOT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |r| r.get(0),
+            )
+        };
+        anyhow::ensure!(
+            !lacks("tunnels", "bytes_in")? && !lacks("tunnels", "bytes_out")? && !lacks("users", "traffic_cap")?,
+            "database predates traffic counters (`tunnels.bytes_in`, `tunnels.bytes_out` or `users.traffic_cap` \
+             is missing); see the CHANGELOG entry for the one-time upgrade"
         );
         tx.execute_batch(SCHEMA)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -637,6 +672,12 @@ impl Db {
                 }
                 return Ok(None);
             }
+            let user_id: Option<String> = match &t.client_id {
+                Some(owner) => tx
+                    .query_row("SELECT user_id FROM clients WHERE id = ?1", params![owner], |r| r.get(0))
+                    .optional()?,
+                None => None,
+            };
             tx.commit()?;
             Ok(Some(TunnelRow {
                 id: t.id,
@@ -650,6 +691,9 @@ impl Db {
                 last_seen_at: None,
                 access: t.access,
                 client_id: t.client_id,
+                user_id,
+                bytes_in: 0,
+                bytes_out: 0,
             }))
         })
         .await
@@ -1375,7 +1419,9 @@ impl Db {
     }
 }
 
-pub(crate) const TUNNEL_SELECT: &str = "SELECT id, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at, last_seen_at, access_mode, password_user, password_hash, client_id FROM tunnels";
+pub(crate) const TUNNEL_SELECT: &str = "SELECT id, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at, last_seen_at, access_mode, password_user, password_hash, client_id, bytes_in, bytes_out, (SELECT user_id FROM clients WHERE clients.id = tunnels.client_id) FROM tunnels";
+/// Columns `tunnel_from_row` reads (others may follow).
+pub(crate) const TUNNEL_COLUMNS: usize = 16;
 
 /// Fresh session for a new grant on `tunnel_id`, carrying the unexpired grants
 /// (and their provenance) of every live presented session. Returns the
@@ -1541,6 +1587,9 @@ pub(crate) fn tunnel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelR
             password_hash: r.get(11)?,
         },
         client_id: r.get(12)?,
+        bytes_in: r.get(13)?,
+        bytes_out: r.get(14)?,
+        user_id: r.get(15)?,
     })
 }
 
@@ -2265,6 +2314,30 @@ mod tests {
         assert!(Db::open(&path).err().unwrap().to_string().contains("newer schema"));
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn refuses_a_database_from_before_traffic_counters_until_upgraded() {
+        for (table, column) in [("tunnels", "bytes_in"), ("tunnels", "bytes_out"), ("users", "traffic_cap")] {
+            let (db, path) = temp_db();
+            drop(db);
+            {
+                let c = Connection::open(&path).unwrap();
+                c.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}")).unwrap();
+            }
+            let err = Db::open(&path).err().unwrap().to_string();
+            assert!(err.contains("predates traffic counters"), "{table}.{column}: {err}");
+            // The one-time upgrade from the CHANGELOG makes it usable again.
+            {
+                let c = Connection::open(&path).unwrap();
+                let ty = if column == "traffic_cap" { "INTEGER" } else { "INTEGER NOT NULL DEFAULT 0" };
+                c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}")).unwrap();
+            }
+            assert!(Db::open(&path).is_ok(), "{table}.{column}");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
         }
     }
 }

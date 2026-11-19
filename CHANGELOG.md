@@ -60,6 +60,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   or on a signal); `tunnel links` and `tunnel unlink <ID>`; `link --label`.
 - `tunnel-server user invite [--role member|admin] [--hours N]` and
   `user delete <name>` for managing accounts from the server's shell.
+- Traffic counters per tunnel and per user and month (request/response bodies
+  and WebSocket messages, kept in memory and flushed about once a minute),
+  shown in the web UI and the API (`bytes_in`/`bytes_out`, `traffic_limited`,
+  `GET /v1/server` `limits.traffic`), and optional monthly per-user caps set
+  by admins (`limits.member_monthly_traffic_gb` for new members): at the cap
+  the user's tunnels answer 503 "Traffic limit reached" and in-flight requests
+  and WebSockets are cut, until the cap is raised, the month is reset or a new
+  month starts. A database from an earlier prerelease build is refused until
+  upgraded once, with the service stopped:
+  `ALTER TABLE tunnels ADD COLUMN bytes_in INTEGER NOT NULL DEFAULT 0;`
+  `ALTER TABLE tunnels ADD COLUMN bytes_out INTEGER NOT NULL DEFAULT 0;`
+  `ALTER TABLE users ADD COLUMN traffic_cap INTEGER;` (the `traffic` table is
+  created on start). WebSocket traffic is now counted while it flows (it was
+  counted only when a WebSocket closed cleanly).
+- The sign-in page explains how to claim an owner account that has no
+  password yet; loading the Users page no longer disables the invite button.
 - Renaming machines: in the web UI (own machines; admins also members', the
   owner anyone's; audited), `tunnel-server client rename`, and
   `PATCH /v1/clients/{name}` for the admin token. New machine and service names

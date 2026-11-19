@@ -284,6 +284,9 @@ pub struct Created {
     pub id: String,
     pub expires_at: i64,
     pub tunnel_token: String,
+    /// The account reached its monthly traffic cap.
+    #[serde(default)]
+    pub traffic_limited: bool,
 }
 
 #[derive(Deserialize)]
@@ -291,6 +294,8 @@ pub struct TunnelInfo {
     pub expired: bool,
     pub expires_at: i64,
     pub access: AccessInfo,
+    #[serde(default)]
+    pub traffic_limited: bool,
 }
 
 #[derive(Deserialize)]

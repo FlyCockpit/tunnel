@@ -139,6 +139,16 @@ pub fn server_busy() -> Response<Body> {
     )
 }
 
+/// The owner's account reached its monthly traffic cap (see `traffic`).
+pub fn traffic_limit() -> Response<Body> {
+    page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Traffic limit reached",
+        "The account sharing this preview has used its traffic for this month. It works again next month, or once the server's admin raises the limit.",
+        None,
+    )
+}
+
 pub fn ended() -> Response<Body> {
     page(StatusCode::GONE, "Preview ended", "This preview has been stopped or has expired.", None)
 }

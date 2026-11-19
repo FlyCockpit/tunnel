@@ -30,6 +30,7 @@ mod sni;
 mod state;
 mod tls;
 mod tokens;
+mod traffic;
 mod turn_relay;
 mod ui;
 mod util;
