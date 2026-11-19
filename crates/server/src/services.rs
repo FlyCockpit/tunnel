@@ -7,7 +7,7 @@
 
 use tunnel_protocol::SERVICE_TOKEN_PREFIX;
 
-use crate::clients::validate_name;
+use crate::clients::validate_new_name;
 use crate::db::{Db, ServiceRow};
 use crate::tokens;
 
@@ -47,7 +47,7 @@ pub fn new_token() -> String {
 }
 
 pub fn validate_new(name: &str, max_tunnels: u32) -> Result<(), Error> {
-    validate_name(name).map_err(Error::Invalid)?;
+    validate_new_name(name).map_err(Error::Invalid)?;
     validate_quota(max_tunnels)
 }
 

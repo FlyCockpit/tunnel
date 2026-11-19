@@ -60,6 +60,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   or on a signal); `tunnel links` and `tunnel unlink <ID>`; `link --label`.
 - `tunnel-server user invite [--role member|admin] [--hours N]` and
   `user delete <name>` for managing accounts from the server's shell.
+- Renaming machines: in the web UI (own machines; admins also members', the
+  owner anyone's; audited), `tunnel-server client rename`, and
+  `PATCH /v1/clients/{name}` for the admin token. New machine and service names
+  made only of dots, or `enroll`, are refused (they collide with URL paths).
 - GitHub Release binaries for Linux and macOS: static Linux servers and client
   archives (`tunnel-<target>.tar.xz`), `sha256.sum` checked fail closed by both
   installers, signed build provenance (GitHub artifact attestations, keyless),

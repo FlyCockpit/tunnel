@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tunnel_protocol::CloseReason;
 
-use super::store::{AcceptError, Acceptance, DecideError, InviteKind, NewUser, Role, User, UserPatch};
+use super::store::{AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, Role, User, UserPatch};
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
 use crate::api::{self, ApiError, ApiJson, ApiResult, CreateAccessLinkRequest};
 use crate::clients;
@@ -50,7 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/ui/api/account/sessions", get(list_sessions))
         .route("/ui/api/account/sessions/revoke", post(revoke_session))
         .route("/ui/api/machines", get(list_machines).post(add_machine))
-        .route("/ui/api/machines/{name}", delete(delete_machine))
+        .route("/ui/api/machines/{name}", delete(delete_machine).patch(rename_machine))
         .route("/ui/api/tunnels", get(list_tunnels))
         .route("/ui/api/tunnels/{id}", delete(delete_tunnel))
         .route("/ui/api/tunnels/{id}/links", get(list_links).post(create_link))
@@ -750,6 +750,39 @@ async fn delete_machine(
     }
     audit(&state, Some(&s.user().id), "machine_deleted", Some(name), &s.ctx).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameMachine {
+    name: String,
+}
+
+/// Rename a machine: one's own, admins also members', the owner anyone's.
+async fn rename_machine(
+    State(state): State<Arc<AppState>>,
+    s: Signed,
+    Path(name): Path<String>,
+    ApiJson(req): ApiJson<RenameMachine>,
+) -> ApiResult<Json<Value>> {
+    clients::validate_new_name(&req.name).map_err(ApiError::validation)?;
+    let actor = Some((s.user().id.clone(), s.session.id_hash.clone()));
+    match state.db.rename_client(name.clone(), req.name.clone(), actor).await? {
+        Ok(()) => {}
+        Err(RenameError::NotFound) => return Err(ApiError::not_found("machine")),
+        Err(RenameError::Taken) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "client_exists",
+                "a machine with this name exists; pick another",
+            ));
+        }
+        Err(RenameError::SignedOut) => return Err(changed_meanwhile()),
+    }
+    if name != req.name {
+        audit(&state, Some(&s.user().id), "machine_renamed", Some(format!("{name} -> {}", req.name)), &s.ctx).await;
+    }
+    Ok(Json(json!({ "name": req.name })))
 }
 
 // ------------------------------------------------------------------ tunnels

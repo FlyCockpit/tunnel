@@ -569,6 +569,30 @@ pub async fn client_delete(config_path: &Path, name: &str) -> anyhow::Result<()>
     }
 }
 
+pub async fn client_rename(config_path: &Path, name: &str, new_name: &str) -> anyhow::Result<()> {
+    crate::clients::validate_new_name(new_name).map_err(anyhow::Error::msg)?;
+    ensure_can_write(config_path, "client rename")?;
+    let cfg = Config::load(config_path)?;
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    let result = db.rename_client(name.to_string(), new_name.to_string(), None).await;
+    if let Ok(Ok(())) = &result
+        && name != new_name
+    {
+        let _ = db.audit(None, "machine_renamed", Some(format!("{name} -> {new_name} (server shell)")), None).await;
+    }
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    match result? {
+        Ok(()) => {
+            println!("Renamed {name} to {new_name}; its login and tunnels are unchanged.");
+            Ok(())
+        }
+        Err(crate::ui::store::RenameError::Taken) => anyhow::bail!("a client named {new_name} exists"),
+        Err(_) => anyhow::bail!("no client named {name}"),
+    }
+}
+
 /// Write a new service token to a new file (0600, never overwritten), synced
 /// before the token's hash is committed.
 fn write_token_file(path: &Path, token: &str) -> anyhow::Result<()> {

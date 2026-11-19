@@ -175,6 +175,8 @@ enum ClientCmd {
     List,
     /// Remove a machine: its token stops working and its tunnels close.
     Delete { name: String },
+    /// Rename a machine; its login, token and tunnels stay as they are.
+    Rename { name: String, new_name: String },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +243,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Client { cmd: ClientCmd::List } => commands::client_list(&config).await,
         Cmd::Client { cmd: ClientCmd::Delete { name } } => commands::client_delete(&config, &name).await,
+        Cmd::Client { cmd: ClientCmd::Rename { name, new_name } } => {
+            commands::client_rename(&config, &name, &new_name).await
+        }
         Cmd::Service { cmd: ServiceCmd::Add { name, max_tunnels, token_file } } => {
             commands::service_add(&config, &name, max_tunnels, token_file.as_deref()).await
         }

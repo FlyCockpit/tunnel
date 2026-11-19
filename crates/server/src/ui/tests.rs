@@ -1305,3 +1305,83 @@ async fn deleting_a_user_from_the_shell_ends_everything_and_frees_the_name() {
     let me = again.call(&state, "GET", "/ui/api/session", None).await;
     assert_eq!(me.body["user"]["role"], "admin", "{}", me.body);
 }
+
+#[tokio::test]
+async fn machines_are_renamed_by_whoever_may_manage_them() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let mut bob = member(&state, &mut owner, "bob", 3).await;
+    let r = owner.call(&state, "POST", "/ui/api/invites", Some(json!({ "role": "admin" }))).await;
+    let token = r.body["url"].as_str().unwrap().split_once('#').unwrap().1.to_string();
+    let mut adam = sign_up(&state, &token, "adam", 4).await;
+    let ann_token = approve_machine(&state, &mut ann, "laptop").await;
+    let _ = approve_machine(&state, &mut bob, "desktop").await;
+    let _ = approve_machine(&state, &mut owner, "server").await;
+    let _ = approve_machine(&state, &mut adam, "adams-box").await;
+    let t = create_tunnel(&state, &ann_token, json!({ "mode": "link" })).await;
+    assert_eq!(t.status, StatusCode::CREATED, "{}", t.body);
+    let rename = |from: &str, to: &str| (format!("/ui/api/machines/{from}"), Some(json!({ "name": to })));
+
+    // A member renames their own machine; its token and tunnel keep working.
+    let (p, b) = rename("laptop", "ann-laptop");
+    let r = ann.call(&state, "PATCH", &p, b).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["name"], "ann-laptop");
+    let list = bearer(&state, "GET", "/v1/tunnels", &ann_token, None).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(list.body["tunnels"].as_array().unwrap().len(), 1);
+    let mine = ann.call(&state, "GET", "/ui/api/machines", None).await;
+    assert_eq!(mine.body["machines"][0]["name"], "ann-laptop", "{}", mine.body);
+
+    // Not someone else's, and not a taken or invalid name.
+    for (who, from) in [("ann", "desktop"), ("ann", "server"), ("adam", "server"), ("adam", "laptop")] {
+        let (p, b) = rename(from, "x-new");
+        let browser = if who == "ann" { &mut ann } else { &mut adam };
+        assert_eq!(browser.call(&state, "PATCH", &p, b).await.status, StatusCode::NOT_FOUND, "{who} {from}");
+    }
+    let (p, b) = rename("ann-laptop", "desktop");
+    assert_eq!(ann.call(&state, "PATCH", &p, b).await.status, StatusCode::CONFLICT);
+    for bad in ["", "..", ".", "enroll", "a b", "a/b", &"x".repeat(65)] {
+        let (p, b) = rename("ann-laptop", bad);
+        assert_eq!(ann.call(&state, "PATCH", &p, b).await.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad:?}");
+    }
+    // Admins rename members' machines; the owner anyone's.
+    let (p, b) = rename("desktop", "bobs-desktop");
+    assert_eq!(adam.call(&state, "PATCH", &p, b).await.status, StatusCode::OK);
+    let (p, b) = rename("adams-box", "admin-box");
+    assert_eq!(owner.call(&state, "PATCH", &p, b).await.status, StatusCode::OK);
+    // Renaming to the same name is a no-op, not a conflict.
+    let (p, b) = rename("admin-box", "admin-box");
+    assert_eq!(owner.call(&state, "PATCH", &p, b).await.status, StatusCode::OK);
+    // A stale session cannot rename.
+    owner.call(&state, "POST", "/ui/api/logout", None).await;
+    let (p, b) = rename("server", "srv");
+    assert_ne!(owner.call(&state, "PATCH", &p, b).await.status, StatusCode::OK);
+
+    let mut owner2 = Browser::new(1);
+    let r = owner2
+        .call(&state, "POST", "/ui/api/login", Some(json!({ "username": "olivia", "password": "olivia-password" })))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let log = owner2.call(&state, "GET", "/ui/api/audit", None).await;
+    let renamed: Vec<&str> = log.body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "machine_renamed")
+        .map(|e| e["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(renamed.len(), 3, "{renamed:?}");
+    assert!(renamed.contains(&"laptop -> ann-laptop") && renamed.contains(&"desktop -> bobs-desktop"));
+
+    // The admin token renames any machine through /v1 (and the server shell does the same).
+    let r = bearer(&state, "PATCH", "/v1/clients/server", ADMIN_CREDENTIAL, Some(json!({ "name": "srv" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let r = bearer(&state, "PATCH", "/v1/clients/nope", ADMIN_CREDENTIAL, Some(json!({ "name": "srv2" }))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = bearer(&state, "PATCH", "/v1/clients/srv", ADMIN_CREDENTIAL, Some(json!({ "name": "admin-box" }))).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    let r = bearer(&state, "PATCH", "/v1/clients/srv", &ann_token, Some(json!({ "name": "mine" }))).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "machine tokens cannot manage clients");
+}

@@ -174,6 +174,16 @@ pub enum Acceptance {
     },
 }
 
+/// Why a machine rename was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenameError {
+    /// No such machine, or not one the actor may manage.
+    NotFound,
+    Taken,
+    /// The UI session ended or the actor was disabled meanwhile.
+    SignedOut,
+}
+
 /// Why `user delete` refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DeleteUserError {
@@ -1310,6 +1320,63 @@ impl Db {
     }
 
     // -------------------------------------------------------- machines, links
+
+    /// Rename machine `old` to `new` (validated by the caller). From the web
+    /// UI, `actor` is `(user id, session id hash)`: the session must still be
+    /// valid and the user may rename their own machines, admins members'
+    /// machines, the owner everyone's (checked here, in the transaction). The
+    /// server shell and the admin token pass `None`.
+    pub async fn rename_client(
+        &self,
+        old: String,
+        new: String,
+        actor: Option<(String, String)>,
+    ) -> anyhow::Result<Result<(), RenameError>> {
+        self.call(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // The session first, so a signed-out caller learns nothing about which names exist.
+            if let Some((actor_id, session)) = &actor
+                && !authorized(&tx, actor_id, None, session)?
+            {
+                return Ok(Err(RenameError::SignedOut));
+            }
+            let found: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT c.id, c.user_id, u.role FROM clients c JOIN users u ON u.id = c.user_id WHERE c.name = ?1",
+                    params![old],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((client_id, owner_id, owner_role)) = found else {
+                return Ok(Err(RenameError::NotFound));
+            };
+            if let Some((actor_id, _)) = &actor {
+                let actor_role =
+                    Role::parse(&tx.query_row("SELECT role FROM users WHERE id = ?1", params![actor_id], |r| {
+                        r.get::<_, String>(0)
+                    })?);
+                let allowed = owner_id == *actor_id
+                    || actor_role == Role::Owner
+                    || (actor_role == Role::Admin && Role::parse(&owner_role) == Role::Member);
+                if !allowed {
+                    return Ok(Err(RenameError::NotFound));
+                }
+            }
+            if old == new {
+                return Ok(Ok(()));
+            }
+            let renamed = tx.execute(
+                "UPDATE clients SET name = ?2 WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM clients WHERE name = ?2)",
+                params![client_id, new],
+            )?;
+            if renamed == 0 {
+                return Ok(Err(RenameError::Taken));
+            }
+            tx.commit()?;
+            Ok(Ok(()))
+        })
+        .await
+    }
 
     /// Machines of `user_id`, or of everyone when `None`.
     pub async fn list_machines(&self, user_id: Option<String>) -> anyhow::Result<Vec<Machine>> {

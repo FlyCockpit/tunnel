@@ -16,7 +16,7 @@ use tunnel_protocol::CLIENT_TOKEN_PREFIX;
 use utoipa::ToSchema;
 
 use crate::api::{ApiError, ApiJson, ApiResult, ErrorBody, PeerAddr};
-use crate::clients::validate_name;
+use crate::clients::validate_new_name;
 use crate::db::NewClientError;
 use crate::state::AppState;
 use crate::tokens::{self, now};
@@ -130,7 +130,7 @@ pub async fn device_code(
             "too many login requests; wait a minute",
         ));
     }
-    validate_name(&req.client_name).map_err(ApiError::validation)?;
+    validate_new_name(&req.client_name).map_err(ApiError::validation)?;
     for _ in 0..8 {
         let device_code = tokens::random_token(DEVICE_CODE_PREFIX);
         let user_code = random_user_code();

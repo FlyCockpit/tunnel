@@ -304,7 +304,12 @@ their machine), checks the machine's name and address, and approves. The new
 client belongs to them. Users with two-factor sign-in confirm with a code when
 their last check is older than ten minutes. Machines without a browser still
 use one-time login codes (`tunnel-server client add <name> [--user <name>]`,
-or "Add a headless machine" in the UI).
+or "Add a headless machine" in the UI). Machines can be renamed in the UI (your
+own; admins also members', the owner anyone's), with
+`tunnel-server client rename <name> <new-name>`, or `PATCH /v1/clients/{name}`
+with the admin token; the login, token and tunnels stay as they are, and the
+UI's audit log records the change. New names (machines and services) are 1–64
+letters, digits, `.`, `_` or `-`; not only dots, and not `enroll`.
 
 **Services** (`tnsvc_`, below) are not accounts: platforms such as a sandbox
 service keep their own quota, and member limits never apply to them.
@@ -335,7 +340,7 @@ TURN connections are closed if they do not authenticate promptly.
 
 Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
 `cert renew [--force]`, `admin link`, `user list | invite [--role member|admin] [--hours N] | delete <name>`,
-`client add <name> [--user <name>] | list | delete <name>`, and
+`client add <name> [--user <name>] | list | rename <name> <new-name> | delete <name>`, and
 `service add <name> --max-tunnels <n> | list | set <name> --max-tunnels <n> | rotate <name> | delete <name>`
 (root only for a root install).
 

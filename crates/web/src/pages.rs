@@ -511,13 +511,27 @@ fn Machines(admin: bool) -> impl IntoView {
             Ok(())
         });
     };
+    // The machine being renamed, and the name typed so far.
+    let editing = RwSignal::new(None::<String>);
+    let new_name = RwSignal::new(String::new());
+    let save_name = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let Some(old) = editing.get_untracked() else { return };
+        let body = json!({ "name": new_name.get_untracked().trim() });
+        run(error, busy, async move {
+            api::patch::<Value>(&format!("/ui/api/machines/{old}"), &body).await?;
+            editing.set(None);
+            load();
+            Ok(())
+        });
+    };
     let login_cmd = format!("tunnel login {ui_origin}");
     view! {
         <div class="page">
             <div class="page-head">
                 <div>
                     <h1>"Machines"</h1>
-                    <p class="muted">"Computers signed in with the tunnel CLI. Removing one stops its login and closes its tunnels."</p>
+                    <p class="muted">"Computers signed in with the tunnel CLI. Renaming one keeps its login and tunnels; removing one stops its login and closes its tunnels."</p>
                 </div>
                 {admin.then(|| view! {
                     <label class="check">
@@ -567,13 +581,32 @@ fn Machines(admin: bool) -> impl IntoView {
                         <tbody>
                         {list.into_iter().map(|m| {
                             let n = m.name.clone();
+                            let (n_edit, n_row) = (m.name.clone(), m.name.clone());
+                            let is_editing = move || editing.get().as_deref() == Some(n_row.as_str());
+                            let shown_name = m.name.clone();
                             view! { <tr>
-                                <td>{m.name.clone()}</td>
+                                <td>{move || if is_editing() {
+                                    view! {
+                                        <form class="row" on:submit=save_name>
+                                            <label class="sr-only" for="rename-machine">"New name"</label>
+                                            <input id="rename-machine" class="input input-sm" required maxlength="64"
+                                                pattern="[A-Za-z0-9._\\-]+" title="letters, digits, '.', '_', '-'"
+                                                prop:value=move || new_name.get() on:input=move |ev| new_name.set(value(&ev)) />
+                                            <button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save"</button>
+                                            <button class="btn btn-ghost btn-sm" type="button" on:click=move |_| editing.set(None)>"Cancel"</button>
+                                        </form>
+                                    }.into_any()
+                                } else {
+                                    view! { <span>{shown_name.clone()}</span> }.into_any()
+                                }}</td>
                                 <td>{m.user.clone()}</td>
                                 <td>{if m.enrolled { view!{ <span class="badge badge-success">"signed in"</span> }.into_any() } else { view!{ <span class="badge badge-warning">"code not used"</span> }.into_any() }}</td>
                                 <td>{m.last_used_at.map(relative).unwrap_or_else(|| "never".into())}</td>
                                 <td>{m.tunnels}</td>
-                                <td class="actions"><button class="btn btn-destructive btn-sm" on:click=move |_| remove(n.clone())>"Remove"</button></td>
+                                <td class="actions">
+                                    <button class="btn btn-outline btn-sm" on:click=move |_| { new_name.set(n_edit.clone()); editing.set(Some(n_edit.clone())); }>"Rename"</button>
+                                    <button class="btn btn-destructive btn-sm" on:click=move |_| remove(n.clone())>"Remove"</button>
+                                </td>
                             </tr> }
                         }).collect_view()}
                         </tbody>

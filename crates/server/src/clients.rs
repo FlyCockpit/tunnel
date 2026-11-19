@@ -36,11 +36,27 @@ impl From<anyhow::Error> for AddError {
     }
 }
 
+/// The characters a machine or service name may have (also how list cursors,
+/// which are names, are checked: names stored before the rules below stay listable).
 pub fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     if ok { Ok(()) } else { Err(format!("name must be 1..={MAX_NAME_LEN} characters: letters, digits, '.', '_', '-'")) }
+}
+
+/// A name for a new or renamed machine or service: `validate_name`, and
+/// usable in `/v1/clients/{name}`-style URLs: not only dots (`.`/`..` are path
+/// segments) and not `enroll` (`/v1/clients/enroll` is the enrollment route).
+pub fn validate_new_name(name: &str) -> Result<(), String> {
+    validate_name(name)?;
+    if name.bytes().all(|b| b == b'.') {
+        return Err("name must not be only dots".into());
+    }
+    if name.eq_ignore_ascii_case("enroll") {
+        return Err("`enroll` is reserved; pick another name".into());
+    }
+    Ok(())
 }
 
 /// Create client `name` owned by `user_id`, and its one-time login command.
@@ -53,7 +69,7 @@ pub async fn add(
     user_id: &str,
     session: Option<String>,
 ) -> Result<Enrollment, AddError> {
-    validate_name(name).map_err(AddError::Invalid)?;
+    validate_new_name(name).map_err(AddError::Invalid)?;
     let code = tokens::random_token(ENROLL_CODE_PREFIX);
     let expires_at = now() + ENROLL_TTL_S;
     let id = format!("cl{}", tokens::random_tunnel_id());
@@ -82,6 +98,12 @@ mod tests {
     fn names() {
         assert!(super::validate_name("laptop").is_ok());
         assert!(super::validate_name("ci.runner-2_a").is_ok());
+        // Stored names stay valid cursors; new names must also work in URLs.
+        for name in ["..", ".", "enroll"] {
+            assert!(super::validate_name(name).is_ok(), "{name}");
+            assert!(super::validate_new_name(name).is_err(), "{name}");
+        }
+        assert!(super::validate_new_name("enroll-2").is_ok());
         for bad in ["", "has space", "slash/x", "ünï", &"x".repeat(65)] {
             assert!(super::validate_name(bad).is_err(), "{bad}");
         }

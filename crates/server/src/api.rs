@@ -87,7 +87,7 @@ fn build_router() -> Router<Arc<AppState>> {
         .route("/v1/device/code", post(crate::device::device_code))
         .route("/v1/device/token", post(crate::device::device_token))
         .route("/v1/server", get(server_info))
-        .route("/v1/clients/{name}", axum::routing::delete(delete_client))
+        .route("/v1/clients/{name}", axum::routing::delete(delete_client).patch(rename_client))
         .route("/v1/services", post(create_service).get(list_services))
         .route("/v1/services/{name}", axum::routing::patch(patch_service).delete(delete_service))
         .route("/v1/services/{name}/token", post(rotate_service_token))
@@ -530,6 +530,7 @@ pub struct TurnCredentialsResponse {
         create_client,
         list_clients,
         delete_client,
+        rename_client,
         enroll_client,
         create_service,
         list_services,
@@ -550,6 +551,7 @@ pub struct TurnCredentialsResponse {
         AccessView,
         AccessMode,
         CreateClientRequest,
+        RenameClientRequest,
         CreateClientResponse,
         ClientView,
         ClientList,
@@ -1435,6 +1437,48 @@ async fn delete_client(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RenameClientRequest {
+    /// The new name: 1..=64 characters: letters, digits, `.`, `_`, `-`.
+    pub name: String,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/clients/{name}",
+    params(("name" = String, Path, description = "Client name")),
+    request_body = RenameClientRequest,
+    responses(
+        (status = 200, body = RenameClientRequest, description = "Renamed; its token and tunnels are unchanged"),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 409, body = ErrorBody),
+        (status = 422, body = ErrorBody),
+    )
+)]
+async fn rename_client(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+    ApiJson(req): ApiJson<RenameClientRequest>,
+) -> ApiResult<Json<RenameClientRequest>> {
+    clients::validate_new_name(&req.name).map_err(ApiError::validation)?;
+    match state.db.rename_client(name.clone(), req.name.clone(), None).await? {
+        Ok(()) => {}
+        Err(crate::ui::store::RenameError::Taken) => {
+            return Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a client with this name exists"));
+        }
+        Err(_) => return Err(ApiError::not_found("client")),
+    }
+    if name != req.name {
+        let _ =
+            state.db.audit(None, "machine_renamed", Some(format!("{name} -> {} (admin token)", req.name)), None).await;
+    }
+    tracing::info!(client = %name, new = %req.name, "client renamed");
+    Ok(Json(req))
+}
+
 /// Unauthenticated: the one-time code is the credential. Shares the
 /// access-link rate limit per IP.
 #[utoipa::path(
@@ -2081,7 +2125,7 @@ mod tests {
             ("/v1/access-links/{id}", vec!["delete"]),
             ("/v1/tunnels/{id}/turn-credentials", vec!["post"]),
             ("/v1/clients", vec!["get", "post"]),
-            ("/v1/clients/{name}", vec!["delete"]),
+            ("/v1/clients/{name}", vec!["patch", "delete"]),
             ("/v1/clients/enroll", vec!["post"]),
             ("/v1/tunnels/{id}/token", vec!["post"]),
             ("/v1/services", vec!["get", "post"]),
@@ -2201,6 +2245,7 @@ mod tests {
             ("GET", "/v1/clients"),
             ("POST", "/v1/clients"),
             ("DELETE", "/v1/clients/one"),
+            ("PATCH", "/v1/clients/one"),
             ("GET", "/v1/services"),
             ("POST", "/v1/services"),
             ("PATCH", "/v1/services/wssp"),
