@@ -469,6 +469,66 @@ pub async fn user_list(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `user invite`: a sign-up link made from the server's shell (as the owner would).
+pub async fn user_invite(config_path: &Path, role: crate::ui::store::Role, hours: u32) -> anyhow::Result<()> {
+    use crate::ui::store::InviteKind;
+    ensure_can_write(config_path, "user invite")?;
+    let cfg = Config::load(config_path)?;
+    let Some(ui) = cfg.ui_host.clone() else {
+        anyhow::bail!("the web UI is off: turn it on with `tunnel-server setup --ui-host <name>`");
+    };
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    let token = crate::tokens::random_token(crate::ui::INVITE_PREFIX);
+    let id = format!("in{}", crate::tokens::random_tunnel_id());
+    let expires_at = crate::tokens::now() + i64::from(hours) * 3600;
+    let result = db
+        .create_invite(id.clone(), crate::tokens::hash_token(&token), InviteKind::Invite, role, None, None, expires_at)
+        .await;
+    if result.is_ok() {
+        let _ = db.audit(None, "invite_created", Some(format!("{id} {} (server shell)", role.as_str())), None).await;
+    }
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    result?;
+    println!(
+        "Send this link to the new {}; it works once, within {hours} hour(s), and is a credential:\n",
+        role.as_str()
+    );
+    println!("  https://{ui}/invite#{token}\n");
+    println!("Withdraw it in the web UI (Users) if it is not needed any more.");
+    Ok(())
+}
+
+/// `user delete`: remove an account other than the owner, with its machines.
+pub async fn user_delete(config_path: &Path, username: &str) -> anyhow::Result<()> {
+    ensure_can_write(config_path, "user delete")?;
+    let cfg = Config::load(config_path)?;
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open(&cfg.db_path())?;
+    let result = db.delete_user(username.to_ascii_lowercase()).await;
+    if let Ok(Ok(_)) = &result {
+        let _ = db.audit(None, "user_deleted", Some(format!("{username} (server shell)")), None).await;
+    }
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    match result? {
+        Ok(tunnels) => {
+            println!("Deleted {username}: signed out, machine tokens revoked.");
+            if !tunnels.is_empty() {
+                println!("Their {} tunnel(s) stopped serving and close within 15 seconds.", tunnels.len());
+            }
+            Ok(())
+        }
+        Err(crate::ui::store::DeleteUserError::NotFound) => {
+            anyhow::bail!("no user {username}; see `tunnel-server user list`")
+        }
+        Err(crate::ui::store::DeleteUserError::Owner) => {
+            anyhow::bail!("{username} is the owner and cannot be deleted (`admin link` resets its password instead)")
+        }
+    }
+}
+
 pub async fn client_list(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;

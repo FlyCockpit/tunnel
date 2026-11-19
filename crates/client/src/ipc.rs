@@ -39,12 +39,29 @@ pub enum Request {
     },
     Unexpose {
         port: u16,
+        /// Only if the daemon still serves this tunnel (checked atomically by the daemon).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<Expect>,
     },
     Status,
     Ice {
         fresh: bool,
     },
-    Stop,
+    Stop {
+        /// Only if the daemon still serves this tunnel; otherwise an error and it keeps running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<Expect>,
+    },
+}
+
+/// The tunnel a request is meant for: its id, or before the daemon's first
+/// Welcome (no id yet) its token. Needs the daemon feature `expect`: an
+/// older daemon would ignore it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Expect {
+    pub tunnel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,8 +126,9 @@ pub struct Status {
     pub features: Vec<String>,
 }
 
-/// Reported in `Status.features`. `target`: honours `Expose.target`.
-pub const DAEMON_FEATURES: &[&str] = &["target"];
+/// Reported in `Status.features`. `target`: honours `Expose.target`;
+/// `expect`: honours `Stop.expect` and `Unexpose.expect`.
+pub const DAEMON_FEATURES: &[&str] = &["target", "expect"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortStatus {
@@ -164,6 +182,16 @@ impl Status {
             ConnState::Revoked => EXIT_REVOKED,
             ConnState::Replaced => EXIT_REPLACED,
             _ => 0,
+        }
+    }
+
+    /// One line for a revoked or replaced tunnel (stderr, beside JSON output).
+    pub fn terminal_summary(&self) -> String {
+        let id = self.tunnel_id.as_deref().map(crate::paths::terminal_text).unwrap_or_else(|| "?".into());
+        match self.state {
+            ConnState::Revoked => format!("tunnel {id} is gone (deleted or expired, or its token was rejected)"),
+            ConnState::Replaced => format!("tunnel {id} was taken over by another client with the same token"),
+            other => format!("tunnel {id} is {}", other.as_str()),
         }
     }
 

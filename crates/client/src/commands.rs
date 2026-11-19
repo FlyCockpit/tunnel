@@ -23,7 +23,18 @@ pub(crate) enum Answer {
     Stopped,
 }
 
-pub(crate) async fn ask(req: Request, takeover: bool, json: bool) -> anyhow::Result<Answer> {
+/// How `ask` reports a tunnel that is gone (revoked or replaced).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// The status as text on stdout.
+    Text,
+    /// The status as JSON on stdout (`status --json`).
+    Json,
+    /// One line on stderr, so stdout keeps its own JSON (`share --json`).
+    Stderr,
+}
+
+pub(crate) async fn ask(req: Request, takeover: bool, report: Report) -> anyhow::Result<Answer> {
     let paths = Paths::resolve()?;
     let (token, server, target) = match &req {
         Request::Expose { token, server, target, .. } => (token.as_deref(), server.as_deref(), target.as_deref()),
@@ -41,9 +52,9 @@ pub(crate) async fn ask(req: Request, takeover: bool, json: bool) -> anyhow::Res
         Reach::Running(stream) => match call(stream, &req, REQUEST_TIMEOUT).await? {
             Some(Response::Error { message }) => bail!("{message}"),
             Some(resp) => Ok(Answer::Response(resp)),
-            None => daemon_gone(&paths, json).map(Answer::Exit),
+            None => daemon_gone(&paths, report).map(Answer::Exit),
         },
-        Reach::Terminal(p, state) => Ok(Answer::Exit(report_terminal(&p, state, json))),
+        Reach::Terminal(p, state) => Ok(Answer::Exit(report_terminal(&p, state, report))),
         Reach::Stopped => Ok(Answer::Stopped),
     }
 }
@@ -52,27 +63,35 @@ pub(crate) async fn ask(req: Request, takeover: bool, json: bool) -> anyhow::Res
 /// loopback; ask first, before anything is exposed, on the same connection
 /// the Expose then uses (so both reach the same daemon).
 async fn require_target_support(stream: &mut UnixStream) -> anyhow::Result<()> {
-    let supported = match call_on(stream, &Request::Status, REQUEST_TIMEOUT).await? {
-        Some(Response::Status { status }) => status.features.iter().any(|f| f == "target"),
-        _ => false,
-    };
-    if !supported {
+    if !daemon_supports(stream, "target").await? {
         bail!("the running daemon does not support --target / {ENV_TARGET}; run `tunnel stop` and try again");
     }
     Ok(())
 }
 
-fn report_terminal(p: &Persisted, state: ConnState, json: bool) -> i32 {
+/// Whether the daemon on `stream` lists `feature` (asked on that connection).
+pub(crate) async fn daemon_supports(stream: &mut UnixStream, feature: &str) -> anyhow::Result<bool> {
+    Ok(match call_on(stream, &Request::Status, REQUEST_TIMEOUT).await? {
+        Some(Response::Status { status }) => status.features.iter().any(|f| f == feature),
+        _ => false,
+    })
+}
+
+fn report_terminal(p: &Persisted, state: ConnState, report: Report) -> i32 {
     let status = Status::from_persisted(p, state);
-    status.print(json);
+    match report {
+        Report::Text => status.print(false),
+        Report::Json => status.print(true),
+        Report::Stderr => eprintln!("tunnel: {}", status.terminal_summary()),
+    }
     status.exit_code()
 }
 
 /// The daemon hung up mid-request: it exited, usually on revocation.
-fn daemon_gone(paths: &Paths, json: bool) -> anyhow::Result<i32> {
+fn daemon_gone(paths: &Paths, report: Report) -> anyhow::Result<i32> {
     match Persisted::load(&paths.state_file) {
-        Some(p) if p.revoked => Ok(report_terminal(&p, ConnState::Revoked, json)),
-        Some(p) if p.replaced => Ok(report_terminal(&p, ConnState::Replaced, json)),
+        Some(p) if p.revoked => Ok(report_terminal(&p, ConnState::Revoked, report)),
+        Some(p) if p.replaced => Ok(report_terminal(&p, ConnState::Replaced, report)),
         _ => bail!("daemon exited unexpectedly; see {}", paths.log_file.display()),
     }
 }
@@ -98,7 +117,7 @@ pub async fn expose(ports: Vec<u16>, target: Option<String>) -> anyhow::Result<i
     let server = env_nonempty(ENV_SERVER).or_else(|| crate::login::Login::load().ok().flatten().map(|l| l.server));
     let target = resolve_target(target)?;
     let req = Request::Expose { ports, token: env_token()?, server, target };
-    match ask(req, true, false).await? {
+    match ask(req, true, Report::Text).await? {
         Answer::Response(resp) => {
             let status = expect_status(resp)?;
             status.print(false);
@@ -110,7 +129,7 @@ pub async fn expose(ports: Vec<u16>, target: Option<String>) -> anyhow::Result<i
 }
 
 pub async fn unexpose(port: u16) -> anyhow::Result<i32> {
-    match ask(Request::Unexpose { port }, false, false).await? {
+    match ask(Request::Unexpose { port, expect: None }, false, Report::Text).await? {
         Answer::Response(resp) => {
             let status = expect_status(resp)?;
             status.print(false);
@@ -122,7 +141,8 @@ pub async fn unexpose(port: u16) -> anyhow::Result<i32> {
 }
 
 pub async fn status(json: bool) -> anyhow::Result<i32> {
-    let status = match ask(Request::Status, false, json).await? {
+    let report = if json { Report::Json } else { Report::Text };
+    let status = match ask(Request::Status, false, report).await? {
         Answer::Response(resp) => expect_status(resp)?,
         Answer::Exit(code) => return Ok(code),
         Answer::Stopped => Status::stopped(),
@@ -132,7 +152,7 @@ pub async fn status(json: bool) -> anyhow::Result<i32> {
 }
 
 pub async fn ice(format: IceFormat, fresh: bool, exec: Vec<String>) -> anyhow::Result<i32> {
-    let (config, ice_file, endpoint) = match ask(Request::Ice { fresh }, false, false).await? {
+    let (config, ice_file, endpoint) = match ask(Request::Ice { fresh }, false, Report::Text).await? {
         Answer::Response(Response::Ice { ice, ice_file, ice_url, ice_token }) => {
             (ice, ice_file, ice_url.zip(ice_token))
         }
@@ -162,13 +182,16 @@ pub async fn stop() -> anyhow::Result<i32> {
     let paths = Paths::resolve()?;
     // A tunnel `share` created is deleted on the server, not just disconnected.
     let deleted = crate::share::delete_shared(&paths).await;
-    stop_daemon(&paths, deleted).await
+    stop_daemon(&paths, deleted, false).await
 }
 
-async fn stop_daemon(paths: &Paths, deleted: bool) -> anyhow::Result<i32> {
+/// Stop the daemon and remove its state; `quiet` keeps stdout clean (for `--json`).
+pub(crate) async fn stop_daemon(paths: &Paths, deleted: bool, quiet: bool) -> anyhow::Result<i32> {
     if let Ok(stream) = UnixStream::connect(&paths.socket).await {
         // The daemon replies, deletes its state, and exits.
-        if let Some(Response::Error { message }) = call(stream, &Request::Stop, REQUEST_TIMEOUT).await? {
+        if let Some(Response::Error { message }) =
+            call(stream, &Request::Stop { expect: None }, REQUEST_TIMEOUT).await?
+        {
             bail!("{message}");
         }
     }
@@ -178,7 +201,11 @@ async fn stop_daemon(paths: &Paths, deleted: bool) -> anyhow::Result<i32> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => bail!("removing {}: {e}", paths.state_file.display()),
     }
-    println!("stopped");
+    if quiet {
+        eprintln!("stopped");
+    } else {
+        println!("stopped");
+    }
     Ok(if deleted { 0 } else { 1 })
 }
 
@@ -207,10 +234,10 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (rd, mut wr) = stream.into_split();
             let request = read_json_line::<_, Request>(&mut BufReader::new(rd), &mut String::new()).await.unwrap();
-            assert!(matches!(request, Some(Request::Stop)));
+            assert!(matches!(request, Some(Request::Stop { expect: None })));
             write_json_line(&mut wr, &Response::Status { status: Status::stopped() }).await.unwrap();
         });
-        assert_eq!(stop_daemon(&paths, false).await.unwrap(), 1);
+        assert_eq!(stop_daemon(&paths, false, false).await.unwrap(), 1);
         peer.await.unwrap();
         assert!(!paths.state_file.exists());
         assert!(paths.dir.join("share.json").exists());

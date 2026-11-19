@@ -54,6 +54,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - The web UI (`crates/web`, Leptos rendered in the browser, about 270 kB
   gzip) embedded in release servers (`--features ui`); an agent skill printed
   by `tunnel help agent` (`docs/agent/SKILL.md`).
+- Agent conveniences in the client: `--json` on `share`, `link` and `links`;
+  `tunnel unshare [PORT…]` (deletes the shared tunnel, or stops sharing some
+  ports); `share --for[=DURATION]` (foreground, unshares when the time is up
+  or on a signal); `tunnel links` and `tunnel unlink <ID>`; `link --label`.
+- `tunnel-server user invite [--role member|admin] [--hours N]` and
+  `user delete <name>` for managing accounts from the server's shell.
 - GitHub Release binaries for Linux and macOS: static Linux servers and client
   archives (`tunnel-<target>.tar.xz`), `sha256.sum` checked fail closed by both
   installers, signed build provenance (GitHub artifact attestations, keyless),

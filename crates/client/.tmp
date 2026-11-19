@@ -1,0 +1,12 @@
+{
+  "server": "",
+  "token": "tntun_test",
+  "ports": [
+    5173
+  ],
+  "revoked": false,
+  "replaced": false,
+  "tunnel_id": null,
+  "host_template": null,
+  "target": null
+}

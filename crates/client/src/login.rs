@@ -1,5 +1,5 @@
 //! `tunnel login`: the machine's client token and server, plus a
-//! small management-API client for `share`, `link`, and `stop`.
+//! small management-API client for `share`, `link`, `links`, `unlink`, `unshare` and `stop`.
 //!
 //! Saved at `$XDG_CONFIG_HOME/tunnel/login.json` (else
 //! `~/.config/...`), mode 0600 in a 0700 directory. Deliberately not `Debug`.
@@ -293,6 +293,24 @@ pub struct TunnelInfo {
     pub access: AccessInfo,
 }
 
+#[derive(Deserialize)]
+pub struct NewLink {
+    pub id: String,
+    pub url: String,
+    pub expires_at: i64,
+}
+
+/// A listed access link (`GET /v1/tunnels/{id}/access-links`; no URL).
+#[derive(Deserialize, Serialize)]
+pub struct LinkInfo {
+    pub id: String,
+    pub label: Option<String>,
+    pub single_use: bool,
+    pub used_at: Option<i64>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 #[derive(Deserialize, PartialEq, Eq, Debug)]
 pub struct AccessInfo {
     pub mode: String,
@@ -332,16 +350,43 @@ impl<'a> Api<'a> {
         decode::<Value>(resp, "changing access").await.map(|_| ())
     }
 
-    /// Full URL of a new access link that opens `port`'s preview.
-    pub async fn access_link(&self, id: &str, port: u16, ttl_s: u64, single_use: bool) -> anyhow::Result<String> {
-        #[derive(Deserialize)]
-        struct Link {
-            url: String,
+    /// A new access link that opens `port`'s preview.
+    pub async fn access_link(
+        &self,
+        id: &str,
+        port: u16,
+        ttl_s: u64,
+        single_use: bool,
+        label: Option<&str>,
+    ) -> anyhow::Result<NewLink> {
+        let mut body = json!({ "ttl_s": ttl_s, "single_use": single_use, "port": port });
+        if let Some(label) = label {
+            body["label"] = json!(label);
         }
-        let body = json!({ "ttl_s": ttl_s, "single_use": single_use, "port": port });
         let resp =
             self.req(reqwest::Method::POST, &format!("/v1/tunnels/{id}/access-links")).json(&body).send().await?;
-        decode::<Link>(resp, "creating access link").await.map(|l| l.url)
+        decode(resp, "creating access link").await
+    }
+
+    /// The tunnel's access links, newest first; `None` if the tunnel is gone.
+    pub async fn access_links(&self, id: &str) -> anyhow::Result<Option<Vec<LinkInfo>>> {
+        #[derive(Deserialize)]
+        struct List {
+            links: Vec<LinkInfo>,
+        }
+        let resp = self.req(reqwest::Method::GET, &format!("/v1/tunnels/{id}/access-links")).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        decode::<List>(resp, "listing access links").await.map(|l| Some(l.links))
+    }
+
+    pub async fn delete_access_link(&self, id: &str) -> anyhow::Result<()> {
+        let resp = self.req(reqwest::Method::DELETE, &format!("/v1/access-links/{id}")).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("access link {} not found (already revoked?)", terminal_text(id));
+        }
+        decode::<Value>(resp, "revoking access link").await.map(|_| ())
     }
 
     pub async fn delete_tunnel(&self, id: &str) -> anyhow::Result<()> {

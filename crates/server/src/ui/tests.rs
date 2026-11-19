@@ -1273,3 +1273,35 @@ async fn an_expired_pending_session_cannot_be_upgraded() {
     let swapped = state.db.create_ui_session("h2".into(), user, false, creds.auth_epoch, Some("f1".into()), None, None);
     assert!(!swapped.await.unwrap());
 }
+
+#[tokio::test]
+async fn deleting_a_user_from_the_shell_ends_everything_and_frees_the_name() {
+    use super::store::DeleteUserError;
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let token = approve_machine(&state, &mut ann, "laptop").await;
+    let t = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
+    let id = t.body["id"].as_str().unwrap().to_string();
+    let pending = ann.call(&state, "POST", "/ui/api/invites", Some(json!({ "role": "member" }))).await;
+    assert_eq!(pending.status, StatusCode::FORBIDDEN, "members cannot invite");
+
+    assert_eq!(state.db.delete_user("olivia".into()).await.unwrap(), Err(DeleteUserError::Owner));
+    assert_eq!(state.db.delete_user("nobody".into()).await.unwrap(), Err(DeleteUserError::NotFound));
+    assert_eq!(state.db.delete_user("ann".into()).await.unwrap(), Ok(vec![id.clone()]));
+    assert!(ann.call(&state, "GET", "/ui/api/session", None).await.body["user"].is_null());
+    assert_eq!(bearer(&state, "GET", "/v1/tunnels", &token, None).await.status, StatusCode::UNAUTHORIZED);
+    // Expired here; the running server's purge loop closes it (as for `client delete`).
+    if let crate::db::TunnelLookup::Live(row) = state.db.lookup_tunnel(id).await.unwrap() {
+        assert!(row.expires_at < now());
+    }
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    assert!(users.body["users"].as_array().unwrap().iter().all(|u| u["username"] != "ann"));
+    assert!(owner.call(&state, "GET", "/ui/api/machines", None).await.body.to_string().find("laptop").is_none());
+
+    // A shell invite (no creator) signs up an account with the invite's role, and the name is free again.
+    let invite = invite_token(&state, InviteKind::Invite, Role::Admin).await;
+    let mut again = sign_up(&state, &invite, "ann", 3).await;
+    let me = again.call(&state, "GET", "/ui/api/session", None).await;
+    assert_eq!(me.body["user"]["role"], "admin", "{}", me.body);
+}

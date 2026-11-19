@@ -291,7 +291,10 @@ limited per address (`limits.login_rate_per_min`, default 10) and per username
 is hashed; five wrong codes in a row lock the second factor for 15 minutes,
 doubling up to a day. Users with two-factor sign-in confirm approving or
 adding a machine with a code when their last check is older than ten minutes. The UI keeps an audit log (90 days).
-`tunnel-server user list` lists accounts. There is no open sign-up, no email
+`tunnel-server user list` lists accounts; from the server's shell,
+`user invite [--role member|admin] [--hours N]` prints an invite link (as the
+owner would make one) and `user delete <name>` removes an account other than
+the owner, with its sessions and machines. There is no open sign-up, no email
 and no SSO.
 
 **Machines.** `tunnel login https://<ui_host>` on a machine prints a code and
@@ -331,7 +334,7 @@ TURN connections are closed if they do not authenticate promptly.
 ### Administration
 
 Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
-`cert renew [--force]`, `admin link`, `user list`,
+`cert renew [--force]`, `admin link`, `user list | invite [--role member|admin] [--hours N] | delete <name>`,
 `client add <name> [--user <name>] | list | delete <name>`, and
 `service add <name> --max-tunnels <n> | list | set <name> --max-tunnels <n> | rotate <name> | delete <name>`
 (root only for a root install).
@@ -438,7 +441,8 @@ tunnel login                # on the laptop; paste tnenr_…@tunnel.example.com
 tunnel share 3000           # prints a one-time link
 tunnel share 5173 --public  # same tunnel, now public
 tunnel link --reusable      # another link
-tunnel stop                 # deletes the tunnel
+tunnel links                # list the links; `tunnel unlink <id>` revokes one
+tunnel unshare              # deletes the tunnel
 ```
 
 The login code is single-use and expires after 15 minutes. Enrollment exchanges

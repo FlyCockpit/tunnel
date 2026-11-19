@@ -62,10 +62,32 @@ tunnel share 3000 [5173 …]                               # link-only; prints a
 tunnel share 3000 --public                               # anyone with the URL (if the server allows it)
 TUNNEL_SHARE_PASSWORD=… tunnel share 3000 --password [--username bob]
 tunnel share 3000 --link                                 # back to links only
-tunnel link [--port 3000] [--reusable] [--ttl 1h]
-tunnel stop                                              # also deletes the shared tunnel
+tunnel share 3000 --for=30m                              # foreground: unshares after 30 min or on Ctrl-C (bare --for: 1h)
+tunnel link [--port 3000] [--reusable] [--ttl 1h] [--label bob]
+tunnel links                                             # the shared tunnel's links (ids, use, expiry; no URLs)
+tunnel unlink <ID>                                       # revoke one link and the visits it allowed
+tunnel unshare [PORT …]                                  # delete the shared tunnel (or stop sharing just those ports)
+tunnel stop                                              # stops the daemon; also deletes the shared tunnel
 tunnel logout
 ```
+
+`share`, `link` and `links` take `--json` for scripts and agents. `share --json`
+and `link --json` print one line (errors and notes go to stderr):
+
+```json
+{"tunnel":"ab12cd3efg","mode":"link","expires_at":1795400000,
+ "links":[{"port":3000,"url":"https://…","connected":true,"id":"lk…","expires_at":1795370000,"single_use":true}]}
+```
+
+`link --json` always describes the one new access link. For `share --json`
+in `public` and `password` mode each entry has the preview URL instead of a
+link (no `id`), and `password` adds `"username"`. With `share --for --json`
+that line is the only output on stdout; the process then waits and exits
+after unsharing (exit 0, or 3/4 if the tunnel was revoked or replaced
+meanwhile). `--for` always makes a new tunnel whose lifetime is the `--for`
+duration, so it also ends if the process is killed. `unshare` with nothing
+shared prints `nothing shared` and exits 0; it leaves a daemon alone that
+serves another tunnel (one from `expose`).
 
 Browser login prints a code and the approval page (`https://<ui host>/device`);
 sign in there, type the code, check the machine name and address, and approve.

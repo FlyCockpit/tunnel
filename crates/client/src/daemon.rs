@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use tunnel_protocol::{ClientMsg, EXIT_REPLACED, EXIT_REVOKED, IceConfig, read_json_line, write_json_line};
 
 use crate::ice;
-use crate::ipc::{ConnState, PortStatus, Request, Response, Status, host_for};
+use crate::ipc::{ConnState, Expect, PortStatus, Request, Response, Status, host_for};
 use crate::paths::{self, ENV_SERVER, ENV_TOKEN, Paths, env_nonempty, terminal_text};
 use crate::session;
 use crate::state::{Persisted, normalize_server, resolve_server, write_atomic};
@@ -64,6 +64,8 @@ struct Inner {
     /// Bumped when the target tunnel changes, so the old connection's late
     /// results are discarded.
     generation: u64,
+    /// A Stop was accepted: no more retargeting or exposing until the exit.
+    stopping: bool,
 }
 
 pub struct Daemon {
@@ -108,6 +110,7 @@ impl Daemon {
                 link: None,
                 ice: None,
                 generation: 0,
+                stopping: false,
             }),
             conn: watch::channel(ConnState::Connecting).0,
             reconnect: Notify::new(),
@@ -341,6 +344,9 @@ impl Daemon {
         let server = server.map(|s| normalize_server(&s)).transpose()?;
         let target = target.map(|t| paths::parse_target(&t)).transpose()?;
         let mut g = self.lock();
+        if g.stopping {
+            bail!("the daemon is stopping");
+        }
         let mut changed = false;
         if let Some(token) = token.filter(|t| *t != g.persisted.token) {
             info!("tunnel token changed; switching tunnels");
@@ -382,7 +388,7 @@ impl Daemon {
         for port in ports {
             let link = {
                 let mut g = self.lock();
-                if g.generation != generation {
+                if g.generation != generation || g.stopping {
                     bail!("tunnel changed while exposing ports");
                 }
                 if g.persisted.ports.contains(&port) {
@@ -406,9 +412,12 @@ impl Daemon {
         Ok(self.status())
     }
 
-    async fn unexpose(&self, port: u16) -> anyhow::Result<Status> {
+    async fn unexpose(&self, port: u16, expect: Option<Expect>) -> anyhow::Result<Status> {
         let link = {
             let mut g = self.lock();
+            if expect.is_some_and(|e| !serves(&g.persisted, &e)) {
+                bail!("{NOT_SERVING}");
+            }
             if !g.persisted.ports.contains(&port) {
                 bail!("port {port} is not exposed");
             }
@@ -478,8 +487,11 @@ impl Daemon {
             Request::Expose { ports, token, server, target } => {
                 self.expose(ports, token, server, target).await.map(|status| Response::Status { status })
             }
-            Request::Unexpose { port } => self.unexpose(port).await.map(|status| Response::Status { status }),
-            Request::Status | Request::Stop => Ok(Response::Status { status: self.status() }),
+            Request::Unexpose { port, expect } => {
+                self.unexpose(port, expect).await.map(|status| Response::Status { status })
+            }
+            Request::Status => Ok(Response::Status { status: self.status() }),
+            Request::Stop { expect } => self.begin_stop(expect).map(|status| Response::Status { status }),
             Request::Ice { fresh } => self.ice(fresh).await.map(|ice| Response::Ice {
                 ice,
                 ice_file: self.ice_file.display().to_string(),
@@ -491,12 +503,36 @@ impl Daemon {
     }
 
     /// `stop`: forget the tunnel locally so no later command resurrects it.
+    /// Accept a Stop (if `expect` still matches): from now on nothing
+    /// retargets or exposes, so the exit cannot take another tunnel down.
+    fn begin_stop(&self, expect: Option<Expect>) -> anyhow::Result<Status> {
+        {
+            let mut g = self.lock();
+            if expect.is_some_and(|e| !serves(&g.persisted, &e)) {
+                bail!("{NOT_SERVING}");
+            }
+            g.stopping = true;
+        }
+        Ok(self.status())
+    }
+
     fn stop(&self) -> ! {
         let _ = fs::remove_file(&self.paths.state_file);
         let _ = fs::remove_file(&self.ice_file);
         let _ = fs::remove_file(&self.paths.socket);
         info!("stop requested; daemon exiting");
         std::process::exit(0);
+    }
+}
+
+/// Error text when an `expect` does not match (the client matches on it).
+pub const NOT_SERVING: &str = "the daemon serves another tunnel";
+
+/// Whether the daemon's tunnel is `e`'s: by id, or by token before the first Welcome.
+fn serves(p: &Persisted, e: &Expect) -> bool {
+    match &p.tunnel_id {
+        Some(id) => *id == e.tunnel_id,
+        None => e.token.as_deref().is_some_and(|t| t == p.token),
     }
 }
 
@@ -575,7 +611,7 @@ fn harden_process() {
 }
 
 /// One daemon per state dir; held for the process lifetime.
-fn lock_daemon(paths: &Paths) -> anyhow::Result<Option<File>> {
+pub(crate) fn lock_daemon(paths: &Paths) -> anyhow::Result<Option<File>> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -620,9 +656,10 @@ async fn serve_ipc(daemon: Arc<Daemon>, stream: UnixStream) {
                 return;
             }
         };
-        let stop = matches!(req, Request::Stop);
+        let stop = matches!(req, Request::Stop { .. });
         let resp = daemon.handle(req).await;
-        if write_json_line(&mut wr, &resp).await.is_err() {
+        let stop = stop && !matches!(resp, Response::Error { .. });
+        if write_json_line(&mut wr, &resp).await.is_err() && !stop {
             return;
         }
         if stop {
@@ -689,6 +726,48 @@ mod tests {
         assert!(!message.contains("foreign-credential"));
         assert!(daemon.target() == target);
         assert_eq!(daemon.ports(), vec![3000]);
+    }
+
+    #[tokio::test]
+    async fn conditional_stop_and_unexpose_check_the_tunnel_and_block_retargeting() {
+        let token = format!("{}test", tunnel_protocol::TUNNEL_TOKEN_PREFIX);
+        let daemon = Daemon::new(
+            Paths {
+                dir: PathBuf::new(),
+                socket: PathBuf::new(),
+                state_file: PathBuf::new(),
+                log_file: PathBuf::new(),
+                lock_file: PathBuf::new(),
+            },
+            PathBuf::new(),
+            String::new(),
+            0,
+            false,
+            Persisted { token: token.clone(), ports: vec![3000, 5173], ..Persisted::default() },
+        );
+        let expect =
+            |id: &str, token: Option<&str>| Some(Expect { tunnel_id: id.into(), token: token.map(str::to_string) });
+        // Before Welcome only the token identifies the tunnel.
+        let err = |r: Response| matches!(r, Response::Error { message } if message == NOT_SERVING);
+        assert!(err(daemon.handle(Request::Unexpose { port: 3000, expect: expect("shared", None) }).await));
+        assert!(err(daemon.handle(Request::Stop { expect: expect("shared", Some("other-token")) }).await));
+        assert_eq!(daemon.ports(), vec![3000, 5173]);
+        let r = daemon.handle(Request::Unexpose { port: 3000, expect: expect("shared", Some(&token)) }).await;
+        assert!(matches!(r, Response::Status { .. }));
+        assert_eq!(daemon.ports(), vec![5173]);
+        // After Welcome, the id decides.
+        daemon.lock().persisted.tunnel_id = Some("shared".into());
+        assert!(err(daemon.handle(Request::Stop { expect: expect("other", Some(&token)) }).await));
+        assert!(!daemon.lock().stopping);
+        let r = daemon.handle(Request::Stop { expect: expect("shared", None) }).await;
+        assert!(matches!(r, Response::Status { .. }));
+        assert!(daemon.lock().stopping);
+        // Once a stop is accepted, nothing can switch the daemon to another tunnel.
+        let other = format!("{}other", tunnel_protocol::TUNNEL_TOKEN_PREFIX);
+        let r =
+            daemon.handle(Request::Expose { ports: vec![8080], token: Some(other), server: None, target: None }).await;
+        assert!(matches!(r, Response::Error { message } if message.contains("stopping")));
+        assert_eq!(daemon.lock().persisted.token, token);
     }
 
     struct Fixture {

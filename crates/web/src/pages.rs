@@ -732,7 +732,7 @@ fn Cli() -> impl IntoView {
             <div class="card stack">
                 <h2>"Then"</h2>
                 <p class="small"><code>"tunnel share 3000"</code> " prints a one-time link to your local port 3000. "
-                    <code>"tunnel link"</code> " makes another, " <code>"tunnel stop"</code> " ends sharing. "
+                    <code>"tunnel link"</code> " makes another, " <code>"tunnel unshare"</code> " ends sharing. "
                     "Agents can follow " <code>"tunnel help agent"</code> "."</p>
             </div>
         </div>

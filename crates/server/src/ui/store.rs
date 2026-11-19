@@ -174,6 +174,13 @@ pub enum Acceptance {
     },
 }
 
+/// Why `user delete` refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteUserError {
+    NotFound,
+    Owner,
+}
+
 /// Why an admin's change to a user was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdminError {
@@ -855,6 +862,43 @@ impl Db {
             )?;
             tx.commit()?;
             Ok(Some(Invite { id, kind, role, created_by, created_at: t, expires_at, used_at: None, used_by: None }))
+        })
+        .await
+    }
+
+    /// Delete a user other than the owner, with their sessions, unused
+    /// invites, device logins and machines; returns the machines' tunnels
+    /// (expired here, closed by the purge loop).
+    pub async fn delete_user(&self, username: String) -> anyhow::Result<Result<Vec<String>, DeleteUserError>> {
+        self.call(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let found: Option<(String, String)> = tx
+                .query_row("SELECT id, role FROM users WHERE username = ?1", params![username], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            let Some((id, role)) = found else {
+                return Ok(Err(DeleteUserError::NotFound));
+            };
+            if Role::parse(&role) == Role::Owner {
+                return Ok(Err(DeleteUserError::Owner));
+            }
+            tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![id])?;
+            tx.execute("DELETE FROM invites WHERE created_by = ?1 AND used_at IS NULL", params![id])?;
+            tx.execute("DELETE FROM device_logins WHERE user_id = ?1", params![id])?;
+            tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![id])?;
+            let clients: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT id FROM clients WHERE user_id = ?1")?;
+                stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut tunnels = Vec::new();
+            for client in clients {
+                tunnels.extend(expire_owner_tunnels(&tx, &client)?);
+                tx.execute("DELETE FROM clients WHERE id = ?1", params![client])?;
+            }
+            tx.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(Ok(tunnels))
         })
         .await
     }

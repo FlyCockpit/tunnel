@@ -142,6 +142,24 @@ enum AdminCmd {
 enum UserCmd {
     /// List accounts, their roles, machines and tunnels.
     List,
+    /// Print a one-time sign-up link for a new account (like an invite from the web UI).
+    Invite {
+        /// The new account's role.
+        #[arg(long, value_enum, default_value_t = InviteRole::Member)]
+        role: InviteRole,
+        /// Hours the link works (1..=720).
+        #[arg(long, default_value_t = 168, value_parser = clap::value_parser!(u32).range(1..=720))]
+        hours: u32,
+    },
+    /// Delete an account (not the owner): its sessions end, its machines'
+    /// tokens stop working and their tunnels close.
+    Delete { username: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum InviteRole {
+    Member,
+    Admin,
 }
 
 #[derive(Subcommand)]
@@ -210,6 +228,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Cert { cmd: CertCmd::Renew { force } } => commands::cert_renew(&config, force).await,
         Cmd::Admin { cmd: AdminCmd::Link } => commands::admin_link(&config, false).await,
         Cmd::User { cmd: UserCmd::List } => commands::user_list(&config).await,
+        Cmd::User { cmd: UserCmd::Invite { role, hours } } => {
+            let role = match role {
+                InviteRole::Member => ui::store::Role::Member,
+                InviteRole::Admin => ui::store::Role::Admin,
+            };
+            commands::user_invite(&config, role, hours).await
+        }
+        Cmd::User { cmd: UserCmd::Delete { username } } => commands::user_delete(&config, &username).await,
         Cmd::Client { cmd: ClientCmd::Add { name, user } } => {
             commands::client_add(&config, &name, user.as_deref()).await
         }

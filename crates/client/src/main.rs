@@ -101,11 +101,19 @@ enum Cmd {
         /// How long the tunnel lives, e.g. 30m, 8h, 2d.
         #[arg(long, default_value = "8h", value_parser = login::parse_duration)]
         ttl: u64,
+        /// Stay in the foreground, then unshare: `--for` (1h) or `--for=30m`;
+        /// Ctrl-C (or SIGTERM) unshares sooner. Always makes a new tunnel.
+        #[arg(long = "for", value_name = "DURATION", num_args = 0..=1, require_equals = true,
+              default_missing_value = "1h", value_parser = login::parse_duration, conflicts_with = "ttl")]
+        for_s: Option<u64>,
         #[arg(long)]
         label: Option<String>,
         /// Dial the ports on this IP address instead of loopback (default $TUNNEL_TARGET_HOST; no hostnames).
         #[arg(long, value_name = "IP")]
         target: Option<String>,
+        /// Print one JSON object: {"tunnel","mode","expires_at","links":[{"port","url","connected",…}]}.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a new access link for what this machine is sharing.
     Link {
@@ -117,6 +125,28 @@ enum Cmd {
         /// How long the link works, e.g. 10m, 1h.
         #[arg(long, default_value = "10m", value_parser = login::parse_duration)]
         ttl: u64,
+        /// A note shown by `tunnel links` and the web UI, e.g. who got the link.
+        #[arg(long)]
+        label: Option<String>,
+        /// Print one JSON object, shaped like `share --json`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the access links of what this machine is sharing (their URLs are not stored).
+    Links {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke one access link (see `tunnel links`) and end the visits it allowed.
+    Unlink {
+        /// The link id.
+        id: String,
+    },
+    /// Stop sharing: delete the shared tunnel and stop its daemon. With
+    /// ports, stop sharing only those (the tunnel goes once none are left).
+    Unshare {
+        #[arg(value_parser = clap::value_parser!(u16).range(1..))]
+        ports: Vec<u16>,
     },
     /// Help for a command, or `tunnel help agent`: how AI agents should share apps with tunnel.
     Help {
@@ -205,10 +235,17 @@ async fn run(cmd: Cmd) -> anyhow::Result<i32> {
         Cmd::Stop => commands::stop().await,
         Cmd::Login { code, name, no_browser } => share::login(code.as_deref(), name.as_deref(), !no_browser).await,
         Cmd::Logout => share::logout(),
-        Cmd::Share { ports, public, password, link, username, ttl, label, target } => {
-            share::share(ports, share::ShareAccess { public, password, link, username }, ttl, label, target).await
+        Cmd::Share { ports, public, password, link, username, ttl, for_s, label, target, json } => {
+            let access = share::ShareAccess { public, password, link, username };
+            let foreground = for_s.map(|duration_s| share::Foreground { duration_s });
+            share::share(ports, access, ttl, label, target, share::Output { json }, foreground).await
         }
-        Cmd::Link { port, reusable, ttl } => share::link(port, reusable, ttl).await,
+        Cmd::Link { port, reusable, ttl, label, json } => {
+            share::link(port, reusable, ttl, label, share::Output { json }).await
+        }
+        Cmd::Links { json } => share::links(json).await,
+        Cmd::Unlink { id } => share::unlink(&id).await,
+        Cmd::Unshare { ports } => share::unshare(ports).await,
         Cmd::Daemon => daemon::run().await.map(|()| 0),
     }
 }
@@ -235,6 +272,27 @@ fn protect_log_filter(filter: EnvFilter) -> EnvFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_for_defaults_to_an_hour_and_excludes_ttl() {
+        let for_s = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.cmd) {
+            Ok(Cmd::Share { for_s, ports, .. }) => Ok((for_s, ports)),
+            Ok(_) => panic!("not share"),
+            Err(e) => Err(e.kind()),
+        };
+        assert_eq!(for_s(&["tunnel", "share", "3000"]), Ok((None, vec![3000])));
+        assert_eq!(for_s(&["tunnel", "share", "3000", "--for"]), Ok((Some(3600), vec![3000])));
+        assert_eq!(for_s(&["tunnel", "share", "3000", "--for=30m"]), Ok((Some(1800), vec![3000])));
+        assert_eq!(for_s(&["tunnel", "share", "--for=2h", "3000", "5173"]), Ok((Some(7200), vec![3000, 5173])));
+        // A bare `--for` never takes a port as its duration.
+        assert_eq!(for_s(&["tunnel", "share", "--for", "3000"]), Ok((Some(3600), vec![3000])));
+        assert_eq!(for_s(&["tunnel", "share", "3000", "--for", "5173"]), Ok((Some(3600), vec![3000, 5173])));
+        assert!(for_s(&["tunnel", "share", "3000", "--for", "30m"]).is_err());
+        assert_eq!(
+            for_s(&["tunnel", "share", "3000", "--for", "--ttl", "1h"]),
+            Err(clap::error::ErrorKind::ArgumentConflict)
+        );
+    }
 
     #[test]
     fn handshake_logging_is_disabled_even_when_trace_is_requested() {
