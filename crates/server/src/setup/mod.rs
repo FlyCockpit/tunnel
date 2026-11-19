@@ -135,7 +135,7 @@ pub async fn run(config_path: &Path, args: SetupArgs) -> anyhow::Result<()> {
         return Err(e);
     }
     finish(&cfg, mode, new_token.as_deref());
-    if cfg.ui_host.is_some() && !args.skip_self_test {
+    if cfg.ui_host.is_some() {
         // First run with the UI: the one-time link that creates the owner account.
         if let Err(e) = crate::commands::admin_link(config_path, true).await {
             eprintln!("Could not create the owner sign-up link ({e:#}); run `tunnel-server admin link`.");
