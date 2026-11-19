@@ -1244,3 +1244,32 @@ async fn ui_link_creation_and_session_revocation_recheck_the_session_in_the_tran
     let r = ann.call(&state, "POST", &format!("/ui/api/tunnels/{id}/links"), Some(json!({ "ttl_s": 60 }))).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
 }
+
+#[tokio::test]
+async fn an_expired_pending_session_cannot_be_upgraded() {
+    let state = state();
+    let _owner = owner(&state).await;
+    let creds = state.db.credentials(Some("olivia".into()), None).await.unwrap().unwrap();
+    let user = creds.user.id.clone();
+    assert!(
+        state.db.create_ui_session("p1".into(), user.clone(), true, creds.auth_epoch, None, None, None).await.unwrap()
+    );
+    // Its five minutes ran out while the request carrying the code was in flight.
+    state
+        .db
+        .call(|c| {
+            c.execute("UPDATE ui_sessions SET expires_at = 1 WHERE id_hash = 'p1'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let swapped =
+        state.db.create_ui_session("h1".into(), user.clone(), false, creds.auth_epoch, Some("p1".into()), None, None);
+    assert!(!swapped.await.unwrap());
+    // A full session cannot stand in for a pending one either.
+    assert!(
+        state.db.create_ui_session("f1".into(), user.clone(), false, creds.auth_epoch, None, None, None).await.unwrap()
+    );
+    let swapped = state.db.create_ui_session("h2".into(), user, false, creds.auth_epoch, Some("f1".into()), None, None);
+    assert!(!swapped.await.unwrap());
+}

@@ -170,6 +170,7 @@ pub async fn status(config_path: &Path) -> anyhow::Result<()> {
         CertStatus::NeedsRenewal => println!("  due for renewal (the server renews automatically; or `cert renew`)"),
         CertStatus::NamesChanged => println!("  does not cover the configured names; run `cert renew`"),
         CertStatus::Missing => println!("  missing; run `setup` or `cert renew`"),
+        CertStatus::Expired => println!("  expired; replace your own certificate"),
     }
 
     let db_path = cfg.db_path();

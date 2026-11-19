@@ -131,7 +131,12 @@ pub enum CertStatus {
     Missing,
     NamesChanged,
     NeedsRenewal,
-    Valid { not_after: i64 },
+    /// Past its expiry date (reported for own certificates, which the server
+    /// never renews; issued ones simply need renewal).
+    Expired,
+    Valid {
+        not_after: i64,
+    },
 }
 
 /// Whether the certificate on disk is usable for `cfg` as-is.
@@ -152,7 +157,9 @@ pub fn cert_status(cfg: &Config) -> CertStatus {
         }
         let lifetime = (loaded.not_after - loaded.not_before).max(0);
         let remaining = loaded.not_after - crate::tokens::now();
-        return if remaining < lifetime / 3 {
+        return if remaining <= 0 {
+            CertStatus::Expired
+        } else if remaining < lifetime / 3 {
             CertStatus::NeedsRenewal
         } else {
             CertStatus::Valid { not_after: loaded.not_after }

@@ -1260,6 +1260,14 @@ async fn ensure_certificate(cfg: &Config) -> anyhow::Result<()> {
                 println!("Own certificate is valid until {} and covers every name", format_unix(not_after));
                 Ok(())
             }
+            // Still usable: say so, and carry on.
+            tls::CertStatus::NeedsRenewal => {
+                println!(
+                    "Warning: your certificate is in its last third of validity; replace fullchain.pem and privkey.pem in {} soon",
+                    cfg.cert_dir().display()
+                );
+                Ok(())
+            }
             other => bail!(
                 "own certificate: {other:?}. Put fullchain.pem and privkey.pem covering {} into {} and re-run setup",
                 cfg.cert_names().join(", "),
@@ -2041,5 +2049,36 @@ mod tests {
         assert_eq!(renewed.extra_dns[0].provider, DnsProviderKind::Digitalocean);
         assert_eq!(renewed.extra_dns[0].zone, "example-previews.com");
         std::fs::remove_file(token_file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_own_certificate_due_for_replacement_still_lets_setup_continue() {
+        let dir =
+            std::env::temp_dir().join(format!("tunnel-own-cert2-{}-{}", std::process::id(), rand::random::<u64>()));
+        let mut cfg = hosts_config();
+        cfg.data_dir = dir.clone();
+        cfg.acme.own_certificate = true;
+        std::fs::create_dir_all(cfg.cert_dir()).unwrap();
+        let write = |days_left: i64, days_total: i64| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![
+                "*.tunnel.example.com".to_string(),
+                "tunnel.example.com".to_string(),
+            ])
+            .unwrap();
+            let now = time::OffsetDateTime::now_utc();
+            params.not_before = now - time::Duration::days(days_total - days_left);
+            params.not_after = now + time::Duration::days(days_left);
+            let cert = params.self_signed(&key).unwrap();
+            std::fs::write(cfg.cert_dir().join("fullchain.pem"), cert.pem()).unwrap();
+            std::fs::write(cfg.cert_dir().join("privkey.pem"), key.serialize_pem()).unwrap();
+        };
+        write(20, 90);
+        assert_eq!(tls::cert_status(&cfg), tls::CertStatus::NeedsRenewal);
+        ensure_certificate(&cfg).await.unwrap();
+        write(-1, 90);
+        assert_eq!(tls::cert_status(&cfg), tls::CertStatus::Expired);
+        assert!(ensure_certificate(&cfg).await.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

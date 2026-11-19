@@ -684,9 +684,12 @@ impl Db {
             let t = now();
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some(old) = &replace {
+                // Only a live, still-pending session can be swapped: one that
+                // expired while its request was in flight is not.
                 let n = tx.execute(
-                    "DELETE FROM ui_sessions WHERE id_hash = ?1 AND user_id = ?2 AND auth_epoch = ?3",
-                    params![old, user_id, epoch],
+                    "DELETE FROM ui_sessions WHERE id_hash = ?1 AND user_id = ?2 AND auth_epoch = ?3
+                       AND pending = 1 AND expires_at > ?4",
+                    params![old, user_id, epoch, t],
                 )?;
                 if n != 1 {
                     return Ok(false);
