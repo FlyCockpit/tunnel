@@ -116,12 +116,13 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check bans licenses sources
-      # The web UI is its own workspace with its own (wasm32) policy.
+      # The web UI is its own workspace with its own (wasm32) policy; cargo-deny
+      # picks up crates/web/deny.toml next to the manifest.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: crates/web/Cargo.toml
           command: check
-          command-arguments: --config crates/web/deny.toml bans licenses sources
+          command-arguments: bans licenses sources
 
   advisories:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
