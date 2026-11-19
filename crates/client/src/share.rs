@@ -23,6 +23,8 @@ pub const ENV_SHARE_PASSWORD: &str = "TUNNEL_SHARE_PASSWORD";
 /// How long a link printed by `share` (and `link` by default) works.
 pub const LINK_TTL_S: u64 = 10 * 60;
 const CONNECT_WAIT: Duration = Duration::from_secs(15);
+/// The server's shortest tunnel lifetime, so the shortest `--for`.
+const MIN_FOR_S: u64 = 60;
 
 /// The tunnel `share` created, so later `share`/`link`/`stop` find it.
 #[derive(Clone, Serialize, Deserialize)]
@@ -241,6 +243,9 @@ pub async fn share(
     out: Output,
     foreground: Option<Foreground>,
 ) -> anyhow::Result<i32> {
+    if foreground.as_ref().is_some_and(|f| f.duration_s < MIN_FOR_S) {
+        bail!("--for must be at least 1m (the server's shortest tunnel lifetime)");
+    }
     let target = crate::commands::resolve_target(target)?;
     let login = Login::require()?;
     let api = Api::new(&login)?;
@@ -794,12 +799,12 @@ async fn require_expect_support(stream: &mut tokio::net::UnixStream) -> anyhow::
     Ok(())
 }
 
-/// Delete `shared`'s tunnel, stop the daemon only if it still serves that
-/// tunnel (checked by the daemon itself), and forget `share.json` only if it
-/// still names it. Returns whether the tunnel is deleted. `quiet`: progress
-/// on stderr, so stdout keeps `--json` output alone.
+/// Stop the daemon only if it still serves `shared`'s tunnel (checked by the
+/// daemon itself), then delete the tunnel and forget `share.json` only if it
+/// still names it. Stopping first: a daemon whose tunnel is deleted exits on
+/// its own and would leave its state behind. Returns whether the tunnel is
+/// deleted. `quiet`: progress on stderr, so stdout keeps `--json` output alone.
 async fn unshare_tunnel(paths: &Paths, shared: &Shared, login: anyhow::Result<Option<Login>>, quiet: bool) -> bool {
-    let deleted = delete_shared_with_login(paths, shared.clone(), login).await;
     let say = |line: String| if quiet { eprintln!("{line}") } else { println!("{line}") };
     match tokio::net::UnixStream::connect(&paths.socket).await {
         Ok(mut stream) => {
@@ -820,15 +825,24 @@ async fn unshare_tunnel(paths: &Paths, shared: &Shared, login: anyhow::Result<Op
             }
         }
         // No daemon: keep it from restarting from state that is this
-        // tunnel's. Under the daemon lock, so none starts from it meanwhile.
+        // tunnel's. Under the daemon lock, so none starts from it meanwhile
+        // (a daemon that is just exiting holds it for a moment longer).
         Err(_) => {
-            if let Ok(Some(_lock)) = crate::daemon::lock_daemon(paths)
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let lock = loop {
+                match crate::daemon::lock_daemon(paths) {
+                    Ok(None) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
+                    other => break other,
+                }
+            };
+            if let Ok(Some(_lock)) = lock
                 && persisted_share_token(shared, Persisted::load(&paths.state_file)).is_some()
             {
                 let _ = std::fs::remove_file(&paths.state_file);
             }
         }
     }
+    let deleted = delete_shared_with_login(paths, shared.clone(), login).await;
     if deleted {
         say(format!("unshared {}", terminal_text(&shared.tunnel_id)));
     }
@@ -1009,6 +1023,75 @@ mod tests {
             assert_eq!(stops.load(Ordering::SeqCst), stopped, "daemon serving {daemon_serves}, expect {expect}");
             std::fs::remove_dir_all(&paths.dir).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn unshare_stops_the_daemon_before_deleting_the_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+        use tunnel_protocol::{read_json_line, write_json_line};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let paths = test_paths("unshare-order");
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped_after_delete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The API notes when the DELETE arrives.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let flag = deleted.clone();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            flag.store(true, Ordering::SeqCst);
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        // The daemon notes whether its Stop came after the DELETE.
+        let sock = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+        let (flag, late) = (deleted.clone(), stopped_after_delete.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = sock.accept().await {
+                let (rd, mut wr) = stream.into_split();
+                let mut rd = BufReader::new(rd);
+                let mut buf = String::new();
+                while let Ok(Some(req)) = read_json_line::<_, Request>(&mut rd, &mut buf).await {
+                    if matches!(req, Request::Stop { .. }) && flag.load(Ordering::SeqCst) {
+                        late.store(true, Ordering::SeqCst);
+                    }
+                    let status = Status {
+                        tunnel_id: Some("shared".into()),
+                        features: vec!["expect".into()],
+                        ..Status::stopped()
+                    };
+                    let _ = write_json_line(&mut wr, &Response::Status { status }).await;
+                }
+            }
+        });
+        let shared = save_shared(&paths, "shared", &api);
+        assert!(unshare_tunnel(&paths, &shared, test_login(api), true).await);
+        peer.await.unwrap();
+        assert!(deleted.load(Ordering::SeqCst));
+        assert!(!stopped_after_delete.load(Ordering::SeqCst), "Stop must reach the daemon before the DELETE");
+        std::fs::remove_dir_all(&paths.dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unshare_waits_for_an_exiting_daemon_before_removing_its_state() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let paths = test_paths("unshare-exiting");
+        let (api, peer) = api_204().await;
+        let shared = save_shared(&paths, "shared", &api);
+        let left = Persisted { tunnel_id: Some("shared".into()), revoked: true, ..Persisted::default() };
+        left.save(&paths.state_file).unwrap();
+        // A daemon that has closed its socket but still holds its lock for a moment.
+        let lock = crate::daemon::lock_daemon(&paths).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(lock);
+        });
+        assert!(unshare_tunnel(&paths, &shared, test_login(api), true).await);
+        release.join().unwrap();
+        peer.await.unwrap();
+        assert!(!paths.state_file.exists(), "the exited daemon's state is removed");
+        std::fs::remove_dir_all(&paths.dir).unwrap();
     }
 
     #[tokio::test]
