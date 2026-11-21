@@ -118,6 +118,10 @@ struct Shared {
     challenges: Mutex<ChallengeLimiter>,
     stream_ips: Mutex<HashMap<IpAddr, usize>>,
     validation_changed: Notify,
+    /// Seconds added to the Unix clock for credential expiry, so tests can
+    /// expire a credential without waiting for the wall clock.
+    #[cfg(test)]
+    clock_skew: std::sync::atomic::AtomicI64,
 }
 
 /// Each turn server owns a 16-slot command channel. Serialize its command
@@ -168,6 +172,8 @@ impl Relay {
             challenges: Mutex::new(ChallengeLimiter::new()),
             stream_ips: Mutex::new(HashMap::new()),
             validation_changed: Notify::new(),
+            #[cfg(test)]
+            clock_skew: Default::default(),
         }));
         let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, w.stun_port));
         let udp = UdpSocket::bind(bind).await.with_context(|| format!("binding udp {bind}"))?;
@@ -353,6 +359,8 @@ impl Relay {
             challenges: Mutex::new(ChallengeLimiter::new()),
             stream_ips: Mutex::new(HashMap::new()),
             validation_changed: Notify::new(),
+            #[cfg(test)]
+            clock_skew: Default::default(),
         })
     }
 }
@@ -421,9 +429,17 @@ fn source_network(ip: IpAddr) -> IpAddr {
 }
 
 impl Shared {
+    /// Unix seconds that credential expiry is checked against.
+    fn now(&self) -> i64 {
+        #[cfg(test)]
+        return crate::tokens::now() + self.clock_skew.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        crate::tokens::now()
+    }
+
     fn credential_allowed(&self, username: &str) -> bool {
         let Some((expiry, tunnel)) = credential_parts(username) else { return false };
-        let now = crate::tokens::now();
+        let now = self.now();
         if expiry <= now || expiry > now.saturating_add(self.max_credential_ttl) {
             return false;
         }
@@ -471,7 +487,7 @@ impl Shared {
         security
             .validated
             .get(tunnel)
-            .and_then(|(at, expiry)| (at.elapsed() < VALIDATION_TTL).then(|| *expiry > crate::tokens::now()))
+            .and_then(|(at, expiry)| (at.elapsed() < VALIDATION_TTL).then(|| *expiry > self.now()))
     }
 
     /// Never waits in the shared UDP receive loop: authenticated misses get one
@@ -607,7 +623,7 @@ impl Shared {
                 }
             }
             security.validated.insert(tunnel.to_owned(), (tokio::time::Instant::now(), valid_until));
-            return valid_until > crate::tokens::now();
+            return valid_until > self.now();
         }
         false
     }
@@ -1239,7 +1255,7 @@ impl RelayConn {
         if self.released.load(Ordering::SeqCst) {
             return false;
         }
-        if self.expiry <= crate::tokens::now() || self.revoked.load(Ordering::Acquire) {
+        if self.expiry <= self.shared.now() || self.revoked.load(Ordering::Acquire) {
             return false;
         }
         let epoch = self.shared.revocation_epoch.load(Ordering::Acquire);
@@ -2235,7 +2251,7 @@ mod tests {
     async fn expired_cached_key_cannot_refresh_and_sweep_closes_allocation() {
         let (relay, server) = udp_server((51400, 51499)).await;
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (user, _) = creds(3);
+        let (user, _) = creds(60);
         let (nonce, key) = raw_allocate(&socket, server, &user).await;
         let refresh =
             |kind| packet(kind, &[(0x0006, user.as_bytes()), (0x0014, b"turn.test"), (0x0015, &nonce)], Some(&key));
@@ -2244,14 +2260,21 @@ mod tests {
         socket.send_to(&refresh(0x0004), server).await.unwrap();
         let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await.unwrap().unwrap();
         assert_eq!(stun_packet(&buf[..n]).unwrap().unwrap().kind, 0x0104);
+        // Move this relay's Unix clock to the credential's expiry.
         let expiry = credential_parts(&user).unwrap().0;
-        while crate::tokens::now() < expiry {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        relay.shared.clock_skew.store(expiry - crate::tokens::now(), Ordering::SeqCst);
+        assert!(relay.shared.now() >= expiry);
         // All four authenticated methods are blocked even before the sweep.
+        // The UDP path handles datagrams in order, so the Binding answer
+        // arriving first proves the request before it got no reply.
         for kind in [0x0003, 0x0004, 0x0008, 0x0009] {
             socket.send_to(&refresh(kind), server).await.unwrap();
-            assert!(tokio::time::timeout(Duration::from_millis(60), socket.recv_from(&mut buf)).await.is_err());
+            let binding = packet(0x0001, &[], None);
+            socket.send_to(&binding, server).await.unwrap();
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await.unwrap().unwrap();
+            assert_eq!(stun_packet(&buf[..n]).unwrap().unwrap().kind, 0x0101, "reply to expired {kind:#06x}");
+            assert_eq!(buf[8..20], binding[8..20]);
         }
         let handle = relay.udp.lock().unwrap().clone().unwrap();
         assert_eq!(handle.get_allocations_info(None).await.unwrap().len(), 1);
