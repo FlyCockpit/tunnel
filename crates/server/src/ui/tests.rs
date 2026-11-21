@@ -328,6 +328,8 @@ async fn request_checks_refuse_cross_origin_same_site_and_stale_csrf() {
     assert_eq!(send(&state, req, 1).await.status, StatusCode::UNAUTHORIZED);
 }
 
+/// Reaches the embedded shell, so CI's `server-ui` job also runs it by name
+/// with `--features ui`.
 #[tokio::test]
 async fn ui_responses_carry_the_strict_headers_and_cookie_attributes() {
     let state = state();
@@ -1113,6 +1115,8 @@ async fn owner_reset_can_revoke_the_owners_machines() {
     assert_eq!(bearer(&state, "GET", "/v1/tunnels", &token, None).await.status, StatusCode::UNAUTHORIZED);
 }
 
+/// Reaches the embedded shell, so CI's `server-ui` job also runs it by name
+/// with `--features ui`.
 #[tokio::test]
 async fn the_app_shell_and_assets_are_served_from_the_binary() {
     let state = state();

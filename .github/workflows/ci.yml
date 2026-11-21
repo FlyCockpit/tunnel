@@ -91,7 +91,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: nice -n 10 cargo clippy -p tunnel-server --all-targets --all-features --locked -- -D warnings
-      - run: 'nice -n 10 cargo test -p tunnel-server --features ui --locked -- --test-threads=3 ui::'
+      # Every ui:: test already runs in `test`. Only the ones that reach the
+      # embedded shell (ui/assets.rs `serve`) depend on the feature; list each.
+      - run: 'nice -n 10 cargo test -p tunnel-server --features ui --locked -- --test-threads=3 ui::tests::the_app_shell_and_assets_are_served_from_the_binary ui::tests::ui_responses_carry_the_strict_headers_and_cookie_attributes'
 
   msrv:
     if: github.event_name != 'schedule'
