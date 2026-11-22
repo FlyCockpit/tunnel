@@ -8,9 +8,9 @@ covers the build.
 
 ## Edge lines
 
-Set 11-22 by the orchestrator's gridlines pass, owner-requested. These are the
-horizontal edges every container sits on. They follow the FlyCockpit
-template's edge lines (`patterns/design-system.md` § Edge lines there):
+These are the horizontal edges every container sits on. They follow the
+FlyCockpit template's edge lines (`patterns/design-system.md` § Edge lines
+there):
 the same 16px app frame, page and card lines, applied to this UI's own
 containers. Lines are measured on ink (glyph bounds, or a boxed control's box)
 from the container's outer edge, so a bordered card's 16px padding puts its

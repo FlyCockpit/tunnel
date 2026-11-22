@@ -1210,8 +1210,8 @@ mod tests {
         let mut other = state();
         other.tunnel_id = Some("other".into());
         assert!(persisted_share_token(&shared, Some(other)).is_none());
-        let legacy: Shared = serde_json::from_value(json!({ "tunnel_id": "shared", "api": "" })).unwrap();
-        assert!(persisted_share_token(&legacy, Some(state())).is_none());
+        let without_token: Shared = serde_json::from_value(json!({ "tunnel_id": "shared", "api": "" })).unwrap();
+        assert!(persisted_share_token(&without_token, Some(state())).is_none());
     }
 
     #[test]

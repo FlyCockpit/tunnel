@@ -231,7 +231,7 @@ The web UI lives on its own host, `ui_host`, and is off until that is set
 `openssl rand -base64 33`; it seals TOTP secrets and derives CSRF tokens, so
 keep it with the config's other secrets). The UI host serves the app, its JSON
 API under `/ui/api/*`, the client installer (`/install.sh`) and the bearer API
-under `/v1/*`; `api_host` keeps serving `/v1/*` as before.
+under `/v1/*`; `api_host` serves the bearer API under `/v1/*` too.
 
 **Hosts and domains.** `ui_host` and `preview_zone` are independent:
 
@@ -377,6 +377,31 @@ keeps the current database as `tunnel.db.before-restore-<time>`, swaps the
 copy in, and starts the service again. The config file (`config.toml`) and the
 `certs/` directory are not in the database; back them up separately. `restore`
 accepts only databases written by Tunnel 1.0.0 or later.
+
+#### Databases from prerelease builds
+
+A database written by a prerelease 1.0.0 build from before user accounts or
+traffic counters is refused at startup, with a message naming the missing
+column. Upgrade it once with `sqlite3` on the database file (`tunnel.db` in
+the data directory):
+
+1. Stop the service and copy the database first (`tunnel-server backup` refuses
+   it too): `sqlite3 tunnel.db ".backup tunnel.db.pre-upgrade"`.
+2. Add each missing column to the tables that exist (a table that does not
+   exist yet, such as `users` in a database from before accounts, is created
+   on start with all its columns, as is the `traffic` table):
+   `ALTER TABLE tunnels ADD COLUMN bytes_in INTEGER NOT NULL DEFAULT 0;`
+   `ALTER TABLE tunnels ADD COLUMN bytes_out INTEGER NOT NULL DEFAULT 0;`
+   `ALTER TABLE users ADD COLUMN traffic_cap INTEGER;`
+   `ALTER TABLE clients ADD COLUMN user_id TEXT REFERENCES users(id);`
+3. Start the service.
+4. If you added `clients.user_id`, the existing machines have no account yet
+   and cannot connect until they belong to one. Create the owner if
+   `tunnel-server user list` shows none: with the web UI on, run
+   `tunnel-server admin link`, open the link and finish the owner's sign-up;
+   without the web UI, `tunnel-server client add <name>` (for a new machine)
+   creates the owner. Then give the existing machines to the owner:
+   `UPDATE clients SET user_id = (SELECT id FROM users WHERE role = 'owner') WHERE user_id IS NULL;`.
 
 ### Tunnels and access
 

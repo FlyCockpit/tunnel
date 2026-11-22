@@ -540,7 +540,7 @@ impl Db {
         )?;
         anyhow::ensure!(
             !clients_table || has_owner,
-            "database predates user accounts (`clients.user_id` is missing); see the CHANGELOG entry for the one-time upgrade"
+            "database predates user accounts (`clients.user_id` is missing); see 'Databases from prerelease builds' in the README for the one-time upgrade"
         );
         let lacks = |table: &str, column: &str| -> rusqlite::Result<bool> {
             tx.query_row(
@@ -553,7 +553,7 @@ impl Db {
         anyhow::ensure!(
             !lacks("tunnels", "bytes_in")? && !lacks("tunnels", "bytes_out")? && !lacks("users", "traffic_cap")?,
             "database predates traffic counters (`tunnels.bytes_in`, `tunnels.bytes_out` or `users.traffic_cap` \
-             is missing); see the CHANGELOG entry for the one-time upgrade"
+             is missing); see 'Databases from prerelease builds' in the README for the one-time upgrade"
         );
         tx.execute_batch(SCHEMA)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2141,6 +2141,10 @@ mod tests {
         drop(db);
         let err = Db::open(&path).err().expect("refused");
         assert!(format!("{err:#}").contains("clients.user_id"), "{err:#}");
+        assert!(format!("{err:#}").contains("'Databases from prerelease builds' in the README"), "{err:#}");
+        // The README's one-time upgrade makes it usable again.
+        Connection::open(&path).unwrap().execute_batch(&readme_upgrade("clients", "user_id")).unwrap();
+        Db::open(&path).unwrap();
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
@@ -2317,6 +2321,62 @@ mod tests {
         }
     }
 
+    /// The README's one-time upgrade statement for `table.column`.
+    fn readme_upgrade(table: &str, column: &str) -> String {
+        let readme = include_str!("../../../README.md");
+        let section = &readme[readme.find("\n#### Databases from prerelease builds\n").expect("README section")..];
+        let start = section.find(&format!("`ALTER TABLE {table} ADD COLUMN {column} ")).expect("README statement") + 1;
+        let len = section[start..].find(';').expect("statement end") + 1;
+        section[start..start + len].to_string()
+    }
+
+    #[test]
+    fn the_readme_upgrades_give_the_columns_a_fresh_database_has() {
+        // (type, notnull, default, referenced table) of `table.column`.
+        fn column_def(c: &Connection, table: &str, column: &str) -> (String, bool, Option<String>, Option<String>) {
+            let (ty, notnull, default) = c
+                .query_row(
+                    "SELECT type, [notnull], dflt_value FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, column],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            let refs = c
+                .query_row(
+                    "SELECT \"table\" FROM pragma_foreign_key_list(?1) WHERE \"from\" = ?2",
+                    params![table, column],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            (ty, notnull, default, refs)
+        }
+        let (db, path) = temp_db();
+        for (table, column) in
+            [("clients", "user_id"), ("tunnels", "bytes_in"), ("tunnels", "bytes_out"), ("users", "traffic_cap")]
+        {
+            let mut fresh = column_def(&db.conn.lock().unwrap(), table, column);
+            if column == "user_id" {
+                // SQLite cannot add a NOT NULL column without a default: an
+                // upgraded `clients.user_id` stays nullable, filled by the UPDATE.
+                assert!(fresh.1);
+                fresh.1 = false;
+            }
+            // A table from before the column, with a row in it, upgraded as the README says.
+            let old = Connection::open_in_memory().unwrap();
+            old.execute_batch(&format!(
+                "CREATE TABLE {table} (id TEXT PRIMARY KEY); INSERT INTO {table} VALUES ('x');"
+            ))
+            .unwrap();
+            old.execute_batch(&readme_upgrade(table, column)).unwrap();
+            assert_eq!(column_def(&old, table, column), fresh, "{table}.{column}");
+        }
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     #[test]
     fn refuses_a_database_from_before_traffic_counters_until_upgraded() {
         for (table, column) in [("tunnels", "bytes_in"), ("tunnels", "bytes_out"), ("users", "traffic_cap")] {
@@ -2328,12 +2388,9 @@ mod tests {
             }
             let err = Db::open(&path).err().unwrap().to_string();
             assert!(err.contains("predates traffic counters"), "{table}.{column}: {err}");
-            // The one-time upgrade from the CHANGELOG makes it usable again.
-            {
-                let c = Connection::open(&path).unwrap();
-                let ty = if column == "traffic_cap" { "INTEGER" } else { "INTEGER NOT NULL DEFAULT 0" };
-                c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}")).unwrap();
-            }
+            assert!(err.contains("'Databases from prerelease builds' in the README"), "{err}");
+            // The one-time upgrade from the README makes it usable again.
+            Connection::open(&path).unwrap().execute_batch(&readme_upgrade(table, column)).unwrap();
             assert!(Db::open(&path).is_ok(), "{table}.{column}");
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
