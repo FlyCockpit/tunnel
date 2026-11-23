@@ -147,8 +147,21 @@ pub async fn status(json: bool) -> anyhow::Result<i32> {
         Answer::Exit(code) => return Ok(code),
         Answer::Stopped => Status::stopped(),
     };
-    status.print(json);
+    let access = match &status.tunnel_id {
+        Some(id) => server_access(id).await,
+        None => None,
+    };
+    status.print_access(json, access.as_ref());
     Ok(status.exit_code())
+}
+
+/// The tunnel's access settings, when this machine's login can read it
+/// (best effort: nothing when logged out, offline, or not its tunnel).
+async fn server_access(tunnel_id: &str) -> Option<crate::login::AccessInfo> {
+    let login = crate::login::Login::load().ok().flatten()?;
+    let api = crate::login::Api::new(&login).ok()?;
+    let info = tokio::time::timeout(Duration::from_secs(5), api.tunnel(tunnel_id)).await.ok()?.ok()??;
+    Some(info.access)
 }
 
 pub async fn ice(format: IceFormat, fresh: bool, exec: Vec<String>) -> anyhow::Result<i32> {

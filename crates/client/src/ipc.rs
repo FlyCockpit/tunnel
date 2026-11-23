@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 use tokio::time::Instant;
 use tunnel_protocol::{EXIT_REPLACED, EXIT_REVOKED, IceConfig, read_json_line, write_json_line};
 
+use crate::login::AccessInfo;
 use crate::paths::{
     ENV_ICE_FILE, ENV_SERVER, ENV_TARGET, ENV_TOKEN, Paths, env_nonempty, env_token, validate_tunnel_token,
 };
@@ -141,6 +142,15 @@ pub fn host_for(template: &str, port: u16) -> String {
     template.replace("{port}", &port.to_string())
 }
 
+/// Where a person signs in to a password-protected preview, from its host
+/// `{port}-{id}.<zone>`: `https://<zone>/__login?to={port}-{id}&next=%2F`
+/// (the server's login form lives only on the zone host).
+pub fn login_url(host: &str) -> Option<String> {
+    let (label, zone) = host.split_once('.')?;
+    let ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    (ok(label) && ok(zone)).then(|| format!("https://{zone}/__login?to={label}&next=%2F"))
+}
+
 impl Status {
     pub fn stopped() -> Self {
         Self {
@@ -196,8 +206,33 @@ impl Status {
     }
 
     pub fn print(&self, json: bool) {
+        self.print_access(json, None);
+    }
+
+    /// `--json` output: the daemon's status plus, when the CLI could read the
+    /// tunnel from the server, `mode` (`link` | `password` | `public`),
+    /// `username` (password mode; never the password) and each port's
+    /// `login_url` (password mode).
+    pub fn to_json(&self, access: Option<&AccessInfo>) -> serde_json::Result<serde_json::Value> {
+        let mut v = serde_json::to_value(self)?;
+        if let Some(access) = access {
+            v["mode"] = access.mode.clone().into();
+            if access.mode == "password" {
+                v["username"] = access.username.clone().into();
+                for (p, out) in self.ports.iter().zip(v["ports"].as_array_mut().into_iter().flatten()) {
+                    if let Some(url) = p.host.as_deref().and_then(login_url) {
+                        out["login_url"] = url.into();
+                    }
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// [`Status::print`] with the tunnel's access settings, if known.
+    pub fn print_access(&self, json: bool, access: Option<&AccessInfo>) {
         if json {
-            match serde_json::to_string_pretty(self) {
+            match self.to_json(access).and_then(|v| serde_json::to_string_pretty(&v)) {
                 Ok(s) => println!("{s}"),
                 Err(e) => eprintln!("tunnel: encoding status: {e}"),
             }
@@ -206,6 +241,14 @@ impl Status {
         println!("state: {}", self.state.as_str());
         if let Some(id) = &self.tunnel_id {
             println!("tunnel: {}", crate::paths::terminal_text(id));
+        }
+        match access {
+            Some(a) if a.mode == "password" => println!(
+                "access: password (username {})",
+                crate::paths::terminal_text(a.username.as_deref().unwrap_or("?"))
+            ),
+            Some(a) => println!("access: {}", crate::paths::terminal_text(&a.mode)),
+            None => {}
         }
         if let Some(target) = &self.target {
             println!("target: {target}");
@@ -221,6 +264,10 @@ impl Status {
                 );
                 let conn = if p.connected { "connected" } else { "not connected" };
                 println!("  {} -> {url} ({conn})", p.port);
+                if let Some(login) = access.filter(|a| a.mode == "password").and(p.host.as_deref()).and_then(login_url)
+                {
+                    println!("       sign in: {}", crate::paths::terminal_text(&login));
+                }
             }
         }
         if let Some(e) = &self.last_error {
@@ -404,6 +451,52 @@ pub async fn call_on(stream: &mut UnixStream, req: &Request, timeout: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_urls_come_from_the_preview_host() {
+        assert_eq!(
+            login_url("3000-ab12cd3efg.previews.example.com").as_deref(),
+            Some("https://previews.example.com/__login?to=3000-ab12cd3efg&next=%2F")
+        );
+        for host in ["3000-?", "", ".zone", "3000-x.", "3000-x.zone/evil", "a b.zone"] {
+            assert_eq!(login_url(host), None, "{host}");
+        }
+    }
+
+    #[test]
+    fn status_json_names_mode_and_username_but_never_a_password() {
+        let status = Status {
+            state: ConnState::Connected,
+            tunnel_id: Some("ab12cd3efg".into()),
+            host_template: Some("{port}-ab12cd3efg.p.example".into()),
+            ports: vec![
+                PortStatus { port: 3000, host: Some("3000-ab12cd3efg.p.example".into()), connected: true },
+                PortStatus { port: 5173, host: None, connected: false },
+            ],
+            last_error: None,
+            ice_file: None,
+            target: None,
+            features: vec![],
+        };
+        let plain = status.to_json(None).unwrap();
+        assert!(plain.get("mode").is_none() && plain.get("username").is_none());
+        assert_eq!(plain, serde_json::to_value(&status).unwrap());
+
+        let password = AccessInfo { mode: "password".into(), username: Some("preview".into()) };
+        let v = status.to_json(Some(&password)).unwrap();
+        assert_eq!(v["mode"], "password");
+        assert_eq!(v["username"], "preview");
+        assert_eq!(v["ports"][0]["login_url"], "https://p.example/__login?to=3000-ab12cd3efg&next=%2F");
+        assert!(v["ports"][1].get("login_url").is_none());
+        assert!(!v.to_string().contains("password\":\"") && v.get("password").is_none());
+
+        for mode in ["link", "public"] {
+            let v = status.to_json(Some(&AccessInfo { mode: mode.into(), username: Some("x".into()) })).unwrap();
+            assert_eq!(v["mode"], mode);
+            assert!(v.get("username").is_none(), "{mode}");
+            assert!(v["ports"][0].get("login_url").is_none(), "{mode}");
+        }
+    }
 
     #[test]
     fn invalid_env_token_is_ignored_without_an_explicit_token() {

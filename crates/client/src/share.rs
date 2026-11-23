@@ -199,6 +199,10 @@ struct LinkOutput {
     expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     single_use: Option<bool>,
+    /// Password mode: the page where a person signs in (`url` alone answers
+    /// non-browser clients with a 401).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login_url: Option<String>,
 }
 
 /// Output options shared by `share` and `link`.
@@ -429,10 +433,20 @@ async fn expose_and_show(
                 id: Some(link.id),
                 expires_at: Some(link.expires_at),
                 single_use: Some(true),
+                login_url: None,
             }
         } else {
-            let url = format!("https://{}/", port_host(&status, port));
-            LinkOutput { port, url, connected, id: None, expires_at: None, single_use: None }
+            let host = port_host(&status, port);
+            let login_url = (mode == "password").then(|| crate::ipc::login_url(&host)).flatten();
+            LinkOutput {
+                port,
+                url: format!("https://{host}/"),
+                connected,
+                id: None,
+                expires_at: None,
+                single_use: None,
+                login_url,
+            }
         });
     }
     let shown = ShareOutput { tunnel: tunnel_id, mode, expires_at, username, traffic_limited: limited, links };
@@ -452,11 +466,16 @@ fn print_share(shared: &ShareOutput, out: &Output, foreground: Option<&Foregroun
         let url = terminal_text(&l.url);
         match shared.mode.as_str() {
             "public" => println!("{}  {url}  (public){note}", l.port),
-            "password" => println!(
-                "{}  {url}  (username {}, password as set){note}",
-                l.port,
-                terminal_text(shared.username.as_deref().unwrap_or("?"))
-            ),
+            "password" => {
+                println!(
+                    "{}  {url}  (username {}, password as set){note}",
+                    l.port,
+                    terminal_text(shared.username.as_deref().unwrap_or("?"))
+                );
+                if let Some(login) = &l.login_url {
+                    println!("      sign in: {}", terminal_text(login));
+                }
+            }
             _ => {
                 let ttl_s = l.expires_at.map_or(0, |e| (e - crate::ice::unix_now() as i64).max(0) as u64);
                 println!("{}  {url}  (works once, within {} min){note}", l.port, link_minutes(ttl_s));
@@ -669,6 +688,7 @@ pub async fn link(
                 id: Some(link.id),
                 expires_at: Some(link.expires_at),
                 single_use: Some(!reusable),
+                login_url: None,
             }],
         };
         println!("{}", serde_json::to_string(&shown)?);
@@ -923,6 +943,7 @@ mod tests {
             id: Some("lnk".into()),
             expires_at: Some(5),
             single_use: Some(true),
+            login_url: None,
         };
         let shown = ShareOutput {
             tunnel: "t".into(),
@@ -944,6 +965,7 @@ mod tests {
             id: None,
             expires_at: None,
             single_use: None,
+            login_url: crate::ipc::login_url("80-t.example"),
         };
         let shown = ShareOutput {
             tunnel: "t".into(),
@@ -956,7 +978,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&shown).unwrap(),
             json!({"tunnel":"t","mode":"password","expires_at":9,"username":"bob","traffic_limited":true,"links":[
-                {"port":80,"url":"https://80-t.example/","connected":false}]})
+                {"port":80,"url":"https://80-t.example/","connected":false,
+                 "login_url":"https://example/__login?to=80-t&next=%2F"}]})
         );
     }
 

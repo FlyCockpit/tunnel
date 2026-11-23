@@ -11,7 +11,13 @@ user asked for something else.
 
 ## Before you start
 
-- `tunnel status --json` shows whether this machine is sharing and its ports.
+- `tunnel status --json` shows whether this machine is sharing, its ports and
+  (when it can read the tunnel) its `mode` (`link`, `password` or `public`)
+  and, in password mode, the `username` and each port's `login_url`. Run it
+  **before** you share. A machine has one tunnel daemon: if `state` is not
+  `stopped`, a tunnel is already running and it is not yours. `share` may add
+  your ports to it, and a new share (including `--for`) would take the daemon
+  over and cut that tunnel off. Ask the human before sharing then.
 - If a command says "not logged in", ask the user to run
   `tunnel login https://<their server>` and approve the machine in their
   browser. Do not try to log in yourself, and never ask for their password.
@@ -42,21 +48,51 @@ tunnel share 3000 5173 --ttl 1h --json  # several ports, shorter lifetime
   Members' public previews are refused unless an admin allowed them; do not
   look for workarounds.
 - `--password` (with `TUNNEL_SHARE_PASSWORD` set) is for when the user asks
-  for a shared password instead of links.
+  for a shared password instead of links. See Password mode below.
 
-### For a fixed time
+### Password mode
 
-When the share should end by itself (a demo, a review session), run it in
-the foreground:
+```sh
+TUNNEL_SHARE_PASSWORD=… tunnel share 3000 --password --for=8h --json
+```
+
+```json
+{"tunnel":"ab12cd3efg","mode":"password","expires_at":1795400000,"username":"preview",
+ "links":[{"port":3000,"url":"https://3000-ab12cd3efg.<zone>/","connected":true,
+           "login_url":"https://<zone>/__login?to=3000-ab12cd3efg&next=%2F"}]}
+```
+
+- Give the human the **`login_url`** (plus the username and password): it
+  opens the sign-in form, which then goes to the preview.
+- The gate redirects to the sign-in form only for page loads: requests with
+  `Sec-Fetch-Dest: document` (or `iframe`/`frame`), or, without that header,
+  `Accept: text/html`. Everything else (curl, `fetch`, you) gets **401**, in
+  password mode too; its body names the `login_url` (JSON with
+  `Accept: application/json`). A 401 from `curl` therefore does not mean the
+  share is broken. Never send the password over HTTP Basic: there is none.
+
+### For a fixed time, or "leave this up"
+
+When the share should end by itself (a demo, a review session), or the human
+says to leave it up, run it with `--for` in the background:
 
 ```sh
 tunnel share 3000 --for=30m --json   # prints the JSON line, waits, then unshares (bare --for: 1h)
+tunnel share 3000 --for=8h --json    # "leave this up": ends by itself after 8 h
 ```
 
-It makes a new tunnel, deletes it when the time is up, on Ctrl-C or SIGTERM,
-and its lifetime is the `--for` duration, so it also ends if the process is
-killed. Run it in the background (or a separate terminal) if you need the
-shell meanwhile, and stop it with SIGTERM to end early.
+It always makes a **new** tunnel, deletes it when the time is up, on Ctrl-C
+or SIGTERM, and its lifetime is the `--for` duration, so it also ends if the
+process is killed. Stop it with SIGTERM to end early. It refuses only while an
+earlier `tunnel share` from this machine is still up; a tunnel started any
+other way (e.g. `tunnel expose`) it would take over, because it uses the
+machine's one daemon. So check `tunnel status --json` first (see Before you
+start).
+
+`--ttl` and `--for` are exclusive. Pick `--for` for anything you start;
+`--ttl` (default 8h) is for a share the daemon keeps up in the background,
+after your process ends, until someone runs `tunnel unshare`, and it reuses
+the machine's current shared tunnel if there is one.
 
 ## More links
 
@@ -79,9 +115,15 @@ tunnel unshare            # deletes the tunnel and stops its daemon (says "nothi
 tunnel unshare 5173       # stop sharing one port; the tunnel goes once no port is left
 ```
 
-Unshare when the user is done or when the task ends; do not leave tunnels
-running "just in case". The user can also see and delete tunnels and links in
-the server's web UI.
+**Never unshare a tunnel you did not create in this session.** Someone may be
+using it (the human, or a person they sent it to). Before `tunnel unshare`,
+check `tunnel status --json`: if the tunnel is not the one your own `share`
+printed, or it was already there before you shared, ask the human instead.
+A share you started with `--for` ends by itself; stop it with SIGTERM.
+
+Unshare your own share when the user is done or when the task ends; do not
+leave tunnels running "just in case". The user can also see and delete
+tunnels and links in the server's web UI.
 
 ## Rules
 

@@ -1,9 +1,33 @@
 //! Small, unbranded status pages served by the edge.
 
+use std::sync::LazyLock;
+
+use base64::Engine as _;
 use http::header::{self, HeaderName};
 use http::{Response, StatusCode};
 
 use crate::util::{Body, full};
+
+/// The Tunnel logo with a padlock badge (`assets/gate-icon.svg`, with a 32px
+/// PNG for browsers without SVG icons; `assets/make-gate-icon.py` makes
+/// both). Inline, so these pages never make the browser ask a preview origin
+/// (or anything else) for `/favicon.ico`.
+const ICON_SVG: &[u8] = include_bytes!("../assets/gate-icon.svg");
+const ICON_PNG: &[u8] = include_bytes!("../assets/gate-icon-32.png");
+
+/// `<link rel="icon">` tags for [`ICON_PNG`] and [`ICON_SVG`] (the SVG last,
+/// so browsers that support it prefer it).
+static ICON_LINKS: LazyLock<String> = LazyLock::new(|| {
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!(
+        r#"<link rel="icon" type="image/png" sizes="32x32" href="data:image/png;base64,{}"><link rel="icon" type="image/svg+xml" sizes="any" href="data:image/svg+xml;base64,{}">"#,
+        b64(ICON_PNG),
+        b64(ICON_SVG)
+    )
+});
+
+/// What every page here allows: its inline style and the inline icon.
+const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
 
 fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>) -> Response<Body> {
     // A meta refresh lets the offline pages recover on their own once the
@@ -14,10 +38,11 @@ fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>
     };
     let html = format!(
         r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">{refresh}<title>{title}</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">{refresh}<title>{title}</title>{icon}
 <style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:#1f1f1f;background:#fafafa}}main{{max-width:30rem;padding:1.5rem;text-align:center}}h1{{margin:0 0 .5rem;font-size:1.25rem}}p{{margin:0;color:#5f5f5f}}@media (prefers-color-scheme:dark){{body{{color:#ececec;background:#161616}}p{{color:#a8a8a8}}}}</style></head>
 <body><main><h1>{title}</h1><p>{message}</p></main></body></html>
-"#
+"#,
+        icon = ICON_LINKS.as_str(),
     );
     let mut builder = Response::builder()
         .status(status)
@@ -26,7 +51,7 @@ fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>
         .header(HeaderName::from_static("x-robots-tag"), "noindex")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::REFERRER_POLICY, "no-referrer")
-        .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'");
+        .header(header::CONTENT_SECURITY_POLICY, CSP);
     if let Some(s) = retry_after {
         builder = builder.header(header::RETRY_AFTER, s.to_string());
     }
@@ -57,7 +82,7 @@ pub fn login(status: StatusCode, target: &LoginTarget<'_>, error: Option<&str>) 
     let error = error.map(|e| format!(r#"<p class="err" role="alert">{}</p>"#, escape(e))).unwrap_or_default();
     let html = format!(
         r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Sign in</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Sign in</title>{icon}
 <style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:#1f1f1f;background:#fafafa}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:#5f5f5f}}input{{width:100%;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid #c8c8c8;border-radius:6px;background:#fff;color:inherit}}button{{margin-top:1rem;width:100%;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:#1f1f1f;color:#fff;cursor:pointer}}.err{{margin:0 0 .5rem;color:#b3261e;font-size:.875rem}}@media (prefers-color-scheme:dark){{body{{color:#ececec;background:#161616}}label{{color:#a8a8a8}}input{{background:#232323;border-color:#3a3a3a}}button{{background:#ececec;color:#161616}}.err{{color:#f2b8b5}}}}</style></head>
 <body><main><h1>Sign in to view this preview</h1>{error}
 <form method="post" action="/__login"><input type="hidden" name="to" value="{to}"><input type="hidden" name="next" value="{next}">
@@ -67,10 +92,11 @@ pub fn login(status: StatusCode, target: &LoginTarget<'_>, error: Option<&str>) 
 "#,
         to = escape(target.to),
         next = escape(target.next),
+        icon = ICON_LINKS.as_str(),
     );
     // `form-action` also governs the redirect after a successful POST.
     let csp = format!(
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {}; frame-ancestors {}",
+        "{CSP}; form-action 'self' {}; frame-ancestors {}",
         target.preview_origin,
         target.frame_sources.join(" ")
     );
@@ -97,6 +123,11 @@ pub fn redirect(location: &str) -> Response<Body> {
         .unwrap_or_else(|_| not_found())
 }
 
+/// A sign-in form that could not be read (too large, wrong type).
+pub fn bad_form(status: StatusCode, message: &str) -> Response<Body> {
+    page(status, "Sign-in failed", &escape(message), None)
+}
+
 pub fn not_found() -> Response<Body> {
     page(StatusCode::NOT_FOUND, "Not found", "There is no preview at this address.", None)
 }
@@ -104,6 +135,30 @@ pub fn not_found() -> Response<Body> {
 /// Deliberately generic: never says whether a link was unknown, used, or expired.
 pub fn unauthorized() -> Response<Body> {
     page(StatusCode::UNAUTHORIZED, "Access required", "Open this preview from the link you were given.", None)
+}
+
+/// A password-protected preview asked for by something other than a page
+/// load (curl, `fetch`, an agent), which gets no redirect: say where to sign
+/// in. JSON when the client asks for it. Names no secret.
+pub fn password_required(login_url: &str, json: bool) -> Response<Body> {
+    const MESSAGE: &str = "This preview is password protected. Sign in in a browser at the login URL, then open it.";
+    if !json {
+        let url = escape(login_url);
+        let message = format!(
+            r#"This preview is password protected. <a href="{url}">Sign in</a> at <code>{url}</code>, then open it."#
+        );
+        return page(StatusCode::UNAUTHORIZED, "Sign-in required", &message, None);
+    }
+    let body = serde_json::json!({ "error": "password_required", "message": MESSAGE, "login_url": login_url });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(HeaderName::from_static("x-robots-tag"), "noindex")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(full(body.to_string()))
+        .expect("valid response")
 }
 
 /// A gated WebSocket or write started by an untrusted origin (see `edge`).
@@ -184,4 +239,31 @@ pub fn bad_gateway() -> Response<Body> {
 
 pub fn rate_limited() -> Response<Body> {
     page(StatusCode::TOO_MANY_REQUESTS, "Too many attempts", "Wait a minute and try again.", Some(60))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The icon is the web UI's logo with a badge: regenerate it
+    /// (`assets/make-gate-icon.py`) when the logo changes.
+    #[test]
+    fn the_gate_icon_embeds_the_current_logo() {
+        let logo = include_bytes!("../../web/static/logo-64.png");
+        let svg = std::str::from_utf8(ICON_SVG).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(logo);
+        assert!(svg.contains(&format!(r#"href="data:image/png;base64,{encoded}""#)));
+        assert!(ICON_PNG.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn every_page_has_the_icon_and_its_policy() {
+        for response in
+            [not_found(), unauthorized(), rate_limited(), offline(), bad_form(StatusCode::PAYLOAD_TOO_LARGE, "<x>")]
+        {
+            assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], CSP);
+        }
+        assert!(ICON_LINKS.contains("data:image/svg+xml;base64,"));
+        assert!(ICON_LINKS.contains("data:image/png;base64,"));
+    }
 }

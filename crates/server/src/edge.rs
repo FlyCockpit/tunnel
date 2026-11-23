@@ -127,8 +127,10 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
         Some(hash) => hash[..SUBJECT_LEN].to_string(),
         None if mode == AccessMode::Public => PUBLIC_SUBJECT.to_string(),
         None => {
-            let login_next = (mode == AccessMode::Password && wants_page(&req))
+            let page = wants_page(&req);
+            let login_next = (mode == AccessMode::Password && page)
                 .then(|| req.uri().path_and_query().map(|p| gate::safe_next(p.as_str())).unwrap_or_default());
+            let json = !page && accepts_json(&req);
             if !reserved && is_same_tunnel_preflight(&req, &state.config.preview_zone, id) {
                 // Preflights never carry credentials; forward without any cookie.
                 // Still watched: any gate epoch rotation (a revoked link, a
@@ -146,6 +148,10 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
             Metrics::inc(&state.metrics.gate_denials);
             if let Some(next) = login_next {
                 return pages::redirect(&gatehost::login_url(&state.config.preview_zone, label, &next));
+            }
+            if mode == AccessMode::Password {
+                // Not a page load, so no redirect: say where a person signs in.
+                return pages::password_required(&gatehost::login_url(&state.config.preview_zone, label, "/"), json);
             }
             return pages::unauthorized();
         }
@@ -272,6 +278,12 @@ fn wants_page(req: &Request<Incoming>) -> bool {
         Some(dest) => matches!(dest, "document" | "iframe" | "frame"),
         None => header_str(req.headers().get(header::ACCEPT)).is_some_and(|a| a.contains("text/html")),
     }
+}
+
+/// The client prefers JSON (`Accept: application/json`, not HTML).
+fn accepts_json<B>(req: &Request<B>) -> bool {
+    header_str(req.headers().get(header::ACCEPT))
+        .is_some_and(|a| a.contains("application/json") && !a.contains("text/html"))
 }
 
 /// Only ports the connected client declared are routable; anything else is

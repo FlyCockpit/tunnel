@@ -1090,4 +1090,164 @@ zone = "example.com"
         events.assert_cut().await;
         assert_eq!(live_streams(&state), 0);
     }
+
+    async fn body_text(response: Response<Body>) -> String {
+        String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+    }
+
+    /// A browser asks the page's own origin for `/favicon.ico` when a page
+    /// names no icon; on a gated preview that must stop at the gate.
+    #[tokio::test]
+    async fn a_gated_favicon_request_never_reaches_the_origin() {
+        for mode in [AccessMode::Link, AccessMode::Password] {
+            let state = test_state(&[]);
+            create_tunnel(&state, mode).await;
+            let (_session, opened, received) = sandbox(&state).await;
+            for extra in [
+                vec![("sec-fetch-dest", "image"), ("accept", "image/avif,image/webp,image/png,*/*;q=0.8")],
+                vec![("accept", "image/*")],
+                vec![],
+            ] {
+                let response = request(&state, PREVIEW, "/favicon.ico", Method::GET, &extra).await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{mode:?} {extra:?}");
+            }
+            assert_eq!(opened.load(Ordering::SeqCst), 0, "{mode:?}");
+            assert_eq!(received.load(Ordering::SeqCst), 0, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_non_page_request_learns_how_its_mode_signs_in() {
+        const LOGIN: &str = "https://previews.example.com/__login?to=3000-abcdefghij&next=%2F";
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Password).await;
+        let (_session, _, received) = sandbox(&state).await;
+        // curl, a fetch, an agent: no redirect, the login URL in the body.
+        for extra in [vec![], vec![("accept", "*/*")], vec![("sec-fetch-dest", "empty"), ("accept", "text/html")]] {
+            let response = request(&state, PREVIEW, "/app?x=1", Method::GET, &extra).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{extra:?}");
+            assert!(!response.headers().contains_key(header::LOCATION));
+            assert!(response.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+            let body = body_text(response).await;
+            assert!(body.contains(&LOGIN.replace('&', "&amp;")), "{body}");
+            assert!(body.contains("password protected"), "{body}");
+            assert!(!body.contains("link you were given"), "{body}");
+            assert!(!body.contains("visitor"), "names no username: {body}");
+        }
+        for extra in [
+            vec![("accept", "application/json")],
+            vec![("sec-fetch-dest", "empty"), ("accept", "application/json, */*")],
+        ] {
+            let response = request(&state, PREVIEW, "/api/x", Method::GET, &extra).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+            assert_eq!(body["error"], "password_required");
+            assert_eq!(body["login_url"], LOGIN);
+            assert_eq!(body.as_object().unwrap().len(), 3, "{body}");
+        }
+        // Page loads still go straight to the login form, keeping the path.
+        for extra in
+            [vec![("sec-fetch-dest", "document")], vec![("sec-fetch-dest", "iframe")], vec![("accept", "text/html")]]
+        {
+            let response = request(&state, PREVIEW, "/app", Method::GET, &extra).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{extra:?}");
+            assert_eq!(
+                response.headers()[header::LOCATION],
+                "https://previews.example.com/__login?to=3000-abcdefghij&next=%2Fapp"
+            );
+        }
+        // Link mode keeps its own copy, whatever the client accepts.
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        for extra in [vec![], vec![("accept", "application/json")], vec![("sec-fetch-dest", "document")]] {
+            let response = request(&state, PREVIEW, "/", Method::GET, &extra).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = body_text(response).await;
+            assert!(body.contains("link you were given"), "{body}");
+            assert!(!body.contains("__login"), "{body}");
+        }
+        assert_eq!(received.load(Ordering::SeqCst), 0);
+    }
+
+    /// Every gate page carries the inline padlock icon (and a CSP that lets
+    /// it load); none points the browser at another URL for one.
+    #[tokio::test]
+    async fn gate_pages_carry_the_inline_padlock_icon() {
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Password).await;
+        let zone = "previews.example.com";
+        let mut pages = vec![
+            (zone, "/__login?to=3000-abcdefghij&next=%2F", Method::GET, vec![], StatusCode::OK),
+            // A used or unknown link on a password tunnel: the form, as a 401.
+            (zone, "/__access/3000-abcdefghij/tnacc_unknown", Method::GET, vec![], StatusCode::UNAUTHORIZED),
+            (zone, "/__login?to=3000-zzzzzzzzzz", Method::GET, vec![], StatusCode::NOT_FOUND),
+            (zone, "/__login", Method::POST, vec![], StatusCode::NOT_FOUND),
+            (PREVIEW, "/", Method::GET, vec![], StatusCode::UNAUTHORIZED),
+        ];
+        for (host, path, method, extra, status) in pages.drain(..) {
+            let response = request(&state, host, path, method.clone(), &extra).await;
+            assert_eq!(response.status(), status, "{method} {host}{path}");
+            let csp = response.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+            assert!(csp.starts_with("default-src 'none'; style-src 'unsafe-inline'; img-src data:"), "{csp}");
+            let body = body_text(response).await;
+            assert!(
+                body.contains(r#"<link rel="icon" type="image/svg+xml" sizes="any" href="data:image/svg+xml;base64,"#)
+            );
+            assert!(body.contains(r#"<link rel="icon" type="image/png" sizes="32x32" href="data:image/png;base64,"#));
+            assert_eq!(body.matches("rel=\"icon\"").count(), 2, "{path}");
+            assert!(!body.contains("favicon"), "{path}");
+        }
+        // Link mode's generic 401 and an unknown link on the zone host too.
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Link).await;
+        for (host, path) in [(zone, "/__access/3000-abcdefghij/tnacc_unknown"), (PREVIEW, "/")] {
+            let response = request(&state, host, path, Method::GET, &[]).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{host}{path}");
+            assert!(body_text(response).await.contains("data:image/svg+xml;base64,"), "{host}{path}");
+        }
+    }
+
+    /// The dashboard's Open button: a single-use, one-minute link for one
+    /// port takes the browser through the zone host to the app, once.
+    #[tokio::test]
+    async fn an_open_link_reaches_the_app_through_the_gate_once() {
+        for mode in [AccessMode::Link, AccessMode::Password] {
+            let state = test_state(&[]);
+            let tunnel = create_tunnel(&state, mode).await;
+            let (_session, _, received) = sandbox(&state).await;
+            let req: crate::api::CreateAccessLinkRequest = serde_json::from_value(serde_json::json!({
+                "port": 3000, "ttl_s": 60, "single_use": true, "label": "Opened from the dashboard"
+            }))
+            .unwrap();
+            let link = crate::api::mint_access_link(&state, &tunnel, req, None).await.unwrap();
+            let path = link.url.strip_prefix("https://previews.example.com").unwrap().to_string();
+            assert!(path.starts_with("/__access/3000-abcdefghij/tnacc_"), "{path}");
+            let document = [("sec-fetch-dest", "document")];
+
+            let response = request(&state, "previews.example.com", &path, Method::GET, &document).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{mode:?}");
+            assert_eq!(response.headers()[header::LOCATION], format!("https://{PREVIEW}/"));
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+            let cookie =
+                response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+            let app = request(&state, PREVIEW, "/", Method::GET, &[("cookie", cookie.as_str()), document[0]]).await;
+            assert_eq!(app.status(), StatusCode::OK);
+            assert_eq!(body_text(app).await, "sandbox");
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+
+            // The same link again: no new session, and the origin is not asked.
+            let again = request(&state, "previews.example.com", &path, Method::GET, &document).await;
+            assert_eq!(again.status(), StatusCode::UNAUTHORIZED, "{mode:?}");
+            assert!(!again.headers().contains_key(header::SET_COOKIE));
+            assert!(!again.headers().contains_key(header::LOCATION));
+            let body = body_text(again).await;
+            match mode {
+                AccessMode::Password => assert!(body.contains(r#"action="/__login""#), "{body}"),
+                _ => assert!(body.contains("link you were given"), "{body}"),
+            }
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+        }
+    }
 }

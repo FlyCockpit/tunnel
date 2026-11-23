@@ -1624,3 +1624,45 @@ async fn a_deleted_tunnels_counter_in_use_keeps_reaching_the_month() {
     crate::traffic::flush(&state).await.unwrap();
     assert!(state.metrics.get(&id).is_none(), "a deleted tunnel's counter is gone");
 }
+
+/// The Tunnels page's Open button mints a one-time, one-minute link through
+/// the same API, so it gets the same checks as any other link.
+#[tokio::test]
+async fn open_links_follow_the_link_rules_and_are_labelled() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let mut bob = member(&state, &mut owner, "bob", 3).await;
+    let ann_token = approve_machine(&state, &mut ann, "laptop").await;
+    let t = create_tunnel(&state, &ann_token, json!({ "mode": "link" })).await;
+    let id = t.body["id"].as_str().unwrap().to_string();
+    let path = format!("/ui/api/tunnels/{id}/links");
+    let open = json!({ "port": 3000, "ttl_s": 60, "single_use": true, "label": "Opened from the dashboard" });
+
+    // Another member cannot open (or even see) Ann's tunnel.
+    let r = bob.call(&state, "POST", &path, Some(open.clone())).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
+    assert!(r.body.get("url").is_none());
+    assert_eq!(bob.call(&state, "GET", &path, None).await.status, StatusCode::NOT_FOUND);
+
+    // Ann can; so can an admin (the owner), as for any link.
+    for who in [&mut ann, &mut owner] {
+        let r = who.call(&state, "POST", &path, Some(open.clone())).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        let url = r.body["url"].as_str().unwrap();
+        assert!(url.starts_with(&format!("https://previews.example.net/__access/3000-{id}/tnacc_")), "{url}");
+    }
+    let listed = ann.call(&state, "GET", &path, None).await;
+    let links = listed.body["links"].as_array().unwrap();
+    assert_eq!(links.len(), 2);
+    for l in links {
+        assert_eq!(l["label"], "Opened from the dashboard");
+        assert_eq!(l["single_use"], true);
+        assert!(l["used_at"].is_null());
+        // Expiry is taken just before the row's creation time (a second boundary may fall between).
+        let lifetime = l["expires_at"].as_i64().unwrap() - l["created_at"].as_i64().unwrap();
+        assert!((59..=60).contains(&lifetime), "{lifetime}");
+        assert!(l.get("url").is_none(), "link URLs are never listed");
+    }
+    assert!(bob.call(&state, "GET", "/ui/api/tunnels?all=true", None).await.status == StatusCode::FORBIDDEN);
+}

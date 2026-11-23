@@ -391,6 +391,12 @@ switching one to public (link and password mode stay available).
 - **Link** (default): visitors need an access link to establish a gate session.
 - **Password**: visitors sign in with the configured username and password;
   access links also work. An expired or consumed link shows the login page.
+  Only page loads (`Sec-Fetch-Dest: document`, `iframe` or `frame`; without
+  that header, `Accept: text/html`) are redirected to the form at
+  `https://<zone>/__login?to={port}-{id}&next=…`. Other requests without a
+  session (curl, `fetch`, agents) get a 401 whose body names that login URL
+  (`{"error":"password_required","message","login_url"}` with
+  `Accept: application/json`, else HTML). There is no HTTP Basic.
 - **Public**: anyone with the preview URL can visit without a gate session.
 
 Mint links with `POST /v1/tunnels/{id}/access-links` (or `tunnel link`).
@@ -425,6 +431,11 @@ on the metrics endpoint counts these cuts. A tunnel that reaches its own expiry
 is ended the same way by the expiry sweep, within 15 seconds. Bytes already
 handed to the connection before the revocation may still reach a slow reader
 before it sees the failure; nothing the origin sends later does.
+
+In link mode the 401 says only to open the preview from the link. The gate's
+pages (sign-in, 401, errors) carry the Tunnel logo with a padlock as an
+inline icon, so a browser never asks a preview for `/favicon.ico` before
+sign-in (that request would stop at the gate anyway).
 
 Sign-in lives only on the zone host: `/__access/...` for links and `/__login`
 for passwords. These routes are absent on preview hosts, keeping preview service
@@ -467,6 +478,16 @@ tunnel link --reusable      # another link
 tunnel links                # list the links; `tunnel unlink <id>` revokes one
 tunnel unshare              # deletes the tunnel
 ```
+
+`tunnel share --password` prints each preview's URL and, as `login_url` in
+`--json`, the sign-in page to hand to people (the preview URL itself answers
+non-browser clients with a 401). `tunnel status --json` adds the tunnel's
+`mode` (`link`, `password` or `public`) and, in password mode, `username`
+(never the password) and each port's `login_url`, when this machine's login
+can read the tunnel. `share --for=8h` makes its own tunnel and ends it by
+itself; `--ttl` (exclusive with `--for`) sets the lifetime of a share the
+daemon keeps until `tunnel unshare`. `tunnel help agent` prints the agent
+skill (`docs/agent/SKILL.md`).
 
 The login code is single-use and expires after 15 minutes. Enrollment exchanges
 it for a long-lived `tncli_` client token saved locally; it lasts until the client

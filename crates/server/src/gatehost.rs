@@ -25,7 +25,7 @@ use crate::headers;
 use crate::pages::{self, LoginTarget};
 use crate::state::AppState;
 use crate::tokens::is_valid_tunnel_id;
-use crate::util::{Body, full, text_response};
+use crate::util::{Body, text_response};
 
 pub const ACCESS_PREFIX: &str = "/__access/";
 pub const LOGIN_PATH: &str = "/__login";
@@ -175,7 +175,7 @@ async fn login(state: &Arc<AppState>, peer: SocketAddr, req: Request<Incoming>) 
             let cookies = gate::split_cookies(req.headers());
             let form = match gate::read_login_form(req.into_body()).await {
                 Ok(f) => f,
-                Err((status, msg)) => return text_page(status, msg),
+                Err((status, msg)) => return pages::bad_form(status, msg),
             };
             let Some((port, id)) = headers::parse_label(&form.to) else {
                 return pages::not_found();
@@ -202,14 +202,6 @@ async fn login(state: &Arc<AppState>, peer: SocketAddr, req: Request<Incoming>) 
         }
         _ => pages::not_found(),
     }
-}
-
-fn text_page(status: StatusCode, msg: &'static str) -> Response<Body> {
-    let mut resp = Response::new(full(msg));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
 }
 
 #[cfg(test)]

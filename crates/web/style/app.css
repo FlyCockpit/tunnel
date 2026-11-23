@@ -13,7 +13,11 @@
 *, *::before, *::after { box-sizing: border-box; }
 html { color-scheme: light; }
 html.dark { color-scheme: dark; }
+/* The app is mounted straight into body: header, main, footer. Main grows,
+   so a short page still puts the footer at the bottom of the viewport. */
 body {
+  display: flex; flex-direction: column;
+  min-height: 100vh; min-height: 100dvh;
   margin: 0;
   font-family: "Roboto Variable", system-ui, sans-serif;
   font-size: 14px;
@@ -54,7 +58,8 @@ p { margin: 0 0 8px; }
 .page-head { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
 .page-head > div:first-child { flex: 1; min-width: 240px; }
 .narrow { max-width: 420px; margin: 48px auto; }
-.footer { border-top: 1px solid var(--border); padding: 16px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.main { flex: 1 0 auto; }
+.footer { flex-shrink: 0; border-top: 1px solid var(--border); padding: 16px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
 
 /* Card. Edge lines (crates/web/README.md § Edge lines): the header, page
    and card text lines are 16px in; tables put their edge cells on the

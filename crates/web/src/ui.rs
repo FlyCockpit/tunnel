@@ -59,7 +59,7 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
                 <button class="btn btn-ghost btn-sm" on:click=sign_out>"Sign out"</button>
             </Show>
         </header>
-        <main>{children()}</main>
+        <main class="main">{children()}</main>
         <footer class="footer">
             "Tunnel " {version}
             {move || abuse().map(|a| view! { " · Report abuse: " {a} })}

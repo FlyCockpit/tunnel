@@ -248,7 +248,122 @@ fn InvitePage() -> impl IntoView {
     }
 }
 
+/// Admins' switch between their own tunnels or machines and everyone's.
+#[component]
+fn ShowAll<F>(all: RwSignal<bool>, what: &'static str, on_change: F) -> impl IntoView
+where
+    F: Fn() + Copy + 'static,
+{
+    let hint = format!("Lists every user's {what}, not only yours. Only admins have this option.");
+    let hint_id = format!("show-all-{what}");
+    let title = hint.clone();
+    view! {
+        <label class="check" title=title>
+            <input
+                type="checkbox"
+                aria-describedby=hint_id.clone()
+                prop:checked=move || all.get()
+                on:change=move |ev| { all.set(event_target_checked(&ev)); on_change(); }
+            />
+            "Show all users"
+            <span id=hint_id class="sr-only">{hint}</span>
+        </label>
+    }
+}
+
 // ------------------------------------------------------------------ tunnels
+
+/// Label and lifetime of the links the Open button mints, and the server's
+/// shortest link lifetime (`MIN_LINK_TTL_S`).
+const OPEN_LABEL: &str = "Opened from the dashboard";
+const OPEN_TTL_S: i64 = 60;
+const MIN_LINK_TTL_S: i64 = 30;
+
+/// Open `port`'s preview in a new tab. Previews live on other hosts and the UI
+/// session never reaches them, so this mints a single-use link that expires in
+/// a minute (or with the tunnel, if sooner) and sends the tab through it. The tab is opened during the click
+/// (so pop-up blockers allow it), cut off from this page (`opener` is cleared;
+/// the page sends no referrer), and navigated with `replace`, so the link is
+/// not left in its back history.
+fn open_preview(tunnel: String, port: u16, expires_at: i64, error: RwSignal<Option<String>>) {
+    // A link cannot outlive its tunnel; leave a few seconds for clock skew.
+    let ttl = OPEN_TTL_S.min(expires_at - (js_sys::Date::now() / 1000.0) as i64 - 5);
+    if ttl < MIN_LINK_TTL_S {
+        error.set(Some("This tunnel ends in less than a minute; it can no longer be opened.".into()));
+        return;
+    }
+    let Some(window) = web_sys::window() else { return };
+    let tab = match window.open_with_url_and_target("about:blank", "_blank") {
+        Ok(Some(tab)) => tab,
+        _ => {
+            error.set(Some(
+                "The browser blocked the new tab. Allow pop-ups for this site, or make a link under Links.".into(),
+            ));
+            return;
+        }
+    };
+    let _ = tab.set_opener(&wasm_bindgen::JsValue::NULL);
+    error.set(None);
+    spawn_local(async move {
+        let body = json!({ "port": port, "ttl_s": ttl, "single_use": true, "label": OPEN_LABEL });
+        let url = api::post::<Value>(&format!("/ui/api/tunnels/{tunnel}/links"), &body)
+            .await
+            .map(|v| v["url"].as_str().map(str::to_string));
+        match url {
+            Ok(Some(url)) => {
+                let _ = tab.location().replace(&url);
+            }
+            Ok(None) => {
+                let _ = tab.close();
+                error.set(Some("The server did not return a link.".into()));
+            }
+            Err(e) => {
+                let _ = tab.close();
+                if e.status == 401 && e.code == "signed_out" {
+                    refresh_session().await;
+                }
+                error.set(Some(err_text(&e)));
+            }
+        }
+    });
+}
+
+/// One Open button per port of the tunnel: enabled while that port is connected.
+fn open_buttons(t: &Tunnel, error: RwSignal<Option<String>>) -> AnyView {
+    if t.ports.is_empty() {
+        let hint = "Not connected: start sharing on its machine to open it";
+        return view! {
+            <span title=hint><button class="btn btn-outline btn-sm" disabled=true aria-label=hint>"Open"</button></span>" "
+        }
+        .into_any();
+    }
+    let several = t.ports.len() > 1;
+    t.ports
+        .iter()
+        .map(|p| {
+            let (id, port, expires_at) = (t.id.clone(), p.port, t.expires_at);
+            let text = if several { format!("Open {port}") } else { "Open".to_string() };
+            let live = t.connected && p.connected;
+            let hint = if live {
+                format!("Open port {port} in a new tab, signed in with a one-time link")
+            } else {
+                format!("Port {port} is not connected: start the app and the tunnel on its machine")
+            };
+            let title = hint.clone();
+            view! {
+                <span title=title>
+                    <button
+                        class="btn btn-outline btn-sm"
+                        disabled=!live
+                        aria-label=hint
+                        on:click=move |_| open_preview(id.clone(), port, expires_at, error)
+                    >{text}</button>
+                </span>" "
+            }
+        })
+        .collect_view()
+        .into_any()
+}
 
 #[component]
 fn Tunnels(admin: bool) -> impl IntoView {
@@ -281,12 +396,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
                     <h1>"Tunnels"</h1>
                     <p class="muted">"Live tunnels from your machines. Share them with access links; links work once unless you make them reusable."</p>
                 </div>
-                {admin.then(|| view! {
-                    <label class="check">
-                        <input type="checkbox" prop:checked=move || all.get() on:change=move |ev| { all.set(event_target_checked(&ev)); load(); } />
-                        "Everyone's"
-                    </label>
-                })}
+                {admin.then(|| view! { <ShowAll all=all what="tunnels" on_change=load /> })}
                 <button class="btn btn-outline" on:click=move |_| load()>"Refresh"</button>
             </div>
             <ErrorBox error=error />
@@ -335,6 +445,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                             </td>
                                             <td title=when(t.expires_at)>{relative(t.expires_at)}</td>
                                             <td class="actions">
+                                                {open_buttons(&t, error)}
                                                 <button class="btn btn-outline btn-sm" on:click=move |_| {
                                                     let cur = open.get();
                                                     open.set(if cur.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) });
@@ -448,7 +559,10 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
                                     (false, _) => "reusable",
                                 };
                                 view! { <tr>
-                                    <td class="mono">{l.id.clone()}</td>
+                                    <td>
+                                        <span class="mono">{l.id.clone()}</span>
+                                        {l.label.clone().map(|x| view! { <div class="muted small">{x}</div> })}
+                                    </td>
                                     <td>{state}</td>
                                     <td>{relative(l.created_at)}</td>
                                     <td>{relative(l.expires_at)}</td>
@@ -537,12 +651,7 @@ fn Machines(admin: bool) -> impl IntoView {
                     <h1>"Machines"</h1>
                     <p class="muted">"Computers signed in with the tunnel CLI. Renaming one keeps its login and tunnels; removing one stops its login and closes its tunnels."</p>
                 </div>
-                {admin.then(|| view! {
-                    <label class="check">
-                        <input type="checkbox" prop:checked=move || all.get() on:change=move |ev| { all.set(event_target_checked(&ev)); load(); } />
-                        "Everyone's"
-                    </label>
-                })}
+                {admin.then(|| view! { <ShowAll all=all what="machines" on_change=load /> })}
             </div>
             <ErrorBox error=error />
             <div class="grid2">
