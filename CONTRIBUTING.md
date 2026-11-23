@@ -91,12 +91,15 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo +1.89 check --workspace --all-targets --locked
 cargo deny check
+(cd crates/web && cargo deny check)
 ```
 
 CI checks formatting, Clippy, the minimum supported Rust version, tests on Linux
 and macOS, and dependency licenses, bans and sources. Advisory checks run weekly
-and on manual dispatch. Tests should use local fixtures and fake providers;
-do not require production credentials or infrastructure.
+and on manual dispatch. Both cover the root workspace and the web UI in
+`crates/web`, which is its own workspace with its own `deny.toml`. Tests should
+use local fixtures and fake providers; do not require production credentials or
+infrastructure.
 
 ## Pull requests
 

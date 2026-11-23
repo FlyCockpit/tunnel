@@ -1,6 +1,7 @@
-# cargo-deny policy for the web UI (its own workspace): the server's policy
-# plus two permissive licenses its dependency tree needs: CC0-1.0 (base16,
-# via leptos' wasm_split macros) and BSL-1.0 (xxhash-rust, via server_fn).
+# cargo-deny policy for the web UI (its own workspace): the server's policy,
+# with the licenses narrowed to those its dependency tree needs, including
+# CC0-1.0 (base16, via leptos' wasm_split macros) and BSL-1.0 (xxhash-rust,
+# via server_fn).
 [graph]
 all-features = true
 targets = ["wasm32-unknown-unknown"]
@@ -8,6 +9,11 @@ targets = ["wasm32-unknown-unknown"]
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # leptos 0.8 pulls paste in directly and through either_of, reactive_graph,
+    # reactive_stores and tachys.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained (no vulnerability); leptos pulls it in, with no fixed version available. Remove when leptos drops paste." },
+]
 
 [licenses]
 version = 2
@@ -15,8 +21,6 @@ confidence-threshold = 0.8
 allow = [
     "MIT",
     "Apache-2.0",
-    "ISC",
-    "BSD-3-Clause",
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
