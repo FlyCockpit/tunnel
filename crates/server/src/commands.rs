@@ -237,17 +237,8 @@ fn check_backup(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("opening {}", path.display()))?;
     let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).context("reading backup schema version")?;
     anyhow::ensure!(
-        version != 0,
-        "this backup was written by a pre-1.0.0 build (schema version 0) and cannot be restored"
-    );
-    anyhow::ensure!(
-        version <= crate::db::SCHEMA_VERSION,
-        "this backup is newer than this binary (schema version {version}; expected {})",
-        crate::db::SCHEMA_VERSION
-    );
-    anyhow::ensure!(
         version == crate::db::SCHEMA_VERSION,
-        "unsupported backup schema version {version}; expected {}",
+        "unsupported backup schema version {version}; this build needs schema version {}",
         crate::db::SCHEMA_VERSION
     );
     let integrity: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).context("integrity check")?;
@@ -909,11 +900,18 @@ mod tests {
         for table in REQUIRED_TABLES {
             db.execute_batch(&format!("CREATE TABLE {table} (id INTEGER)")).unwrap();
         }
-        assert!(check_backup(&path).unwrap_err().to_string().contains("pre-1.0.0"));
-        db.pragma_update(None, "user_version", 1).unwrap();
+        for version in [0, crate::db::SCHEMA_VERSION + 1] {
+            db.pragma_update(None, "user_version", version).unwrap();
+            assert_eq!(
+                check_backup(&path).unwrap_err().to_string(),
+                format!(
+                    "unsupported backup schema version {version}; this build needs schema version {}",
+                    crate::db::SCHEMA_VERSION
+                )
+            );
+        }
+        db.pragma_update(None, "user_version", crate::db::SCHEMA_VERSION).unwrap();
         check_backup(&path).unwrap();
-        db.pragma_update(None, "user_version", crate::db::SCHEMA_VERSION + 1).unwrap();
-        assert!(check_backup(&path).unwrap_err().to_string().contains("newer than this binary"));
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }

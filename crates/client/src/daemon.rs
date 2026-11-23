@@ -731,20 +731,9 @@ mod tests {
     #[tokio::test]
     async fn conditional_stop_and_unexpose_check_the_tunnel_and_block_retargeting() {
         let token = format!("{}test", tunnel_protocol::TUNNEL_TOKEN_PREFIX);
-        let daemon = Daemon::new(
-            Paths {
-                dir: PathBuf::new(),
-                socket: PathBuf::new(),
-                state_file: PathBuf::new(),
-                log_file: PathBuf::new(),
-                lock_file: PathBuf::new(),
-            },
-            PathBuf::new(),
-            String::new(),
-            0,
-            false,
-            Persisted { token: token.clone(), ports: vec![3000, 5173], ..Persisted::default() },
-        );
+        let fixture = Fixture::new(vec![3000, 5173]);
+        fixture.daemon.lock().persisted.token = token.clone();
+        let daemon = &fixture.daemon;
         let expect =
             |id: &str, token: Option<&str>| Some(Expect { tunnel_id: id.into(), token: token.map(str::to_string) });
         // Before Welcome only the token identifies the tunnel.
@@ -755,6 +744,8 @@ mod tests {
         let r = daemon.handle(Request::Unexpose { port: 3000, expect: expect("shared", Some(&token)) }).await;
         assert!(matches!(r, Response::Status { .. }));
         assert_eq!(daemon.ports(), vec![5173]);
+        let saved = Persisted::load_strict(&fixture.dir.join("state.json")).unwrap().unwrap();
+        assert_eq!(saved.ports, vec![5173], "the state is written inside the test directory");
         // After Welcome, the id decides.
         daemon.lock().persisted.tunnel_id = Some("shared".into());
         assert!(err(daemon.handle(Request::Stop { expect: expect("other", Some(&token)) }).await));

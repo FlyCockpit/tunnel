@@ -15,7 +15,7 @@ use crate::tokens::now;
 pub const SCHEMA_VERSION: i32 = 1;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS tunnels (
+CREATE TABLE tunnels (
     id           TEXT PRIMARY KEY,
     token_hash   TEXT NOT NULL UNIQUE,
     label        TEXT,
@@ -37,15 +37,15 @@ CREATE TABLE IF NOT EXISTS tunnels (
     bytes_in     INTEGER NOT NULL DEFAULT 0,
     bytes_out    INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS tunnels_expires_at ON tunnels(expires_at);
-CREATE INDEX IF NOT EXISTS tunnels_client ON tunnels(client_id, expires_at);
-CREATE INDEX IF NOT EXISTS tunnels_client_id ON tunnels(client_id, id);
-CREATE TABLE IF NOT EXISTS tombstones (
+CREATE INDEX tunnels_expires_at ON tunnels(expires_at);
+CREATE INDEX tunnels_client ON tunnels(client_id, expires_at);
+CREATE INDEX tunnels_client_id ON tunnels(client_id, id);
+CREATE TABLE tombstones (
     id         TEXT PRIMARY KEY,
     deleted_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS tombstones_deleted_at ON tombstones(deleted_at);
-CREATE TABLE IF NOT EXISTS access_links (
+CREATE INDEX tombstones_deleted_at ON tombstones(deleted_at);
+CREATE TABLE access_links (
     id            TEXT PRIMARY KEY,
     tunnel_id     TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
     token_hash    TEXT NOT NULL UNIQUE,
@@ -56,23 +56,23 @@ CREATE TABLE IF NOT EXISTS access_links (
     created_at    INTEGER NOT NULL,
     expires_at    INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS access_links_tunnel ON access_links(tunnel_id);
-CREATE TABLE IF NOT EXISTS gate_sessions (
+CREATE INDEX access_links_tunnel ON access_links(tunnel_id);
+CREATE TABLE gate_sessions (
     id_hash    TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS gate_grants (
+CREATE TABLE gate_grants (
     session_hash TEXT NOT NULL REFERENCES gate_sessions(id_hash) ON DELETE CASCADE,
     tunnel_id    TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
     expires_at   INTEGER NOT NULL,
     PRIMARY KEY (session_hash, tunnel_id)
 );
-CREATE INDEX IF NOT EXISTS gate_grants_tunnel ON gate_grants(tunnel_id);
+CREATE INDEX gate_grants_tunnel ON gate_grants(tunnel_id);
 -- Every link a grant came from, so revoking any of them revokes the grant.
 -- Deleting a link cascades here only; the grant itself is removed explicitly
 -- by revocation, never by routine link expiry.
-CREATE TABLE IF NOT EXISTS gate_grant_links (
+CREATE TABLE gate_grant_links (
     session_hash TEXT NOT NULL,
     tunnel_id    TEXT NOT NULL,
     link_id      TEXT NOT NULL REFERENCES access_links(id) ON DELETE CASCADE,
@@ -81,10 +81,10 @@ CREATE TABLE IF NOT EXISTS gate_grant_links (
     PRIMARY KEY (session_hash, tunnel_id, link_id),
     FOREIGN KEY (session_hash, tunnel_id) REFERENCES gate_grants(session_hash, tunnel_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS gate_grant_links_link ON gate_grant_links(link_id);
+CREATE INDEX gate_grant_links_link ON gate_grant_links(link_id);
 -- Grants that came from a password login, so changing the password (or
 -- leaving password mode) revokes exactly those.
-CREATE TABLE IF NOT EXISTS gate_grant_logins (
+CREATE TABLE gate_grant_logins (
     session_hash TEXT NOT NULL,
     tunnel_id    TEXT NOT NULL,
     expires_at   INTEGER NOT NULL,
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS gate_grant_logins (
 );
 -- Machines enrolled with `client add` + `tunnel login`, or approved in the
 -- browser (`tunnel login <url>`). Each belongs to a user.
-CREATE TABLE IF NOT EXISTS clients (
+CREATE TABLE clients (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     token_hash   TEXT UNIQUE,
@@ -101,10 +101,10 @@ CREATE TABLE IF NOT EXISTS clients (
     last_used_at INTEGER,
     user_id      TEXT NOT NULL REFERENCES users(id)
 );
-CREATE INDEX IF NOT EXISTS clients_user ON clients(user_id);
+CREATE INDEX clients_user ON clients(user_id);
 -- People who sign in to the web UI. Exactly one owner (setup); admins manage
 -- users and see everything; members manage only their own machines.
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE users (
     id                 TEXT PRIMARY KEY,
     username           TEXT NOT NULL UNIQUE,
     password_hash      TEXT NOT NULL,
@@ -128,8 +128,8 @@ CREATE TABLE IF NOT EXISTS users (
     factor_failures    INTEGER NOT NULL DEFAULT 0,
     factor_locked_until INTEGER
 );
-CREATE UNIQUE INDEX IF NOT EXISTS users_one_owner ON users(role) WHERE role = 'owner';
-CREATE TABLE IF NOT EXISTS recovery_codes (
+CREATE UNIQUE INDEX users_one_owner ON users(role) WHERE role = 'owner';
+CREATE TABLE recovery_codes (
     user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     code_hash TEXT NOT NULL,
     used_at   INTEGER,
@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS recovery_codes (
 );
 -- Single-use sign-up links: `invite` (role admin or member), and the owner's
 -- `owner_setup` / `owner_reset` from `tunnel-server admin link`.
-CREATE TABLE IF NOT EXISTS invites (
+CREATE TABLE invites (
     id         TEXT PRIMARY KEY,
     token_hash TEXT NOT NULL UNIQUE,
     kind       TEXT NOT NULL CHECK (kind IN ('invite', 'owner_setup', 'owner_reset')),
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 -- Web UI sessions (`__Host-tunnel-ui` cookie; only the hash is stored).
 -- `pending` sessions have passed the password and wait for the TOTP code.
-CREATE TABLE IF NOT EXISTS ui_sessions (
+CREATE TABLE ui_sessions (
     id_hash      TEXT PRIMARY KEY,
     user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     pending      INTEGER NOT NULL,
@@ -164,9 +164,9 @@ CREATE TABLE IF NOT EXISTS ui_sessions (
     ip           TEXT,
     user_agent   TEXT
 );
-CREATE INDEX IF NOT EXISTS ui_sessions_user ON ui_sessions(user_id);
+CREATE INDEX ui_sessions_user ON ui_sessions(user_id);
 -- Browser-approved machine logins (RFC 8628 device flow).
-CREATE TABLE IF NOT EXISTS device_logins (
+CREATE TABLE device_logins (
     device_code_hash TEXT PRIMARY KEY,
     user_code        TEXT NOT NULL UNIQUE,
     client_name      TEXT NOT NULL,
@@ -179,14 +179,14 @@ CREATE TABLE IF NOT EXISTS device_logins (
     user_id          TEXT REFERENCES users(id) ON DELETE CASCADE
 );
 -- Traffic per user and calendar month (UTC, `YYYYMM`), from their machines' tunnels.
-CREATE TABLE IF NOT EXISTS traffic (
+CREATE TABLE traffic (
     user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     month     INTEGER NOT NULL,
     bytes_in  INTEGER NOT NULL DEFAULT 0,
     bytes_out INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, month)
 );
-CREATE TABLE IF NOT EXISTS audit (
+CREATE TABLE audit (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      INTEGER NOT NULL,
     user_id TEXT,
@@ -194,10 +194,10 @@ CREATE TABLE IF NOT EXISTS audit (
     target  TEXT,
     ip      TEXT
 );
-CREATE INDEX IF NOT EXISTS audit_at ON audit(at);
+CREATE INDEX audit_at ON audit(at);
 -- Service credentials (`service add`): API-only callers such as a sandbox
 -- platform. They manage only their own tunnels, within `max_tunnels`.
-CREATE TABLE IF NOT EXISTS services (
+CREATE TABLE services (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     token_hash   TEXT NOT NULL UNIQUE,
@@ -206,7 +206,7 @@ CREATE TABLE IF NOT EXISTS services (
     last_used_at INTEGER
 );
 -- One-time enrollment codes; only the hash is stored.
-CREATE TABLE IF NOT EXISTS client_enrollments (
+CREATE TABLE client_enrollments (
     code_hash  TEXT PRIMARY KEY,
     client_id  TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL,
@@ -496,6 +496,23 @@ pub struct PurgeStats {
     pub grants: usize,
 }
 
+/// Switch to WAL. SQLite does not wait on the busy handler for this switch,
+/// so it fails with `SQLITE_BUSY` while another connection opening the same
+/// new file holds a lock; retry for up to 5 seconds.
+fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -507,56 +524,22 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                let tables: i64 =
-                    tx.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'", [], |r| r.get(0))?;
-                anyhow::ensure!(tables == 0, "database written by a pre-1.0.0 build; not supported");
-            }
-            SCHEMA_VERSION => {}
-            v if v > SCHEMA_VERSION => {
-                anyhow::bail!("database has a newer schema ({v}); supported schema is {SCHEMA_VERSION}")
-            }
-            v => anyhow::bail!("unsupported database schema version {v}"),
+        let objects: i64 = tx.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |r| r.get(0))?;
+        if objects == 0 {
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else {
+            let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            anyhow::ensure!(
+                version == SCHEMA_VERSION,
+                "unsupported database schema version {version}; this build needs schema version {SCHEMA_VERSION}"
+            );
         }
-        // `CREATE TABLE IF NOT EXISTS` leaves a table from an earlier
-        // prerelease build as it was; refuse one that lacks columns this
-        // build needs, with a message, rather than failing on a query.
-        let clients_table: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'clients')",
-            [],
-            |r| r.get(0),
-        )?;
-        let has_owner: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('clients') WHERE name = 'user_id')",
-            [],
-            |r| r.get(0),
-        )?;
-        anyhow::ensure!(
-            !clients_table || has_owner,
-            "database predates user accounts (`clients.user_id` is missing); see 'Databases from prerelease builds' in the README for the one-time upgrade"
-        );
-        let lacks = |table: &str, column: &str| -> rusqlite::Result<bool> {
-            tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)
-                    AND NOT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                params![table, column],
-                |r| r.get(0),
-            )
-        };
-        anyhow::ensure!(
-            !lacks("tunnels", "bytes_in")? && !lacks("tunnels", "bytes_out")? && !lacks("users", "traffic_cap")?,
-            "database predates traffic counters (`tunnels.bytes_in`, `tunnels.bytes_out` or `users.traffic_cap` \
-             is missing); see 'Databases from prerelease builds' in the README for the one-time upgrade"
-        );
-        tx.execute_batch(SCHEMA)?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
@@ -2130,55 +2113,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_clients_table_without_owners_is_refused() {
-        let (db, path) = temp_db();
-        {
-            let conn = db.conn.lock().unwrap();
-            // A prerelease database from before user accounts.
-            conn.execute_batch("DROP TABLE client_enrollments; DROP TABLE clients; CREATE TABLE clients (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_hash TEXT UNIQUE, created_at INTEGER NOT NULL, last_used_at INTEGER);").unwrap();
-        }
-        drop(db);
-        let err = Db::open(&path).err().expect("refused");
-        assert!(format!("{err:#}").contains("clients.user_id"), "{err:#}");
-        assert!(format!("{err:#}").contains("'Databases from prerelease builds' in the README"), "{err:#}");
-        // The README's one-time upgrade makes it usable again.
-        Connection::open(&path).unwrap().execute_batch(&readme_upgrade("clients", "user_id")).unwrap();
-        Db::open(&path).unwrap();
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    #[test]
-    fn existing_schema_gains_services_table_and_keeps_data() {
-        let (db, path) = temp_db();
-        {
-            let conn = db.conn.lock().unwrap();
-            // A database written before service credentials existed.
-            conn.execute_batch("DROP TABLE services").unwrap();
-            conn.execute(
-                "INSERT INTO clients (id, name, token_hash, created_at, user_id) VALUES ('c1', 'laptop', 'h', 1, 'utest')",
-                [],
-            )
-                .unwrap();
-        }
-        drop(db);
-        let reopened = Db::open(&path).unwrap();
-        {
-            let conn = reopened.conn.lock().unwrap();
-            let services: i64 = conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0)).unwrap();
-            assert_eq!(services, 0);
-            let name: String =
-                conn.query_row("SELECT name FROM clients WHERE token_hash = 'h'", [], |r| r.get(0)).unwrap();
-            assert_eq!(name, "laptop");
-        }
-        drop(reopened);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
     #[tokio::test]
     async fn tunnel_token_rotates_only_while_unexpired() {
         let (db, path) = temp_db();
@@ -2299,102 +2233,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_and_newer_schemas() {
-        let path = std::env::temp_dir()
-            .join("tunnel-db-tests")
-            .join(format!("legacy-{}.db", crate::tokens::random_tunnel_id()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        {
-            let c = Connection::open(&path).unwrap();
-            c.execute_batch("CREATE TABLE tunnels (id TEXT PRIMARY KEY)").unwrap();
-        }
-        assert!(
-            Db::open(&path).err().unwrap().to_string().contains("database written by a pre-1.0.0 build; not supported")
-        );
-        {
-            let c = Connection::open(&path).unwrap();
-            c.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
-        }
-        assert!(Db::open(&path).err().unwrap().to_string().contains("newer schema"));
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    /// The README's one-time upgrade statement for `table.column`.
-    fn readme_upgrade(table: &str, column: &str) -> String {
-        let readme = include_str!("../../../README.md");
-        let section = &readme[readme.find("\n#### Databases from prerelease builds\n").expect("README section")..];
-        let start = section.find(&format!("`ALTER TABLE {table} ADD COLUMN {column} ")).expect("README statement") + 1;
-        let len = section[start..].find(';').expect("statement end") + 1;
-        section[start..start + len].to_string()
-    }
-
-    #[test]
-    fn the_readme_upgrades_give_the_columns_a_fresh_database_has() {
-        // (type, notnull, default, referenced table) of `table.column`.
-        fn column_def(c: &Connection, table: &str, column: &str) -> (String, bool, Option<String>, Option<String>) {
-            let (ty, notnull, default) = c
-                .query_row(
-                    "SELECT type, [notnull], dflt_value FROM pragma_table_info(?1) WHERE name = ?2",
-                    params![table, column],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .unwrap();
-            let refs = c
-                .query_row(
-                    "SELECT \"table\" FROM pragma_foreign_key_list(?1) WHERE \"from\" = ?2",
-                    params![table, column],
-                    |r| r.get(0),
-                )
-                .optional()
-                .unwrap();
-            (ty, notnull, default, refs)
-        }
-        let (db, path) = temp_db();
-        for (table, column) in
-            [("clients", "user_id"), ("tunnels", "bytes_in"), ("tunnels", "bytes_out"), ("users", "traffic_cap")]
-        {
-            let mut fresh = column_def(&db.conn.lock().unwrap(), table, column);
-            if column == "user_id" {
-                // SQLite cannot add a NOT NULL column without a default: an
-                // upgraded `clients.user_id` stays nullable, filled by the UPDATE.
-                assert!(fresh.1);
-                fresh.1 = false;
+    fn concurrent_first_opens_of_a_new_file_all_succeed() {
+        let dir = std::env::temp_dir().join("tunnel-db-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        for _ in 0..20 {
+            let path = dir.join(format!("first-open-{}.db", crate::tokens::random_tunnel_id()));
+            let start = Arc::new(std::sync::Barrier::new(8));
+            let opens: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, start) = (path.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        Db::open(&path).map(drop).map_err(|e| format!("{e:#}"))
+                    })
+                })
+                .collect();
+            for open in opens {
+                open.join().unwrap().unwrap();
             }
-            // A table from before the column, with a row in it, upgraded as the README says.
-            let old = Connection::open_in_memory().unwrap();
-            old.execute_batch(&format!(
-                "CREATE TABLE {table} (id TEXT PRIMARY KEY); INSERT INTO {table} VALUES ('x');"
-            ))
-            .unwrap();
-            old.execute_batch(&readme_upgrade(table, column)).unwrap();
-            assert_eq!(column_def(&old, table, column), fresh, "{table}.{column}");
-        }
-        drop(db);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    #[test]
-    fn refuses_a_database_from_before_traffic_counters_until_upgraded() {
-        for (table, column) in [("tunnels", "bytes_in"), ("tunnels", "bytes_out"), ("users", "traffic_cap")] {
-            let (db, path) = temp_db();
-            drop(db);
-            {
-                let c = Connection::open(&path).unwrap();
-                c.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}")).unwrap();
-            }
-            let err = Db::open(&path).err().unwrap().to_string();
-            assert!(err.contains("predates traffic counters"), "{table}.{column}: {err}");
-            assert!(err.contains("'Databases from prerelease builds' in the README"), "{err}");
-            // The one-time upgrade from the README makes it usable again.
-            Connection::open(&path).unwrap().execute_batch(&readme_upgrade(table, column)).unwrap();
-            assert!(Db::open(&path).is_ok(), "{table}.{column}");
+            let c = Connection::open(&path).unwrap();
+            assert_eq!(c.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0)).unwrap(), SCHEMA_VERSION);
+            drop(c);
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
             }
+        }
+    }
+
+    #[test]
+    fn refuses_a_database_with_another_schema_version_and_adds_nothing() {
+        let path = std::env::temp_dir()
+            .join("tunnel-db-tests")
+            .join(format!("other-version-{}.db", crate::tokens::random_tunnel_id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        Connection::open(&path).unwrap().execute_batch("CREATE TABLE tunnels (id TEXT PRIMARY KEY)").unwrap();
+        let schema = |c: &Connection| -> Vec<String> {
+            let mut q = c.prepare("SELECT name FROM sqlite_schema ORDER BY name").unwrap();
+            q.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        let before = schema(&Connection::open(&path).unwrap());
+        for version in [0, SCHEMA_VERSION + 1] {
+            Connection::open(&path).unwrap().pragma_update(None, "user_version", version).unwrap();
+            let err = Db::open(&path).err().expect("refused").to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "unsupported database schema version {version}; this build needs schema version {SCHEMA_VERSION}"
+                )
+            );
+            let c = Connection::open(&path).unwrap();
+            assert_eq!(schema(&c), before, "a refused database gains nothing");
+            assert_eq!(c.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0)).unwrap(), version);
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 }
