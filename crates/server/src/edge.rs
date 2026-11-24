@@ -303,7 +303,7 @@ async fn forward_live(
     };
     // After the gate, so only visitors with access learn of it, and refused
     // requests are never counted.
-    let bytes = match crate::traffic::counter(state, tunnel).await {
+    let bytes = match state.traffic.counter(&state.db, tunnel).await {
         Ok(bytes) => bytes,
         // Never relayed uncounted: without the owner's usage, no cap could apply.
         Err(e) => {

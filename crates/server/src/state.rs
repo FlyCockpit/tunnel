@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::future::BoxFuture;
 use tunnel_protocol::CloseReason;
 
 use crate::config::Config;
@@ -123,7 +124,7 @@ pub struct AppState {
     pub registry: Registry,
     pub certs: Arc<CertStore>,
     pub metrics: Metrics,
-    pub traffic: crate::traffic::Traffic,
+    pub traffic: Arc<crate::traffic::Traffic>,
     /// Per-IP limiter for `/__access/*`.
     pub access_limiter: RateLimiter,
     /// Web UI keys and limiters.
@@ -150,7 +151,7 @@ impl AppState {
             registry: Registry::default(),
             certs,
             metrics: Metrics::default(),
-            traffic: crate::traffic::Traffic::default(),
+            traffic: Arc::new(crate::traffic::Traffic::default()),
             access_limiter,
             tunnel_cache: Cache::new(TUNNEL_CACHE_TTL),
             session_cache: Cache::new(SESSION_CACHE_TTL),
@@ -170,7 +171,8 @@ impl AppState {
 
     /// Attach the TURN lifecycle validator before publishing the relay.
     pub fn install_turn(self: &Arc<Self>, relay: Arc<crate::turn_relay::Relay>) {
-        relay.install_state(Arc::downgrade(self));
+        let lookups: std::sync::Weak<dyn crate::turn_relay::TunnelLookups> = Arc::downgrade(self) as _;
+        relay.install_state(lookups);
         let _ = self.turn.set(relay);
     }
 
@@ -281,7 +283,7 @@ impl AppState {
             if let Some(live) = state.registry.remove(&id) {
                 live.close(reason);
             }
-            state.metrics.forget_tunnel(&id);
+            state.traffic.forget_tunnel(&id);
             Ok(outcome)
         })
         .await?
@@ -289,6 +291,16 @@ impl AppState {
 
     pub fn preview_host(&self, port: u16, tunnel_id: &str) -> String {
         self.config.preview_host(port, tunnel_id)
+    }
+}
+
+impl crate::turn_relay::TunnelLookups for AppState {
+    fn cached<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Arc<TunnelLookup>>> {
+        Box::pin(self.tunnel_for_turn(id))
+    }
+
+    fn fresh<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Arc<TunnelLookup>>> {
+        Box::pin(async move { self.db.lookup_tunnel(id.to_owned()).await.map(Arc::new) })
     }
 }
 

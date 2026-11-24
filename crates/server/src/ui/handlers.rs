@@ -300,7 +300,7 @@ async fn session(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Json
         Some((id, s)) if !s.pending => json!({
             "user": user_json(&state, &s.user), "pending": false, "csrf": keys(&state)?.csrf_token(id),
             "owner_exists": owner_exists, "server": server,
-            "traffic": crate::traffic::view(&state, &s.user.id).await?,
+            "traffic": state.traffic.view(&state.db, &s.user.id).await?,
             "usage": usage_json(&state, &s.user.id).await?,
         }),
         Some((_, s)) => {
@@ -1056,7 +1056,7 @@ async fn device_decide(
 async fn list_users(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiResult<Json<Value>> {
     let mut users = state.db.list_users(state.traffic.month()).await?;
     for u in &mut users {
-        u.traffic_bytes = crate::traffic::used_or(&state, &u.user.id, u.traffic_bytes);
+        u.traffic_bytes = state.traffic.used_or(&u.user.id, u.traffic_bytes);
     }
     let users: Vec<Value> = users
         .iter()
@@ -1131,7 +1131,7 @@ async fn update_user(
                 // Always the committed row's cap: a role or limit change by a
                 // concurrent request may have committed just before this one.
                 let cap = defaults.resolve(crate::limits::Kind::Traffic, user.role, user.limits.traffic_bytes);
-                crate::traffic::set_cap(&state, &changes, &user.id, cap).await?;
+                state.traffic.set_cap(&changes, &state.db, &user.id, cap).await?;
                 for t in &update.shortened {
                     state.invalidate_tunnel(t);
                 }
@@ -1188,16 +1188,12 @@ async fn reset_user_traffic(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let actor = s.user().clone();
-    let reset = crate::traffic::reset_month(
-        state.clone(),
-        id.clone(),
-        actor.id.clone(),
-        s.session.id_hash.clone(),
-        s.ctx.ip_string(),
-    )
-    .await?;
+    let reset = state
+        .traffic
+        .reset_month(&state.db, id.clone(), actor.id.clone(), s.session.id_hash.clone(), s.ctx.ip_string())
+        .await?;
     match reset {
-        Ok(_) => Ok(Json(json!({ "traffic": crate::traffic::view(&state, &id).await? }))),
+        Ok(_) => Ok(Json(json!({ "traffic": state.traffic.view(&state.db, &id).await? }))),
         Err(crate::accounts::AdminError::NotFound) => Err(ApiError::not_found("user")),
         Err(crate::accounts::AdminError::Forbidden) => {
             Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you may not change this user"))

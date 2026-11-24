@@ -443,12 +443,12 @@ async fn traffic_follows_the_configured_default_until_set_and_a_role_change_rese
     let users = p.owner.call(&state, "GET", "/ui/api/users", None).await;
     assert_eq!(effective(&users.body, "ann"), json!(5_000_000_000u64));
     assert_eq!(effective(&users.body, "amy"), Value::Null, "admins have no default cap");
-    assert_eq!(crate::traffic::view(&state, &ann).await.unwrap().cap_bytes, Some(5_000_000_000));
+    assert_eq!(state.traffic.view(&state.db, &ann).await.unwrap().cap_bytes, Some(5_000_000_000));
     // Unlimited, then back to the default.
     assert_eq!(set(&state, &mut p.adam, &ann, json!({ "traffic_bytes": "unlimited" })).await.status, StatusCode::OK);
-    assert_eq!(crate::traffic::view(&state, &ann).await.unwrap().cap_bytes, None);
+    assert_eq!(state.traffic.view(&state.db, &ann).await.unwrap().cap_bytes, None);
     assert_eq!(set(&state, &mut p.adam, &ann, json!({ "traffic_bytes": "default" })).await.status, StatusCode::OK);
-    assert_eq!(crate::traffic::view(&state, &ann).await.unwrap().cap_bytes, Some(5_000_000_000));
+    assert_eq!(state.traffic.view(&state.db, &ann).await.unwrap().cap_bytes, Some(5_000_000_000));
     // "Server default" follows the configuration (a restart with a new
     // config): users on it get the new value, explicit numbers stay.
     let bob = p.ids["bob"].clone();
@@ -496,7 +496,7 @@ async fn traffic_follows_the_configured_default_until_set_and_a_role_change_rese
         let view = &r.body["user"]["limits"][kind];
         assert_eq!((view["setting"].clone(), view["effective"].clone()), (json!("default"), value), "{kind}");
     }
-    assert_eq!(crate::traffic::view(&state, &amy).await.unwrap().cap_bytes, Some(5_000_000_000));
+    assert_eq!(state.traffic.view(&state.db, &amy).await.unwrap().cap_bytes, Some(5_000_000_000));
     let entries = audit_targets(&state, &mut p.owner, "limit_set").await;
     for expected in [
         "amy: live tunnels 4 → Server default (10)",
@@ -521,13 +521,13 @@ async fn traffic_follows_the_configured_default_until_set_and_a_role_change_rese
         .unwrap();
     let r = p.adam.call(&state, "PATCH", &format!("/ui/api/users/{ann}"), Some(json!({ "can_public": true }))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(crate::traffic::view(&state, &ann).await.unwrap().cap_bytes, None);
+    assert_eq!(state.traffic.view(&state.db, &ann).await.unwrap().cap_bytes, None);
 
     // A role change on the server default is audited with what it moved.
     let adam = p.ids["adam"].clone();
     let r = p.owner.call(&state, "PATCH", &format!("/ui/api/users/{adam}"), Some(json!({ "role": "member" }))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(crate::traffic::view(&state, &adam).await.unwrap().cap_bytes, Some(5_000_000_000));
+    assert_eq!(state.traffic.view(&state.db, &adam).await.unwrap().cap_bytes, Some(5_000_000_000));
     let entries = audit_targets(&state, &mut p.owner, "limit_set").await;
     for expected in [
         "adam: live tunnels Server default (unlimited) → Server default (10)",
