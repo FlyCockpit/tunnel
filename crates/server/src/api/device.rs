@@ -110,6 +110,7 @@ fn oauth_error(code: &'static str) -> ApiError {
 #[utoipa::path(
     post,
     path = "/v1/device/code",
+    tag = "crate::device",
     security(()),
     request_body = DeviceCodeRequest,
     responses((status = 200, body = DeviceCodeResponse), (status = 404, body = ErrorBody), (status = 422, body = ErrorBody), (status = 429, body = ErrorBody))
@@ -163,6 +164,7 @@ pub async fn device_code(
 #[utoipa::path(
     post,
     path = "/v1/device/token",
+    tag = "crate::device",
     security(()),
     request_body = DeviceTokenRequest,
     responses(

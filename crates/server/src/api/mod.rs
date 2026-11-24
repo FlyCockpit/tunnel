@@ -2375,6 +2375,9 @@ mod tests {
             ("/v1/device/token", vec!["post"]),
         ];
         assert_eq!(doc["paths"].as_object().unwrap().len(), expected.len());
+        for path in ["/v1/device/code", "/v1/device/token"] {
+            assert_eq!(doc["paths"][path]["post"]["tags"], serde_json::json!(["crate::device"]), "{path}");
+        }
         for (path, methods) in expected {
             for method in methods {
                 assert!(doc["paths"][path][method].is_object(), "missing {method} {path}");
