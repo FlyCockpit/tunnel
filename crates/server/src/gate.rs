@@ -361,6 +361,7 @@ pub async fn redeem(
     state: &AppState,
     peer: IpAddr,
     tunnel_id: &str,
+    port: Option<u16>,
     token: &str,
     cookie_values: &[String],
     location: &str,
@@ -374,7 +375,13 @@ pub async fn redeem(
     }
     let outcome = match state
         .db
-        .redeem_access_link(tunnel_id.to_string(), hash_token(token), session_hashes(cookie_values))
+        .redeem_access_link(
+            tunnel_id.to_string(),
+            hash_token(token),
+            session_hashes(cookie_values),
+            port,
+            hash_token(&peer.to_string()),
+        )
         .await
     {
         Ok(o) => o,
@@ -534,6 +541,7 @@ mod tests {
                 id: "abcdefghij".into(),
                 token_hash: "test-placeholder".into(),
                 label: None,
+                name: None,
                 metadata: None,
                 max_ports: 8,
                 host_header: crate::db::HostHeaderMode::Rewrite,
@@ -680,13 +688,17 @@ mod tests {
                 token_hash: "test-link-placeholder".into(),
                 single_use: false,
                 label: None,
+                owner_port: None,
                 session_ttl_s: 60,
                 expires_at: now() + 600,
             })
             .await
             .unwrap();
-        let Redemption::Granted { session_id: linked, .. } =
-            state.db.redeem_access_link("abcdefghij".into(), "test-link-placeholder".into(), vec![]).await.unwrap()
+        let Redemption::Granted { session_id: linked, .. } = state
+            .db
+            .redeem_access_link("abcdefghij".into(), "test-link-placeholder".into(), vec![], None, String::new())
+            .await
+            .unwrap()
         else {
             panic!("expected link grant");
         };

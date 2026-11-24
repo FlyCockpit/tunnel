@@ -231,6 +231,7 @@ pub(crate) mod tests {
     use http::Method;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tunnel_protocol::ACCESS_TOKEN_PREFIX;
 
     const ID: &str = "abcdefghij";
     const PREVIEW: &str = "3000-abcdefghij.previews.example.com";
@@ -269,6 +270,7 @@ zone = "example.com"
                     id: ID.into(),
                     token_hash: "unused-tunnel-hash".into(),
                     label: None,
+                    name: None,
                     metadata: None,
                     max_ports: 8,
                     host_header: HostHeaderMode::Rewrite,
@@ -295,6 +297,18 @@ zone = "example.com"
         method: Method,
         extra: &[(&str, &str)],
     ) -> Response<Body> {
+        request_from(state, "127.0.0.1:1234".parse().unwrap(), host, path, method, extra).await
+    }
+
+    /// [`request`] from the visitor address `peer`.
+    pub(crate) async fn request_from(
+        state: &Arc<AppState>,
+        peer: SocketAddr,
+        host: &str,
+        path: &str,
+        method: Method,
+        extra: &[(&str, &str)],
+    ) -> Response<Body> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let service_state = state.clone();
         tokio::spawn(async move {
@@ -302,7 +316,7 @@ zone = "example.com"
                 let state = service_state.clone();
                 // Hosts is cheap test routing data; production uses Arc.
                 let hosts = Hosts::new(&state);
-                async move { Ok::<_, Infallible>(route(state, &hosts, "127.0.0.1:1234".parse().unwrap(), req).await) }
+                async move { Ok::<_, Infallible>(route(state, &hosts, peer, req).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), svc).await;
         });
@@ -651,13 +665,17 @@ zone = "example.com"
                 token_hash: format!("{link}-placeholder"),
                 single_use: false,
                 label: None,
+                owner_port: None,
                 session_ttl_s: 3600,
                 expires_at: crate::tokens::now() + 3600,
             })
             .await
             .unwrap();
-        let crate::db::Redemption::Granted { session_id, .. } =
-            state.db.redeem_access_link(ID.into(), format!("{link}-placeholder"), vec![]).await.unwrap()
+        let crate::db::Redemption::Granted { session_id, .. } = state
+            .db
+            .redeem_access_link(ID.into(), format!("{link}-placeholder"), vec![], None, String::new())
+            .await
+            .unwrap()
         else {
             panic!("test link denied")
         };
@@ -1249,5 +1267,154 @@ zone = "example.com"
             }
             assert_eq!(received.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// An owner link (the dashboard's Open on your own tunnel) for port 3000.
+    async fn owner_link(state: &AppState, token: &str) -> String {
+        state
+            .db
+            .create_access_link(crate::db::NewAccessLink {
+                id: "al_owner".into(),
+                tunnel_id: ID.into(),
+                token_hash: crate::tokens::hash_token(token),
+                single_use: true,
+                label: Some("Opened from the dashboard".into()),
+                owner_port: Some(3000),
+                session_ttl_s: 3600,
+                expires_at: crate::tokens::now() + 60,
+            })
+            .await
+            .unwrap();
+        format!("/__access/3000-{ID}/{token}")
+    }
+
+    /// Regression (owner 11-23: Open still asked for the password). The
+    /// browser sent the one-time Open URL twice, 47 ms apart; the second
+    /// request found the link used and answered the password form, which is
+    /// what the tab showed. A repeat from the same address within seconds now
+    /// signs in again; anyone else, or later, still gets the normal prompt.
+    #[tokio::test]
+    async fn an_owner_link_repeated_by_the_browser_still_lands_on_the_app() {
+        let zone = "previews.example.com";
+        let document = [("sec-fetch-dest", "document")];
+        let owner_ip: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        let other_ip: SocketAddr = "198.51.100.9:40000".parse().unwrap();
+        for mode in [AccessMode::Password, AccessMode::Link] {
+            let state = test_state(&[]);
+            create_tunnel(&state, mode).await;
+            let (_session, _, received) = sandbox(&state).await;
+            let token = format!("{ACCESS_TOKEN_PREFIX}owner-open-token");
+            let path = owner_link(&state, &token).await;
+
+            // A HEAD (a link checker) neither signs in nor uses the link up.
+            let head = request_from(&state, owner_ip, zone, &path, Method::HEAD, &[]).await;
+            assert_eq!(head.status(), StatusCode::NOT_FOUND, "{mode:?}");
+            assert!(!head.headers().contains_key(header::SET_COOKIE));
+
+            // The click, then the browser's repeat a moment later (new connection, same address):
+            // both land on the app with a session of their own.
+            for attempt in ["first", "repeat"] {
+                let r = request_from(&state, owner_ip, zone, &path, Method::GET, &document).await;
+                assert_eq!(r.status(), StatusCode::FOUND, "{mode:?} {attempt}");
+                assert_eq!(r.headers()[header::LOCATION], format!("https://{PREVIEW}/"));
+                let cookie = r.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+                assert!(cookie.contains("Domain=previews.example.com"), "{cookie}");
+                let pair = cookie.split(';').next().unwrap().to_string();
+                let app = request(&state, PREVIEW, "/", Method::GET, &[("cookie", pair.as_str()), document[0]]).await;
+                assert_eq!(app.status(), StatusCode::OK, "{mode:?} {attempt}");
+            }
+            assert_eq!(received.load(Ordering::SeqCst), 2);
+
+            // Someone else with the URL: the tunnel's normal prompt, no session.
+            let r = request_from(&state, other_ip, zone, &path, Method::GET, &document).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{mode:?}");
+            assert!(!r.headers().contains_key(header::SET_COOKIE));
+
+            // The same address after the repeat window: refused too.
+            state
+                .db
+                .call(|c| {
+                    c.execute("UPDATE access_links SET used_at = used_at - ?1", [crate::db::OWNER_LINK_RETRY_S + 1])?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let r = request_from(&state, owner_ip, zone, &path, Method::GET, &document).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{mode:?}");
+            let body = body_text(r).await;
+            if matches!(mode, AccessMode::Password) {
+                assert!(body.contains(r#"action="/__login""#), "{body}");
+            }
+            assert_eq!(received.load(Ordering::SeqCst), 2, "the origin is not asked");
+        }
+    }
+
+    /// An owner link opens only the port it was made for.
+    #[tokio::test]
+    async fn an_owner_link_is_bound_to_its_port() {
+        let zone = "previews.example.com";
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Password).await;
+        let (_session, _, _) = sandbox(&state).await;
+        let token = format!("{ACCESS_TOKEN_PREFIX}owner-port-token");
+        owner_link(&state, &token).await;
+        // Another port, no port, or another tunnel: refused.
+        for path in [
+            format!("/__access/3001-{ID}/{token}"),
+            format!("/__access/{ID}/{token}"),
+            format!("/__access/3000-bcdefghijk/{token}"),
+        ] {
+            let r = request(&state, zone, &path, Method::GET, &[]).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert!(!r.headers().contains_key(header::SET_COOKIE), "{path}");
+        }
+        // Not used up by the wrong-port attempts.
+        let r = request(&state, zone, &format!("/__access/3000-{ID}/{token}"), Method::GET, &[]).await;
+        assert_eq!(r.status(), StatusCode::FOUND);
+
+        // An expired owner link is refused even before its first use.
+        let late = format!("{ACCESS_TOKEN_PREFIX}owner-late-token");
+        state
+            .db
+            .create_access_link(crate::db::NewAccessLink {
+                id: "al_late".into(),
+                tunnel_id: ID.into(),
+                token_hash: crate::tokens::hash_token(&late),
+                single_use: true,
+                label: None,
+                owner_port: Some(3000),
+                session_ttl_s: 3600,
+                expires_at: crate::tokens::now() - 1,
+            })
+            .await
+            .unwrap();
+        let r = request(&state, zone, &format!("/__access/3000-{ID}/{late}"), Method::GET, &[]).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Ordinary (visitor) single-use links get no repeat window.
+    #[tokio::test]
+    async fn a_visitor_link_is_still_single_use_from_the_same_address() {
+        let zone = "previews.example.com";
+        let state = test_state(&[]);
+        create_tunnel(&state, AccessMode::Password).await;
+        let token = format!("{ACCESS_TOKEN_PREFIX}visitor-token");
+        state
+            .db
+            .create_access_link(crate::db::NewAccessLink {
+                id: "al_visitor".into(),
+                tunnel_id: ID.into(),
+                token_hash: crate::tokens::hash_token(&token),
+                single_use: true,
+                label: None,
+                owner_port: None,
+                session_ttl_s: 3600,
+                expires_at: crate::tokens::now() + 60,
+            })
+            .await
+            .unwrap();
+        let path = format!("/__access/3000-{ID}/{token}");
+        assert_eq!(request(&state, zone, &path, Method::GET, &[]).await.status(), StatusCode::FOUND);
+        assert_eq!(request(&state, zone, &path, Method::GET, &[]).await.status(), StatusCode::UNAUTHORIZED);
     }
 }

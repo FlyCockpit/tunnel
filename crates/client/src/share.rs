@@ -178,6 +178,9 @@ pub const NEVER_EXPIRES: i64 = 253_402_300_799;
 #[derive(Serialize)]
 struct ShareOutput {
     tunnel: String,
+    /// Display name (`--name`), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     mode: String,
     expires_at: i64,
     /// Present (true) when the tunnel never expires (`expires_at` is then 9999-12-31).
@@ -248,11 +251,13 @@ impl Signals {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn share(
     ports: Vec<u16>,
     access: ShareAccess,
     ttl: crate::login::Ttl,
     label: Option<String>,
+    name: Option<String>,
     target: Option<String>,
     out: Output,
     foreground: Option<Foreground>,
@@ -273,12 +278,12 @@ pub async fn share(
         && let Some(token) = persisted_share_token(&s, running)
         && let Some(info) = api.tunnel(&s.tunnel_id).await?.filter(|i| !i.expired)
     {
-        reuse = Some((s.tunnel_id, token, info.access.mode, info.expires_at, info.traffic_limited));
+        reuse = Some((s.tunnel_id, token, info.access.mode, info.expires_at, info.traffic_limited, info.name));
     }
 
     let Some(fg) = foreground else {
-        let (tunnel_id, token, mode, expires_at, limited) = match reuse {
-            Some((id, token, current_mode, expires_at, limited)) => {
+        let (tunnel_id, token, mode, expires_at, limited, name) = match reuse {
+            Some((id, token, current_mode, expires_at, limited, current_name)) => {
                 let mode = if access.explicit() {
                     let wanted = access.to_json()?;
                     api.set_access(&id, &wanted).await?;
@@ -286,16 +291,26 @@ pub async fn share(
                 } else {
                     current_mode
                 };
-                (id, token, mode, expires_at, limited)
+                // `--name` on a running share renames it; its URLs stay the same.
+                let name = match name {
+                    Some(n) => {
+                        api.rename_tunnel(&id, &n).await?;
+                        Some(n)
+                    }
+                    None => current_name,
+                };
+                (id, token, mode, expires_at, limited, name)
             }
             None => {
                 let wanted = access.to_json()?;
-                let (shared, expires_at, limited) = create_shared(&api, &login, &paths, label, ttl, &wanted).await?;
+                let (shared, expires_at, limited) =
+                    create_shared(&api, &login, &paths, label, name.as_deref(), ttl, &wanted).await?;
                 let mode = wanted["mode"].as_str().unwrap_or("link").to_string();
-                (shared.tunnel_id, shared.token.unwrap_or_default(), mode, expires_at, limited)
+                (shared.tunnel_id, shared.token.unwrap_or_default(), mode, expires_at, limited, name)
             }
         };
-        let plan = Plan { ports, token, server: login.server.clone(), target, tunnel_id, mode, expires_at, limited };
+        let plan =
+            Plan { ports, token, server: login.server.clone(), target, tunnel_id, mode, expires_at, limited, name };
         return match expose_and_show(&api, plan, &out, None, report).await? {
             Ok(_) => Ok(0),
             Err(code) => Ok(code),
@@ -314,7 +329,8 @@ pub async fn share(
     let wanted = access.to_json()?;
     let mut signals = Signals::install()?;
     let (shared, expires_at, limited) =
-        create_shared(&api, &login, &paths, label, crate::login::Ttl::Seconds(fg.duration_s), &wanted).await?;
+        create_shared(&api, &login, &paths, label, name.as_deref(), crate::login::Ttl::Seconds(fg.duration_s), &wanted)
+            .await?;
     let created = Instant::now();
     let plan = Plan {
         ports,
@@ -325,6 +341,7 @@ pub async fn share(
         mode: wanted["mode"].as_str().unwrap_or("link").to_string(),
         expires_at,
         limited,
+        name,
     };
     let end = End { created, duration_s: fg.duration_s, expires_at };
     let setup = tokio::select! {
@@ -369,6 +386,8 @@ struct Plan {
     expires_at: i64,
     /// The account reached its monthly traffic cap.
     limited: bool,
+    /// Display name, if any.
+    name: Option<String>,
 }
 
 /// Create a tunnel and record it in `share.json` (deleting it again if that fails).
@@ -377,11 +396,12 @@ async fn create_shared(
     login: &Login,
     paths: &Paths,
     label: Option<String>,
+    name: Option<&str>,
     ttl: crate::login::Ttl,
     access: &Value,
 ) -> anyhow::Result<(Shared, i64, bool)> {
     let label = label.unwrap_or_else(|| format!("share-{}", hostname()));
-    let created = api.create_tunnel(&label, ttl, access).await?;
+    let created = api.create_tunnel(&label, name, ttl, access).await?;
     let shared = Shared { tunnel_id: created.id.clone(), api: login.api.clone(), token: Some(created.tunnel_token) };
     let written = share_lock(paths).and_then(|_lock| {
         write_atomic(&shared_path(paths), &serde_json::to_vec(&shared)?, 0o600).map_err(anyhow::Error::from)
@@ -403,7 +423,7 @@ async fn expose_and_show(
     foreground: Option<&Foreground>,
     report: Report,
 ) -> anyhow::Result<Result<ShareOutput, i32>> {
-    let Plan { ports, token, server, target, tunnel_id, mode, expires_at, limited } = plan;
+    let Plan { ports, token, server, target, tunnel_id, mode, expires_at, limited, name } = plan;
     if limited {
         eprintln!(
             "tunnel: warning: this account reached its monthly traffic limit; visitors see \"Traffic limit reached\" \
@@ -457,8 +477,16 @@ async fn expose_and_show(
         });
     }
     let never_expires = expires_at == NEVER_EXPIRES;
-    let shown =
-        ShareOutput { tunnel: tunnel_id, mode, expires_at, never_expires, username, traffic_limited: limited, links };
+    let shown = ShareOutput {
+        tunnel: tunnel_id,
+        name,
+        mode,
+        expires_at,
+        never_expires,
+        username,
+        traffic_limited: limited,
+        links,
+    };
     print_share(&shown, out, foreground)?;
     Ok(Ok(shown))
 }
@@ -470,6 +498,9 @@ fn print_share(shared: &ShareOutput, out: &Output, foreground: Option<&Foregroun
         return Ok(());
     }
     const PENDING: &str = "  (not connected yet; check `tunnel status`)";
+    if let Some(name) = &shared.name {
+        println!("{}", terminal_text(name));
+    }
     for l in &shared.links {
         let note = if l.connected { "" } else { PENDING };
         let url = terminal_text(&l.url);
@@ -687,6 +718,7 @@ pub async fn link(
     if out.json {
         let shown = ShareOutput {
             tunnel: shared.tunnel_id,
+            name: info.name,
             mode: info.access.mode,
             expires_at: info.expires_at,
             never_expires: info.expires_at == NEVER_EXPIRES,
@@ -958,6 +990,7 @@ mod tests {
         };
         let shown = ShareOutput {
             tunnel: "t".into(),
+            name: None,
             mode: "link".into(),
             expires_at: 9,
             never_expires: false,
@@ -981,6 +1014,7 @@ mod tests {
         };
         let shown = ShareOutput {
             tunnel: "t".into(),
+            name: Some("Checkout redesign".into()),
             mode: "password".into(),
             expires_at: 9,
             never_expires: true,
@@ -990,7 +1024,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&shown).unwrap(),
-            json!({"tunnel":"t","mode":"password","expires_at":9,"never_expires":true,"username":"bob","traffic_limited":true,"links":[
+            json!({"tunnel":"t","name":"Checkout redesign","mode":"password","expires_at":9,"never_expires":true,"username":"bob","traffic_limited":true,"links":[
                 {"port":80,"url":"https://80-t.example/","connected":false,
                  "login_url":"https://example/__login?to=80-t&next=%2F"}]})
         );

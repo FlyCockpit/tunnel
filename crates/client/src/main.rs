@@ -109,8 +109,15 @@ enum Cmd {
         #[arg(long = "for", value_name = "DURATION", num_args = 0..=1, require_equals = true,
               default_missing_value = "1h", value_parser = login::parse_duration, conflicts_with = "ttl")]
         for_s: Option<u64>,
+        /// A machine-readable tag (default `share-<hostname>`); `GET /v1/tunnels?label=` matches it exactly.
         #[arg(long)]
         label: Option<String>,
+        /// Display name for people, e.g. --name "Checkout redesign": shown first in the web UI's
+        /// tunnel list and in `tunnel status`. A label only: the URL keeps its random id and the
+        /// name need not be unique. On a running share it renames the tunnel; links keep working.
+        /// Up to 80 characters, no control characters.
+        #[arg(long, value_name = "NAME", value_parser = login::parse_name)]
+        name: Option<String>,
         /// Dial the ports on this IP address instead of loopback (default $TUNNEL_TARGET_HOST; no hostnames).
         #[arg(long, value_name = "IP")]
         target: Option<String>,
@@ -223,6 +230,10 @@ running tunnel someone else started, a new share takes the daemon over, so ask f
 unshare a tunnel someone else started: check
 `tunnel status --json` first.
 
+Name the share for people: --name \"Checkout redesign\" shows first in the web UI and in
+`tunnel status`. It is a label only: the URL keeps its random id; on a running share,
+--name renames it and every link keeps working.
+
 AI agents: `tunnel help agent`.";
 
 /// The agent skill (docs/agent/SKILL.md), for `tunnel help agent`.
@@ -255,10 +266,10 @@ async fn run(cmd: Cmd) -> anyhow::Result<i32> {
         Cmd::Stop => commands::stop().await,
         Cmd::Login { code, name, no_browser } => share::login(code.as_deref(), name.as_deref(), !no_browser).await,
         Cmd::Logout => share::logout(),
-        Cmd::Share { ports, public, password, link, username, ttl, for_s, label, target, json } => {
+        Cmd::Share { ports, public, password, link, username, ttl, for_s, label, name, target, json } => {
             let access = share::ShareAccess { public, password, link, username };
             let foreground = for_s.map(|duration_s| share::Foreground { duration_s });
-            share::share(ports, access, ttl, label, target, share::Output { json }, foreground).await
+            share::share(ports, access, ttl, label, name, target, share::Output { json }, foreground).await
         }
         Cmd::Link { port, reusable, ttl, label, json } => {
             share::link(port, reusable, ttl, label, share::Output { json }).await
@@ -315,6 +326,32 @@ mod tests {
     }
 
     #[test]
+    fn share_takes_a_display_name() {
+        let name = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.cmd) {
+            Ok(Cmd::Share { name, ports, .. }) => Ok((name, ports)),
+            Ok(_) => panic!("not share"),
+            Err(e) => Err(e.kind()),
+        };
+        assert_eq!(name(&["tunnel", "share", "3000"]), Ok((None, vec![3000])));
+        assert_eq!(
+            name(&["tunnel", "share", "3000", "--name", "  Checkout redesign "]),
+            Ok((Some("Checkout redesign".into()), vec![3000]))
+        );
+        assert_eq!(
+            name(&["tunnel", "share", "--name=API + UI", "3000", "5173"]),
+            Ok((Some("API + UI".into()), vec![3000, 5173]))
+        );
+        let too_long = "x".repeat(81);
+        for bad in ["", " ", "a\u{1b}[2Jb", too_long.as_str()] {
+            assert_eq!(
+                name(&["tunnel", "share", "3000", "--name", bad]),
+                Err(clap::error::ErrorKind::ValueValidation),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_skill_and_share_help_cover_password_mode_and_unshare_safety() {
         for needle in [
             "login_url",
@@ -327,6 +364,8 @@ mod tests {
             "a new share (including `--for`) would take the daemon\n  over",
             "check `tunnel status --json`",
             "ask the human",
+            "**Name what you share** with `--name",
+            "It is a label only: the URL keeps its random id",
         ] {
             assert!(AGENT_SKILL.contains(needle), "skill lacks {needle:?}");
         }
@@ -346,6 +385,9 @@ mod tests {
             "a new share takes the daemon over",
             "Not with --for",
             "Not with --ttl",
+            "--name \"Checkout redesign\" shows first in the web UI",
+            "the URL keeps its random id",
+            "Up to 80 characters",
         ] {
             assert!(help.contains(needle), "share --help lacks {needle:?}:\n{help}");
         }

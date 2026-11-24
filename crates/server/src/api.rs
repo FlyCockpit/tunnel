@@ -418,8 +418,15 @@ fn optional_json<T: DeserializeOwned + Default>(body: &Bytes) -> ApiResult<T> {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTunnelRequest {
+    /// A machine-readable tag (`tunnel share` sets `share-<host>`); matched
+    /// exactly by `GET /v1/tunnels?label=`.
     #[serde(default)]
     pub label: Option<String>,
+    /// Display name for people (dashboard, `tunnel status`): trimmed, at most
+    /// 80 characters, no control characters. A label only: it never changes
+    /// a URL and need not be unique. Empty means none.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Lifetime in seconds (60 ..= the caller's limit, `GET /v1/server`
     /// `limits.max_tunnel_ttl_s`). Required unless `never_expires`.
     #[serde(default)]
@@ -500,6 +507,9 @@ pub struct PatchTunnelRequest {
     pub never_expires: bool,
     #[serde(default)]
     pub label: Option<String>,
+    /// Rename (same rules as on create); `""` removes the name. Links keep working.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub host_header: Option<HostHeaderMode>,
     #[serde(default)]
@@ -520,6 +530,9 @@ pub struct PortView {
 pub struct TunnelView {
     pub id: String,
     pub label: Option<String>,
+    /// Display name; absent when unnamed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
     pub access: AccessView,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
@@ -895,6 +908,10 @@ async fn create_tunnel(
         return Err(ApiError::validation(format!("max_ports must be within 1..={}", limits.hard_max_ports)));
     }
     validate_label(req.label.as_deref())?;
+    let name = match req.name.as_deref() {
+        Some(n) => tunnel_name(n)?,
+        None => None,
+    };
     if let Some(m) = &req.metadata
         && m.to_string().len() > MAX_METADATA_BYTES
     {
@@ -919,6 +936,7 @@ async fn create_tunnel(
                 id,
                 token_hash: tokens::hash_token(&token),
                 label: req.label,
+                name,
                 metadata: req.metadata,
                 max_ports,
                 host_header: req.host_header.unwrap_or(HostHeaderMode::Rewrite),
@@ -1068,6 +1086,7 @@ async fn patch_tunnel(
     let never = req.never_expires;
     let expires_at = caller.requested_expiry(req.ttl_s, req.never_expires, &state.config.limits)?;
     validate_label(req.label.as_deref())?;
+    let name = req.name.as_deref().map(tunnel_name).transpose()?;
     // Expiry is revocation: an expired tunnel cannot be revived by extending it.
     let current = active_tunnel(&state, &caller, &id).await?;
     let keep_password_hash =
@@ -1080,6 +1099,7 @@ async fn patch_tunnel(
     let patch = TunnelPatch {
         expires_at,
         label: req.label,
+        name,
         host_header: req.host_header,
         inject_ice: req.inject_ice,
         access,
@@ -1237,6 +1257,36 @@ pub(crate) async fn mint_access_link(
     req: CreateAccessLinkRequest,
     ui: Option<(String, String)>,
 ) -> ApiResult<AccessLinkResponse> {
+    mint_link(state, tunnel, req, ui, None).await
+}
+
+/// An owner link for the web UI's Open button: single use, bound to `port`,
+/// for `user`'s own tunnel only (checked again when it is stored).
+pub(crate) async fn mint_owner_link(
+    state: &AppState,
+    tunnel: &TunnelRow,
+    port: u16,
+    ttl_s: u64,
+    label: &str,
+    ui: (String, String),
+) -> ApiResult<AccessLinkResponse> {
+    let req = CreateAccessLinkRequest {
+        ttl_s,
+        single_use: Some(true),
+        label: Some(label.to_string()),
+        session_ttl_s: None,
+        port: Some(port),
+    };
+    mint_link(state, tunnel, req, Some(ui), Some(port)).await
+}
+
+async fn mint_link(
+    state: &AppState,
+    tunnel: &TunnelRow,
+    req: CreateAccessLinkRequest,
+    ui: Option<(String, String)>,
+    owner_port: Option<u16>,
+) -> ApiResult<AccessLinkResponse> {
     let t = now();
     let remaining = (tunnel.expires_at - t).max(0) as u64;
     if req.ttl_s < MIN_LINK_TTL_S || req.ttl_s > remaining {
@@ -1268,6 +1318,7 @@ pub(crate) async fn mint_access_link(
         label: req.label,
         session_ttl_s: session_ttl_s as i64,
         expires_at,
+        owner_port,
     };
     match ui {
         Some((user, session)) => {
@@ -1277,7 +1328,8 @@ pub(crate) async fn mint_access_link(
         }
         None => state.db.create_access_link(link).await?,
     }
-    tracing::info!(tunnel = %tunnel.id, link = %link_id, single_use, expires_at, "access link created");
+    let kind = if owner_port.is_some() { "owner" } else { "visitor" };
+    tracing::info!(tunnel = %tunnel.id, link = %link_id, kind, single_use, expires_at, "access link created");
     Ok(AccessLinkResponse {
         id: link_id,
         url: crate::gatehost::access_url(&state.config.preview_zone, &tunnel.id, port, &token),
@@ -1295,6 +1347,14 @@ pub struct AccessLinkView {
     pub session_ttl_s: i64,
     pub created_at: i64,
     pub expires_at: i64,
+    /// `visitor`, or `owner`: made by the web UI's Open button for the
+    /// tunnel's own user, bound to one port.
+    #[serde(default = "visitor_kind")]
+    pub kind: String,
+}
+
+fn visitor_kind() -> String {
+    "visitor".into()
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1332,6 +1392,7 @@ pub(crate) async fn access_link_list(state: &AppState, tunnel_id: &str) -> ApiRe
             session_ttl_s: l.session_ttl_s,
             created_at: l.created_at,
             expires_at: l.expires_at,
+            kind: l.kind,
         })
         .collect();
     Ok(AccessLinkList { links })
@@ -1405,6 +1466,36 @@ async fn turn_credentials(
 }
 
 // ----------------------------------------------------------------- helpers
+
+/// Longest tunnel display name, in characters.
+pub const MAX_NAME_CHARS: usize = 80;
+
+/// Characters a display name may not contain besides control characters:
+/// every Unicode format character (zero-width, bidi, tags, …), line and
+/// paragraph separators and the invisible Hangul fillers, which could blank
+/// out or disguise a name or reorder the text around it in a terminal or a page.
+fn hidden_char(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{034F}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}' | '\u{180E}'
+            | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FEFF}'
+            | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// A tunnel display name as stored: trimmed; empty is no name (`None`).
+pub fn tunnel_name(raw: &str) -> ApiResult<Option<String>> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(ApiError::validation(format!("name must be at most {MAX_NAME_CHARS} characters")));
+    }
+    if name.chars().any(|c| c.is_control() || hidden_char(c)) {
+        return Err(ApiError::validation("name must not contain control, zero-width or bidi characters"));
+    }
+    Ok(Some(name.to_string()))
+}
 
 fn validate_label(label: Option<&str>) -> ApiResult<()> {
     match label {
@@ -1958,6 +2049,7 @@ pub(crate) fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
     TunnelView {
         id: row.id.clone(),
         label: row.label.clone(),
+        name: row.name.clone(),
         access: AccessView { mode: row.access.mode, username: row.access.password_user.clone() },
         metadata: row.metadata.clone(),
         connected: live.is_some(),

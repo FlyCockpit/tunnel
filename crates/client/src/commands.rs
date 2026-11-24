@@ -147,21 +147,20 @@ pub async fn status(json: bool) -> anyhow::Result<i32> {
         Answer::Exit(code) => return Ok(code),
         Answer::Stopped => Status::stopped(),
     };
-    let access = match &status.tunnel_id {
-        Some(id) => server_access(id).await,
+    let info = match &status.tunnel_id {
+        Some(id) => server_tunnel(id).await,
         None => None,
     };
-    status.print_access(json, access.as_ref());
+    status.print_access(json, info.as_ref().map(|i| &i.access), info.as_ref().and_then(|i| i.name.as_deref()));
     Ok(status.exit_code())
 }
 
-/// The tunnel's access settings, when this machine's login can read it
-/// (best effort: nothing when logged out, offline, or not its tunnel).
-async fn server_access(tunnel_id: &str) -> Option<crate::login::AccessInfo> {
+/// The tunnel's access settings and name, when this machine's login can
+/// read it (best effort: nothing when logged out, offline, or not its tunnel).
+async fn server_tunnel(tunnel_id: &str) -> Option<crate::login::TunnelInfo> {
     let login = crate::login::Login::load().ok().flatten()?;
     let api = crate::login::Api::new(&login).ok()?;
-    let info = tokio::time::timeout(Duration::from_secs(5), api.tunnel(tunnel_id)).await.ok()?.ok()??;
-    Some(info.access)
+    tokio::time::timeout(Duration::from_secs(5), api.tunnel(tunnel_id)).await.ok()?.ok()?
 }
 
 pub async fn ice(format: IceFormat, fresh: bool, exec: Vec<String>) -> anyhow::Result<i32> {

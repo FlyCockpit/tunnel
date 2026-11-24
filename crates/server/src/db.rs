@@ -39,7 +39,11 @@ CREATE TABLE tunnels (
     -- Proxied body and WebSocket bytes (visitor -> app, app -> visitor),
     -- flushed from memory about once a minute.
     bytes_in     INTEGER NOT NULL DEFAULT 0,
-    bytes_out    INTEGER NOT NULL DEFAULT 0
+    bytes_out    INTEGER NOT NULL DEFAULT 0,
+    -- Display name (`tunnel share --name`, renamed in the web UI): a label
+    -- only, never part of a URL, not unique. Trimmed, 1..=80 characters, no
+    -- control or bidi-override characters; NULL when unnamed.
+    name         TEXT
 );
 CREATE INDEX tunnels_expires_at ON tunnels(expires_at);
 CREATE INDEX tunnels_client ON tunnels(client_id, expires_at);
@@ -58,7 +62,16 @@ CREATE TABLE access_links (
     label         TEXT,
     session_ttl_s INTEGER NOT NULL,
     created_at    INTEGER NOT NULL,
-    expires_at    INTEGER NOT NULL
+    expires_at    INTEGER NOT NULL,
+    -- `owner`: minted by the web UI's Open button for the tunnel's owner,
+    -- bound to `port`, and redeemable again from the address that used it
+    -- for a few seconds (a browser's repeated request must not land on the
+    -- sign-in form). `visitor`: every other link.
+    kind          TEXT NOT NULL DEFAULT 'visitor' CHECK (kind IN ('visitor', 'owner')),
+    -- The only port an owner link lands on; NULL for visitor links.
+    port          INTEGER,
+    -- Hash of the address that redeemed a single-use owner link.
+    used_from     TEXT
 );
 CREATE INDEX access_links_tunnel ON access_links(tunnel_id);
 CREATE TABLE gate_sessions (
@@ -292,6 +305,8 @@ impl Default for Access {
 pub struct TunnelRow {
     pub id: String,
     pub label: Option<String>,
+    /// Display name (see the schema); `None` when unnamed.
+    pub name: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub max_ports: u16,
     pub host_header: HostHeaderMode,
@@ -321,6 +336,7 @@ pub struct NewTunnel {
     pub id: String,
     pub token_hash: String,
     pub label: Option<String>,
+    pub name: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub max_ports: u16,
     pub host_header: HostHeaderMode,
@@ -349,6 +365,8 @@ pub enum TunnelQuotaExceeded {
 pub struct TunnelPatch {
     pub expires_at: Option<i64>,
     pub label: Option<String>,
+    /// `Some(None)` removes the name.
+    pub name: Option<Option<String>>,
     pub host_header: Option<HostHeaderMode>,
     pub inject_ice: Option<bool>,
     /// Replaces the access setting, subject to `keep_password_hash`.
@@ -465,7 +483,15 @@ pub struct NewAccessLink {
     pub label: Option<String>,
     pub session_ttl_s: i64,
     pub expires_at: i64,
+    /// `Some(port)`: an owner link (Open in the web UI) bound to that port.
+    pub owner_port: Option<u16>,
 }
+
+/// How long after its first use a single-use owner link may be redeemed
+/// again, from the same address only. Browsers can send one navigation
+/// twice (a retry on a new connection, a duplicated navigation); without
+/// this the tab shows the second answer, the sign-in form.
+pub const OWNER_LINK_RETRY_S: i64 = 10;
 
 /// A service credential.
 #[derive(Debug, Clone)]
@@ -723,8 +749,8 @@ impl Db {
             let metadata = t.metadata.as_ref().map(|m| m.to_string());
             tx.execute(
                 "INSERT INTO tunnels (id, token_hash, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at,
-                                      access_mode, password_user, password_hash, client_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                      access_mode, password_user, password_hash, client_id, name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     t.id,
                     t.token_hash,
@@ -739,12 +765,14 @@ impl Db {
                     t.access.password_user,
                     t.access.password_hash,
                     t.client_id,
+                    t.name,
                 ],
             )?;
             tx.commit()?;
             Ok(Some(TunnelRow {
                 id: t.id,
                 label: t.label,
+                name: t.name,
                 metadata: t.metadata,
                 max_ports: t.max_ports,
                 host_header: t.host_header,
@@ -855,6 +883,9 @@ impl Db {
             if let Some(v) = &patch.label {
                 tx.execute("UPDATE tunnels SET label = ?2 WHERE id = ?1", params![id, v])?;
             }
+            if let Some(v) = &patch.name {
+                tx.execute("UPDATE tunnels SET name = ?2 WHERE id = ?1", params![id, v])?;
+            }
             if let Some(v) = patch.host_header {
                 tx.execute("UPDATE tunnels SET host_header = ?2 WHERE id = ?1", params![id, v.as_str()])?;
             }
@@ -941,9 +972,20 @@ impl Db {
     pub async fn create_access_link(&self, l: NewAccessLink) -> anyhow::Result<()> {
         self.call(move |c| {
             c.execute(
-                "INSERT INTO access_links (id, tunnel_id, token_hash, single_use, label, session_ttl_s, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![l.id, l.tunnel_id, l.token_hash, l.single_use, l.label, l.session_ttl_s, now(), l.expires_at],
+                "INSERT INTO access_links (id, tunnel_id, token_hash, single_use, label, session_ttl_s, created_at, expires_at, kind, port)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    l.id,
+                    l.tunnel_id,
+                    l.token_hash,
+                    l.single_use,
+                    l.label,
+                    l.session_ttl_s,
+                    now(),
+                    l.expires_at,
+                    if l.owner_port.is_some() { "owner" } else { "visitor" },
+                    l.owner_port,
+                ],
             )?;
             Ok(())
         })
@@ -977,39 +1019,59 @@ impl Db {
     /// (tossing could already give the browser those), which keeps one cookie
     /// covering every tunnel the visitor holds. Single-use links are consumed
     /// in the same transaction as the grant.
+    /// Redeem an access link reached through `port` (`None`: the URL named
+    /// no port) by a visitor whose address hashes to `peer`. Owner links work
+    /// only through their own port and, once used, again only from the same
+    /// address within [`OWNER_LINK_RETRY_S`].
     pub async fn redeem_access_link(
         &self,
         tunnel_id: String,
         token_hash: String,
         presented_session_hashes: Vec<String>,
+        port: Option<u16>,
+        peer: String,
     ) -> anyhow::Result<Redemption> {
         self.call(move |c| {
             let t = now();
             let tx = c.transaction()?;
-            let link: Option<(String, bool, Option<i64>, i64, i64)> = tx
+            type LinkRow = (String, bool, Option<i64>, i64, i64, String, Option<u16>, Option<String>);
+            let link: Option<LinkRow> = tx
                 .query_row(
-                    "SELECT id, single_use, used_at, session_ttl_s, expires_at FROM access_links
+                    "SELECT id, single_use, used_at, session_ttl_s, expires_at, kind, port, used_from FROM access_links
                      WHERE token_hash = ?1 AND tunnel_id = ?2",
                     params![token_hash, tunnel_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
                 )
                 .optional()?;
-            let Some((link_id, single_use, used_at, session_ttl_s, link_expires)) = link else {
+            let Some((link_id, single_use, used_at, session_ttl_s, link_expires, kind, link_port, used_from)) = link
+            else {
                 return Ok(Redemption::Invalid);
             };
-            if link_expires <= t || (single_use && used_at.is_some()) {
+            let owner = kind == "owner";
+            if link_expires <= t || (owner && (link_port.is_none() || link_port != port)) {
                 return Ok(Redemption::Invalid);
             }
+            let repeat = match used_at {
+                Some(_) if !single_use => false,
+                None => false,
+                Some(used) => {
+                    let retry = owner && used_from.as_deref() == Some(peer.as_str()) && t - used <= OWNER_LINK_RETRY_S;
+                    if !retry {
+                        return Ok(Redemption::Invalid);
+                    }
+                    true
+                }
+            };
             let tunnel_expires: Option<i64> = tx
                 .query_row("SELECT expires_at FROM tunnels WHERE id = ?1", params![tunnel_id], |r| r.get(0))
                 .optional()?;
             if tunnel_expires.is_none_or(|e| e <= t) {
                 return Ok(Redemption::Invalid);
             }
-            if single_use {
+            if single_use && !repeat {
                 let n = tx.execute(
-                    "UPDATE access_links SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
-                    params![link_id, t],
+                    "UPDATE access_links SET used_at = ?2, used_from = ?3 WHERE id = ?1 AND used_at IS NULL",
+                    params![link_id, t, owner.then_some(&peer)],
                 )?;
                 if n != 1 {
                     return Ok(Redemption::Invalid);
@@ -1506,9 +1568,9 @@ impl Db {
     }
 }
 
-pub(crate) const TUNNEL_SELECT: &str = "SELECT id, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at, last_seen_at, access_mode, password_user, password_hash, client_id, bytes_in, bytes_out, (SELECT user_id FROM clients WHERE clients.id = tunnels.client_id) FROM tunnels";
+pub(crate) const TUNNEL_SELECT: &str = "SELECT id, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at, last_seen_at, access_mode, password_user, password_hash, client_id, bytes_in, bytes_out, (SELECT user_id FROM clients WHERE clients.id = tunnels.client_id), name FROM tunnels";
 /// Columns `tunnel_from_row` reads (others may follow).
-pub(crate) const TUNNEL_COLUMNS: usize = 16;
+pub(crate) const TUNNEL_COLUMNS: usize = 17;
 
 /// Fresh session for a new grant on `tunnel_id`, carrying the unexpired grants
 /// (and their provenance) of every live presented session. Returns the
@@ -1680,6 +1742,7 @@ pub(crate) fn tunnel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelR
         bytes_in: r.get(13)?,
         bytes_out: r.get(14)?,
         user_id: r.get(15)?,
+        name: r.get(16)?,
     })
 }
 
@@ -1742,6 +1805,7 @@ mod tests {
                 id: id.into(),
                 token_hash: format!("test-{id}"),
                 label: None,
+                name: None,
                 metadata: None,
                 max_ports: 8,
                 host_header: HostHeaderMode::Rewrite,
@@ -1859,12 +1923,15 @@ mod tests {
             token_hash: "test-link".into(),
             single_use: false,
             label: None,
+            owner_port: None,
             session_ttl_s: 60,
             expires_at: now() + 3600,
         })
         .await
         .unwrap();
-        let short = granted(Some(db.redeem_access_link(id.clone(), "test-link".into(), vec![]).await.unwrap()));
+        let short = granted(Some(
+            db.redeem_access_link(id.clone(), "test-link".into(), vec![], None, String::new()).await.unwrap(),
+        ));
         // Deterministically model a later redemption with a longer expiry.
         db.call(|c| {
             c.execute("UPDATE access_links SET session_ttl_s = 600 WHERE id = 'reusable'", [])?;
@@ -1873,9 +1940,15 @@ mod tests {
         .await
         .unwrap();
         let long = granted(Some(
-            db.redeem_access_link(id.clone(), "test-link".into(), vec![crate::tokens::hash_token(&short)])
-                .await
-                .unwrap(),
+            db.redeem_access_link(
+                id.clone(),
+                "test-link".into(),
+                vec![crate::tokens::hash_token(&short)],
+                None,
+                String::new(),
+            )
+            .await
+            .unwrap(),
         ));
         let long_hash = crate::tokens::hash_token(&long);
         let expected = db.session_grants(vec![long_hash.clone()]).await.unwrap()[&long_hash][0].1;
@@ -1918,6 +1991,7 @@ mod tests {
                 id: id.clone(),
                 token_hash: "tok".into(),
                 label: None,
+                name: None,
                 metadata: None,
                 max_ports: 8,
                 host_header: HostHeaderMode::Rewrite,
@@ -1936,6 +2010,7 @@ mod tests {
             token_hash: "link".into(),
             single_use: false,
             label: None,
+            owner_port: None,
             session_ttl_s: 3600,
             expires_at: now() + 600,
         })
@@ -1943,7 +2018,8 @@ mod tests {
         .unwrap();
 
         // Link session; then a login that carries it (both provenances); then a login-only session.
-        let s_link = granted(Some(db.redeem_access_link(id.clone(), "link".into(), vec![]).await.unwrap()));
+        let s_link =
+            granted(Some(db.redeem_access_link(id.clone(), "link".into(), vec![], None, String::new()).await.unwrap()));
         let s_both = granted(
             db.login_grant(id.clone(), "h1".into(), 3600, vec![crate::tokens::hash_token(&s_link)]).await.unwrap(),
         );
@@ -2015,6 +2091,7 @@ mod tests {
             id: id.into(),
             token_hash: format!("tt-{id}"),
             label: None,
+            name: None,
             metadata: None,
             max_ports: 8,
             host_header: HostHeaderMode::Rewrite,
@@ -2053,6 +2130,7 @@ mod tests {
                 id: id.clone(),
                 token_hash: "tok2".into(),
                 label: None,
+                name: None,
                 metadata: None,
                 max_ports: 8,
                 host_header: HostHeaderMode::Rewrite,
@@ -2072,12 +2150,15 @@ mod tests {
             token_hash: "shortlink".into(),
             single_use: false,
             label: None,
+            owner_port: None,
             session_ttl_s: 60,
             expires_at: now() + 600,
         })
         .await
         .unwrap();
-        let s_link = granted(Some(db.redeem_access_link(id.clone(), "shortlink".into(), vec![]).await.unwrap()));
+        let s_link = granted(Some(
+            db.redeem_access_link(id.clone(), "shortlink".into(), vec![], None, String::new()).await.unwrap(),
+        ));
         let merged = granted(
             db.login_grant(id.clone(), "h1".into(), 7200, vec![crate::tokens::hash_token(&s_link)]).await.unwrap(),
         );
@@ -2104,6 +2185,7 @@ mod tests {
             id: id.into(),
             token_hash: format!("h-{id}"),
             label: None,
+            name: None,
             metadata: None,
             max_ports: 8,
             host_header: HostHeaderMode::Rewrite,
@@ -2245,6 +2327,7 @@ mod tests {
             id: id.into(),
             token_hash: format!("hash-{id}"),
             label: None,
+            name: None,
             metadata: None,
             max_ports: 8,
             host_header: HostHeaderMode::Rewrite,

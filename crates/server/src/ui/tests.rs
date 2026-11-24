@@ -1235,6 +1235,7 @@ async fn ui_link_creation_and_session_revocation_recheck_the_session_in_the_tran
         token_hash: crate::tokens::random_secret(),
         single_use: true,
         label: None,
+        owner_port: None,
         session_ttl_s: 60,
         expires_at: now() + 60,
     };
@@ -1706,6 +1707,206 @@ async fn open_links_follow_the_link_rules_and_are_labelled() {
         assert!(l.get("url").is_none(), "link URLs are never listed");
     }
     assert!(bob.call(&state, "GET", "/ui/api/tunnels?all=true", None).await.status == StatusCode::FORBIDDEN);
+}
+
+/// Pretend tunnel `id` is connected with `ports` (nothing behind them).
+/// Keep the returned session alive for as long as the tunnel should be.
+fn connect(state: &AppState, id: &str, ports: &[u16]) -> tunnel_protocol::mux::Session {
+    let (server_io, client_io) = tokio::io::duplex(1024);
+    std::mem::forget(client_io);
+    let server = tunnel_protocol::mux::Session::new_server(server_io);
+    let (ctrl_tx, _) = tokio::sync::mpsc::channel(1);
+    state.registry.insert(Arc::new(crate::registry::LiveTunnel {
+        conn_id: 1,
+        tunnel_id: id.into(),
+        control: server.control(),
+        ports: std::sync::RwLock::new(ports.iter().copied().collect()),
+        ctrl_tx,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        connected_at: now(),
+        streams: std::sync::atomic::AtomicUsize::new(0),
+        pool: crate::pool::OriginPool::default(),
+        token_hash: String::new(),
+    }));
+    server
+}
+
+/// Open is for the tunnel's own user: a single-use owner link to one
+/// connected port, CSRF-protected and audited. Admins (the owner here)
+/// viewing a member's tunnel get no Open link: Links makes ordinary ones.
+#[tokio::test]
+async fn open_mints_a_one_time_owner_link_for_the_tunnels_own_user_only() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let mut bob = member(&state, &mut owner, "bob", 3).await;
+    let ann_token = approve_machine(&state, &mut ann, "laptop").await;
+    let t = create_tunnel(
+        &state,
+        &ann_token,
+        json!({ "mode": "password", "username": "u", "password": "visitor-password" }),
+    )
+    .await;
+    let id = t.body["id"].as_str().unwrap().to_string();
+    let path = format!("/ui/api/tunnels/{id}/open");
+
+    let r = ann.call(&state, "POST", &path, Some(json!({ "port": 3000 }))).await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("port_not_connected")));
+    let _live = connect(&state, &id, &[3000]);
+
+    // Ann's own tunnel: a link on the preview zone (another site than the
+    // UI here), for exactly that port.
+    let r = ann.call(&state, "POST", &path, Some(json!({ "port": 3000 }))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let url = r.body["url"].as_str().unwrap();
+    assert!(url.starts_with(&format!("https://previews.example.net/__access/3000-{id}/tnacc_")), "{url}");
+    let r = ann.call(&state, "POST", &path, Some(json!({ "port": 3001 }))).await;
+    assert_eq!(r.body["error"]["code"], "port_not_connected");
+    // Only the port: the lifetime and kind are the server's.
+    let r = ann.call(&state, "POST", &path, Some(json!({ "port": 3000, "ttl_s": 86400 }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.body);
+
+    // Another member: not even visible. The owner (an admin): not theirs.
+    let r = bob.call(&state, "POST", &path, Some(json!({ "port": 3000 }))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.body.get("url").is_none());
+    let r = owner.call(&state, "POST", &path, Some(json!({ "port": 3000 }))).await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::FORBIDDEN, json!("not_owner")));
+    assert!(r.body.get("url").is_none());
+
+    // A stale CSRF token, or none: refused before anything is minted.
+    let mut forged = Browser { csrf: Some("not-the-token".into()), ..ann.clone() };
+    let r = forged.call(&state, "POST", &path, Some(json!({ "port": 3000 }))).await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::FORBIDDEN, json!("csrf")));
+
+    // One owner link, single use, a minute at most, never listed with its URL.
+    let links = ann.call(&state, "GET", &format!("/ui/api/tunnels/{id}/links"), None).await;
+    let links = links.body["links"].as_array().unwrap().clone();
+    assert_eq!(links.len(), 1, "{links:?}");
+    let l = &links[0];
+    assert_eq!(
+        (l["kind"].clone(), l["label"].clone(), l["single_use"].clone()),
+        (json!("owner"), json!("Opened from the dashboard"), json!(true))
+    );
+    let lifetime = l["expires_at"].as_i64().unwrap() - l["created_at"].as_i64().unwrap();
+    assert!((59..=60).contains(&lifetime), "{lifetime}");
+    assert!(l.get("url").is_none());
+    // Audited like any link (no token in the log).
+    let audit = owner.call(&state, "GET", "/ui/api/audit", None).await;
+    let opened: Vec<_> =
+        audit.body["entries"].as_array().unwrap().iter().filter(|e| e["action"] == "tunnel_opened").collect();
+    assert_eq!(opened.len(), 1, "{}", audit.body);
+    let target = opened[0]["target"].as_str().unwrap();
+    assert!(target.contains(&id) && target.ends_with("port 3000") && !target.contains("tnacc_"), "{target}");
+
+    // The list tells the UI whose tunnel it is.
+    let mine = ann.call(&state, "GET", "/ui/api/tunnels", None).await;
+    assert_eq!(mine.body["tunnels"][0]["mine"], true);
+    let all = owner.call(&state, "GET", "/ui/api/tunnels?all=true", None).await;
+    let row = all.body["tunnels"].as_array().unwrap().iter().find(|t| t["id"] == id.as_str()).unwrap().clone();
+    assert_eq!(row["mine"], false);
+
+    // A tunnel in its last half minute cannot be opened (the link would outlive it).
+    state
+        .db
+        .call({
+            let id = id.clone();
+            move |c| {
+                c.execute("UPDATE tunnels SET expires_at = ?2 WHERE id = ?1", rusqlite::params![id, now() + 20])?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    state.invalidate_tunnel(&id);
+    let r = ann.call(&state, "POST", &path, Some(json!({ "port": 3000 }))).await;
+    assert_eq!(r.body["error"]["code"], "tunnel_ending", "{}", r.body);
+}
+
+/// A display name: trimmed, bounded, printable; set on create, renamed by
+/// whoever may manage the tunnel, audited, and never touching its URLs.
+#[tokio::test]
+async fn tunnels_carry_a_display_name_that_whoever_manages_them_can_change() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let mut bob = member(&state, &mut owner, "bob", 3).await;
+    let ann_token = approve_machine(&state, &mut ann, "laptop").await;
+    let make =
+        |name: Value| bearer(&state, "POST", "/v1/tunnels", &ann_token, Some(json!({ "ttl_s": 3600, "name": name })));
+
+    for bad in [
+        json!("a\u{1b}[2Jb"),
+        json!("line\nbreak"),
+        json!("x\u{202e}gpj.exe"),
+        json!("zero\u{200b}width"),
+        json!("arabic\u{61c}mark"),
+        json!("\u{3164}"),
+        json!("\u{206a}"),
+        json!("tag\u{e0041}"),
+        json!("é".repeat(81)),
+    ] {
+        let r = make(bad.clone()).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {}", r.body);
+    }
+    let r = make(json!("  Checkout redesign  ")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let id = r.body["id"].as_str().unwrap().to_string();
+    let host_template = r.body["host_template"].clone();
+    let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &ann_token, None).await;
+    assert_eq!(view.body["name"], "Checkout redesign");
+    assert_eq!(make(json!("")).await.body["name"], Value::Null, "empty is no name");
+    let dup = make(json!("Checkout redesign")).await;
+    assert_eq!(dup.status, StatusCode::CREATED, "names need not be unique");
+
+    let path = format!("/ui/api/tunnels/{id}");
+    // Stored and returned as typed: HTML is text, escaped where it is shown.
+    let r = ann.call(&state, "PATCH", &path, Some(json!({ "name": "<img src=x onerror=alert(1)> & co" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let list = ann.call(&state, "GET", "/ui/api/tunnels", None).await;
+    let row = list.body["tunnels"].as_array().unwrap().iter().find(|t| t["id"] == id.as_str()).unwrap().clone();
+    assert_eq!(row["name"], "<img src=x onerror=alert(1)> & co");
+    assert_eq!(row["host_template"], host_template, "a rename never changes a URL");
+    let r = ann.call(&state, "PATCH", &path, Some(json!({ "name": "bad\u{7}" }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Bob may not; an admin (the owner) may rename a member's tunnel.
+    assert_eq!(
+        bob.call(&state, "PATCH", &path, Some(json!({ "name": "mine now" }))).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let r = owner.call(&state, "PATCH", &path, Some(json!({ "name": "Reviewed" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // The machine can rename it too, and "" removes the name.
+    let r = bearer(&state, "PATCH", &format!("/v1/tunnels/{id}"), &ann_token, Some(json!({ "name": "" }))).await;
+    assert_eq!((r.status, r.body["name"].clone()), (StatusCode::OK, Value::Null));
+    assert_eq!(r.body["host_template"], host_template);
+
+    // The write re-checks the session and the right to the tunnel in its own
+    // transaction (an admin demoted, or a session revoked, mid-request).
+    let session_of = |b: &Browser| tokens::hash_token(b.cookie.as_ref().unwrap().split_once('=').unwrap().1);
+    let user_id = |r: &Resp| r.body["user"]["id"].as_str().unwrap().to_string();
+    let bob_id = user_id(&bob.call(&state, "GET", "/ui/api/session", None).await);
+    let ann_id = user_id(&ann.call(&state, "GET", "/ui/api/session", None).await);
+    let db = &state.db;
+    let rename = |user: String, session: String| db.rename_tunnel_for(id.clone(), Some("x".into()), user, session);
+    assert_eq!(rename(bob_id, session_of(&bob)).await.unwrap(), None, "not bob's");
+    assert_eq!(rename(ann_id.clone(), "not-a-live-session".into()).await.unwrap(), None, "signed out");
+    assert_eq!(rename(ann_id, session_of(&ann)).await.unwrap(), Some(None));
+
+    let audit = owner.call(&state, "GET", "/ui/api/audit", None).await;
+    let renames: Vec<String> = audit.body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "tunnel_renamed")
+        .map(|e| e["target"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(renames.len(), 2, "{renames:?}");
+    assert!(
+        renames.iter().any(|t| t == &format!("{id}: <img src=x onerror=alert(1)> & co -> Reviewed")),
+        "{renames:?}"
+    );
 }
 
 #[path = "limit_tests.rs"]

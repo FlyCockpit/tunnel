@@ -414,25 +414,23 @@ where
 
 // ------------------------------------------------------------------ tunnels
 
-/// Label and lifetime of the links the Open button mints, and the server's
-/// shortest link lifetime (`MIN_LINK_TTL_S`).
-const OPEN_LABEL: &str = "Opened from the dashboard";
-const OPEN_TTL_S: i64 = 60;
-const MIN_LINK_TTL_S: i64 = 30;
+/// Longest tunnel name, in characters (the server's limit).
+const MAX_NAME_CHARS: usize = 80;
 
-/// Open `port`'s preview in a new tab. Previews live on other hosts and the UI
-/// session never reaches them, so this mints a single-use link that expires in
-/// a minute (or with the tunnel, if sooner) and sends the tab through it. The tab is opened during the click
-/// (so pop-up blockers allow it), cut off from this page (`opener` is cleared;
-/// the page sends no referrer), and navigated with `replace`, so the link is
-/// not left in its back history.
-fn open_preview(tunnel: String, port: u16, expires_at: i64, error: RwSignal<Option<String>>) {
-    // A link cannot outlive its tunnel; leave a few seconds for clock skew.
-    let ttl = OPEN_TTL_S.min(expires_at - (js_sys::Date::now() / 1000.0) as i64 - 5);
-    if ttl < MIN_LINK_TTL_S {
-        error.set(Some("This tunnel ends in less than a minute; it can no longer be opened.".into()));
-        return;
-    }
+/// The tunnel's display name, or its id when it has none.
+fn display_name(t: &Tunnel) -> String {
+    t.name.clone().unwrap_or_else(|| t.id.clone())
+}
+
+/// Open `port`'s preview of one of your own tunnels in a new tab, signed in
+/// as its owner. Previews live on other hosts (another site, even) and the UI
+/// session never reaches them, so the server mints a single-use owner link
+/// (a minute at most, bound to this port) and the tab goes through it; the
+/// link's sign-in page then skips the tunnel's own password or link prompt.
+/// The tab is opened during the click (so pop-up blockers allow it), cut off
+/// from this page (`opener` is cleared; the page sends no referrer), and
+/// navigated with `replace`, so the link is not left in its back history.
+fn open_preview(tunnel: String, port: u16, error: RwSignal<Option<String>>) {
     let Some(window) = web_sys::window() else { return };
     let tab = match window.open_with_url_and_target("about:blank", "_blank") {
         Ok(Some(tab)) => tab,
@@ -446,8 +444,7 @@ fn open_preview(tunnel: String, port: u16, expires_at: i64, error: RwSignal<Opti
     let _ = tab.set_opener(&wasm_bindgen::JsValue::NULL);
     error.set(None);
     spawn_local(async move {
-        let body = json!({ "port": port, "ttl_s": ttl, "single_use": true, "label": OPEN_LABEL });
-        let url = api::post::<Value>(&format!("/ui/api/tunnels/{tunnel}/links"), &body)
+        let url = api::post::<Value>(&format!("/ui/api/tunnels/{tunnel}/open"), &json!({ "port": port }))
             .await
             .map(|v| v["url"].as_str().map(str::to_string));
         match url {
@@ -469,12 +466,14 @@ fn open_preview(tunnel: String, port: u16, expires_at: i64, error: RwSignal<Opti
     });
 }
 
-/// One Open button per port of the tunnel: enabled while that port is connected.
+/// Per port: Open (your own tunnel: signed in, no prompt) or Visit (someone
+/// else's: the tunnel's normal sign-in). Disabled while the port is not connected.
 fn open_buttons(t: &Tunnel, error: RwSignal<Option<String>>) -> AnyView {
+    let name = display_name(t);
     if t.ports.is_empty() {
-        let hint = "Not connected: start sharing on its machine to open it";
+        let hint = format!("{name} is not connected: start sharing on its machine to open it");
         return view! {
-            <span title=hint><button class="btn btn-outline btn-sm" disabled=true aria-label=hint>"Open"</button></span>" "
+            <button class="btn btn-outline btn-sm" disabled=true aria-label=hint.clone() title=hint>"Open"</button>
         }
         .into_any();
     }
@@ -482,24 +481,30 @@ fn open_buttons(t: &Tunnel, error: RwSignal<Option<String>>) -> AnyView {
     t.ports
         .iter()
         .map(|p| {
-            let (id, port, expires_at) = (t.id.clone(), p.port, t.expires_at);
-            let text = if several { format!("Open {port}") } else { "Open".to_string() };
+            let (id, port) = (t.id.clone(), p.port);
             let live = t.connected && p.connected;
-            let hint = if live {
-                format!("Open port {port} in a new tab, signed in with a one-time link")
-            } else {
-                format!("Port {port} is not connected: start the app and the tunnel on its machine")
+            let verb = if t.mine { "Open" } else { "Visit" };
+            let text = if several { format!("{verb} {port}") } else { verb.to_string() };
+            let hint = match (live, t.mine) {
+                (false, _) => {
+                    format!("Port {port} of {name} is not connected: start the app and the tunnel on its machine")
+                }
+                (true, true) => format!("Open {name}, port {port}, in a new tab, signed in as you"),
+                (true, false) => format!("Visit {name}, port {port}, in a new tab (asks for the tunnel's own sign-in)"),
             };
-            let title = hint.clone();
-            view! {
-                <span title=title>
-                    <button
-                        class="btn btn-outline btn-sm"
-                        disabled=!live
-                        aria-label=hint
-                        on:click=move |_| open_preview(id.clone(), port, expires_at, error)
+            if t.mine || !live {
+                view! {
+                    <button class="btn btn-outline btn-sm" disabled=!live aria-label=hint.clone() title=hint
+                        on:click=move |_| open_preview(id.clone(), port, error)
                     >{text}</button>
-                </span>" "
+                }
+                .into_any()
+            } else {
+                view! {
+                    <a class="btn btn-outline btn-sm" href=format!("https://{}/", p.host) target="_blank"
+                        rel="noopener noreferrer" aria-label=hint.clone() title=hint>{text}</a>
+                }
+                .into_any()
             }
         })
         .collect_view()
@@ -530,37 +535,61 @@ fn Tunnels(admin: bool) -> impl IntoView {
             Ok(())
         });
     };
+    // The tunnel being renamed, and the name typed so far.
+    let editing = RwSignal::new(None::<String>);
+    let new_name = RwSignal::new(String::new());
+    let save_name = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let Some(id) = editing.get_untracked() else { return };
+        // Characters as the server counts them (`maxlength` counts UTF-16 units).
+        if new_name.get_untracked().trim().chars().count() > MAX_NAME_CHARS {
+            error.set(Some(format!("A name has at most {MAX_NAME_CHARS} characters.")));
+            return;
+        }
+        let body = json!({ "name": new_name.get_untracked() });
+        run(error, busy, async move {
+            api::patch::<Value>(&format!("/ui/api/tunnels/{id}"), &body).await?;
+            editing.set(None);
+            load();
+            Ok(())
+        });
+    };
     view! {
         <div class="page">
             <div class="page-head">
                 <div>
                     <h1>"Tunnels"</h1>
-                    <p class="muted">"Live tunnels from your machines. Share them with access links; links work once unless you make them reusable."</p>
+                    <p class="muted">"Live tunnels from your machines. Open your own signed in; share them with access links, which work once unless you make them reusable."</p>
                 </div>
-                {admin.then(|| view! { <ShowAll all=all what="tunnels" on_change=load /> })}
-                <button class="btn btn-outline" on:click=move |_| load()>"Refresh"</button>
+                <div class="head-actions">
+                    {admin.then(|| view! { <ShowAll all=all what="tunnels" on_change=load /> })}
+                    <button class="btn btn-outline" on:click=move |_| load()>"Refresh"</button>
+                </div>
             </div>
             <ErrorBox error=error />
             {move || match tunnels.get() {
                 None => view! { <p class="muted">"Loading…"</p> }.into_any(),
                 Some(list) if list.is_empty() => view! {
                     <div class="card"><Empty title="No tunnels yet">
-                        <p>"Install the CLI on a machine, sign it in, then run " <code>"tunnel share 3000"</code> "."</p>
+                        <p>"Install the CLI on a machine, sign it in, then run " <code>"tunnel share 3000 --name \"My app\""</code> "."</p>
                         <button class="btn" on:click=move |_| navigate("/cli")>"Get the CLI"</button>
                     </Empty></div>
                 }.into_any(),
                 Some(list) => view! {
                     <div class="card card-tight table-wrap">
-                        <table class="table">
+                        <table class="table table-stack tunnels-table">
                             <thead><tr>
-                                <th>"Tunnel"</th><th>"Ports"</th><th>"Access"</th><th>"Machine"</th><th>"Traffic"</th><th>"Expires"</th><th></th>
+                                <th>"Tunnel"</th><th>"Ports"</th><th>"Access"</th><th>"Machine"</th><th>"Traffic"</th><th>"Expires"</th><th><span class="sr-only">"Actions"</span></th>
                             </tr></thead>
                             <tbody>
                                 {list.into_iter().map(|t| {
                                     let id = t.id.clone();
                                     let id2 = t.id.clone();
                                     let id3 = t.id.clone();
+                                    let (id_edit, id_row) = (t.id.clone(), t.id.clone());
                                     let is_open = move || open.get().as_deref() == Some(id3.as_str());
+                                    let expanded = is_open.clone();
+                                    let is_editing = move || editing.get().as_deref() == Some(id_row.as_str());
                                     let ports = if t.ports.is_empty() { "—".to_string() } else {
                                         t.ports.iter().map(|p| p.port.to_string()).collect::<Vec<_>>().join(", ")
                                     };
@@ -569,37 +598,74 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                         (Some(o), None) => o.clone(),
                                         _ => "admin".into(),
                                     };
+                                    let name = display_name(&t);
+                                    let current_name = t.name.clone().unwrap_or_default();
+                                    // Secondary line: where it lives (its first preview host), else its id.
+                                    let secondary = match (&t.name, t.ports.first()) {
+                                        (_, Some(p)) => p.host.clone(),
+                                        (Some(_), None) => t.id.clone(),
+                                        (None, None) => String::new(),
+                                    };
+                                    let named = t.name.is_some();
+                                    let label_title = t.label.clone().unwrap_or_default();
                                     let t2 = t.clone();
+                                    let rename_label = format!("Rename {name}");
+                                    let links_label = format!("Access links of {name}");
+                                    let delete_label = format!("Delete {name}");
                                     view! {
                                         <tr>
-                                            <td>
-                                                <span class=if t.connected { "dot dot-on" } else { "dot" }></span>" "
-                                                <span class="mono">{t.id.clone()}</span>
-                                                {t.label.clone().map(|l| view! { <div class="muted small">{l}</div> })}
+                                            <td class="cell-main">
+                                                {move || if is_editing() {
+                                                    view! {
+                                                        <form class="row" on:submit=save_name>
+                                                            <label class="sr-only" for="rename-tunnel">"Name"</label>
+                                                            <input id="rename-tunnel" class="input input-sm grow"
+                                                                placeholder="e.g. Checkout redesign" autocomplete="off"
+                                                                prop:value=move || new_name.get() on:input=move |ev| new_name.set(value(&ev)) />
+                                                            <button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save"</button>
+                                                            <button class="btn btn-ghost btn-sm" type="button" on:click=move |_| editing.set(None)>"Cancel"</button>
+                                                        </form>
+                                                        <p class="muted small">"A label only: links and URLs stay the same. Empty removes the name."</p>
+                                                    }.into_any()
+                                                } else {
+                                                    view! {
+                                                        <div class="tunnel-name" title=label_title.clone()>
+                                                            <span class=if t.connected { "dot dot-on" } else { "dot" }
+                                                                role="img" aria-label=if t.connected { "connected" } else { "not connected" }></span>
+                                                            <span class=if named { "name" } else { "name mono" }>{name.clone()}</span>
+                                                        </div>
+                                                        {(!secondary.is_empty()).then(|| view! { <div class="muted small mono break">{secondary.clone()}</div> })}
+                                                    }.into_any()
+                                                }}
                                             </td>
-                                            <td>{ports}</td>
-                                            <td><span class="badge">{t.access.mode.clone()}</span></td>
-                                            <td>{owner}</td>
-                                            <td title=format!("in {} / out {}", bytes(t.bytes_in), bytes(t.bytes_out))>
+                                            <td data-label="Ports">{ports}</td>
+                                            <td data-label="Access"><span class="badge">{t.access.mode.clone()}</span></td>
+                                            <td data-label="Machine">{owner}</td>
+                                            <td data-label="Traffic" title=format!("in {} / out {}", bytes(t.bytes_in), bytes(t.bytes_out))>
                                                 {bytes(t.bytes_in + t.bytes_out)}
                                                 {t.traffic_limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}
                                             </td>
                                             {if t.never_expires {
-                                                view! { <td title="This tunnel lives until it is deleted.">"never"</td> }.into_any()
+                                                view! { <td data-label="Expires" title="This tunnel lives until it is deleted.">"never"</td> }.into_any()
                                             } else {
-                                                view! { <td title=when(t.expires_at)>{relative(t.expires_at)}</td> }.into_any()
+                                                view! { <td data-label="Expires" title=when(t.expires_at)>{relative(t.expires_at)}</td> }.into_any()
                                             }}
                                             <td class="actions">
                                                 {open_buttons(&t, error)}
-                                                <button class="btn btn-outline btn-sm" on:click=move |_| {
+                                                <button class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| {
+                                                    new_name.set(current_name.clone());
+                                                    editing.set(Some(id_edit.clone()));
+                                                }>"Rename"</button>
+                                                <button class="btn btn-outline btn-sm" aria-label=links_label
+                                                    aria-expanded=move || expanded().to_string() on:click=move |_| {
                                                     let cur = open.get();
                                                     open.set(if cur.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) });
-                                                }>"Links"</button>" "
-                                                <button class="btn btn-destructive btn-sm" on:click=move |_| delete(id2.clone())>"Delete"</button>
+                                                }>"Links"</button>
+                                                <button class="btn btn-destructive btn-sm" aria-label=delete_label on:click=move |_| delete(id2.clone())>"Delete"</button>
                                             </td>
                                         </tr>
                                         <Show when=is_open.clone()>
-                                            <tr><td colspan="7" class="links-panel"><Links tunnel=t2.clone() /></td></tr>
+                                            <tr class="panel-row"><td colspan="7" class="links-panel"><Links tunnel=t2.clone() /></td></tr>
                                         </Show>
                                     }
                                 }).collect_view()}
@@ -665,7 +731,7 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
     view! {
         <div class="stack">
             <ErrorBox error=error />
-            <form class="row" on:submit=create>
+            <form class="row link-form" on:submit=create>
                 <label class="sr-only" for="link-port">"Port"</label>
                 <select id="link-port" class="input w-auto" on:change=move |ev| port.set(value(&ev))>
                     {ports.iter().map(|p| view! { <option value=p.port.to_string()>{format!("port {}", p.port)}</option> }).collect_view()}
@@ -692,8 +758,8 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
                     view! { <p class="muted small">"No access links."</p> }.into_any()
                 } else {
                     view! {
-                        <table class="table">
-                            <thead><tr><th>"Link"</th><th>"Kind"</th><th>"Created"</th><th>"Expires"</th><th></th></tr></thead>
+                        <table class="table table-stack">
+                            <thead><tr><th>"Link"</th><th>"Kind"</th><th>"Created"</th><th>"Expires"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                             <tbody>
                             {list.into_iter().map(|l| {
                                 let lid = l.id.clone();
@@ -703,15 +769,17 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
                                     (true, None) => "single use",
                                     (false, _) => "reusable",
                                 };
+                                let state = if l.kind == "owner" { format!("owner, {state}") } else { state.to_string() };
+                                let revoke_label = format!("Revoke link {}", l.id);
                                 view! { <tr>
-                                    <td>
+                                    <td class="cell-main">
                                         <span class="mono">{l.id.clone()}</span>
                                         {l.label.clone().map(|x| view! { <div class="muted small">{x}</div> })}
                                     </td>
-                                    <td>{state}</td>
-                                    <td>{relative(l.created_at)}</td>
-                                    <td>{relative(l.expires_at)}</td>
-                                    <td class="actions"><button class="btn btn-destructive btn-sm" on:click=move |_| revoke(lid.clone())>"Revoke"</button></td>
+                                    <td data-label="Kind">{state}</td>
+                                    <td data-label="Created">{relative(l.created_at)}</td>
+                                    <td data-label="Expires">{relative(l.expires_at)}</td>
+                                    <td class="actions"><button class="btn btn-destructive btn-sm" aria-label=revoke_label on:click=move |_| revoke(lid.clone())>"Revoke"</button></td>
                                 </tr> }
                             }).collect_view()}
                             </tbody>
@@ -796,7 +864,7 @@ fn Machines(admin: bool) -> impl IntoView {
                     <h1>"Machines"</h1>
                     <p class="muted">"Computers signed in with the tunnel CLI. Renaming one keeps its login and tunnels; removing one stops its login and closes its tunnels."</p>
                 </div>
-                {admin.then(|| view! { <ShowAll all=all what="machines" on_change=load /> })}
+                {admin.then(|| view! { <div class="head-actions"><ShowAll all=all what="machines" on_change=load /></div> })}
             </div>
             <ErrorBox error=error />
             <div class="grid2">
@@ -804,12 +872,12 @@ fn Machines(admin: bool) -> impl IntoView {
                     <h2>"Connect a machine"</h2>
                     <p class="muted small">"On the machine, run this and approve it in your browser:"</p>
                     <Copy value=Signal::derive(move || login_cmd.clone()) label="Login command" />
-                    <p class="small"><a href="/cli" on:click=move |ev| { ev.prevent_default(); navigate("/cli"); }>"Install the CLI first"</a></p>
+                    <p class="small"><a class="tap" href="/cli" on:click=move |ev| { ev.prevent_default(); navigate("/cli"); }>"Install the CLI first"</a></p>
                 </div>
                 <form class="card stack" on:submit=add>
                     <h2>"Add a headless machine"</h2>
                     <p class="muted small">"For servers without a browser: a one-time login code, valid 15 minutes."</p>
-                    <div class="row">
+                    <div class="row row-fill">
                         <label class="sr-only" for="machine-name">"Name"</label>
                         <input id="machine-name" class="input grow" placeholder="name, e.g. ci-runner" required
                             prop:value=move || name.get() on:input=move |ev| name.set(value(&ev)) />
@@ -834,20 +902,21 @@ fn Machines(admin: bool) -> impl IntoView {
                     <div class="card"><Empty title="No machines yet"><p>"Connect one with the command above."</p></Empty></div>
                 }.into_any(),
                 Some(list) => view! {
-                    <div class="card card-tight table-wrap"><table class="table">
-                        <thead><tr><th>"Name"</th><th>"Account"</th><th>"Status"</th><th>"Last used"</th><th>"Tunnels"</th><th></th></tr></thead>
+                    <div class="card card-tight table-wrap"><table class="table table-stack">
+                        <thead><tr><th>"Name"</th><th>"Account"</th><th>"Status"</th><th>"Last used"</th><th>"Tunnels"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                         <tbody>
                         {list.into_iter().map(|m| {
                             let n = m.name.clone();
                             let (n_edit, n_row) = (m.name.clone(), m.name.clone());
                             let is_editing = move || editing.get().as_deref() == Some(n_row.as_str());
                             let shown_name = m.name.clone();
+                            let (rename_label, remove_label) = (format!("Rename {}", m.name), format!("Remove {}", m.name));
                             view! { <tr>
-                                <td>{move || if is_editing() {
+                                <td class="cell-main">{move || if is_editing() {
                                     view! {
                                         <form class="row" on:submit=save_name>
                                             <label class="sr-only" for="rename-machine">"New name"</label>
-                                            <input id="rename-machine" class="input input-sm" required maxlength="64"
+                                            <input id="rename-machine" class="input input-sm grow" required maxlength="64"
                                                 pattern="[A-Za-z0-9._\\-]+" title="letters, digits, '.', '_', '-'"
                                                 prop:value=move || new_name.get() on:input=move |ev| new_name.set(value(&ev)) />
                                             <button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save"</button>
@@ -855,15 +924,15 @@ fn Machines(admin: bool) -> impl IntoView {
                                         </form>
                                     }.into_any()
                                 } else {
-                                    view! { <span>{shown_name.clone()}</span> }.into_any()
+                                    view! { <span class="name">{shown_name.clone()}</span> }.into_any()
                                 }}</td>
-                                <td>{m.user.clone()}</td>
-                                <td>{if m.enrolled { view!{ <span class="badge badge-success">"signed in"</span> }.into_any() } else { view!{ <span class="badge badge-warning">"code not used"</span> }.into_any() }}</td>
-                                <td>{m.last_used_at.map(relative).unwrap_or_else(|| "never".into())}</td>
-                                <td>{m.tunnels}</td>
+                                <td data-label="Account">{m.user.clone()}</td>
+                                <td data-label="Status">{if m.enrolled { view!{ <span class="badge badge-success">"signed in"</span> }.into_any() } else { view!{ <span class="badge badge-warning">"code not used"</span> }.into_any() }}</td>
+                                <td data-label="Last used">{m.last_used_at.map(relative).unwrap_or_else(|| "never".into())}</td>
+                                <td data-label="Tunnels">{m.tunnels}</td>
                                 <td class="actions">
-                                    <button class="btn btn-outline btn-sm" on:click=move |_| { new_name.set(n_edit.clone()); editing.set(Some(n_edit.clone())); }>"Rename"</button>
-                                    <button class="btn btn-destructive btn-sm" on:click=move |_| remove(n.clone())>"Remove"</button>
+                                    <button class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| { new_name.set(n_edit.clone()); editing.set(Some(n_edit.clone())); }>"Rename"</button>
+                                    <button class="btn btn-destructive btn-sm" aria-label=remove_label on:click=move |_| remove(n.clone())>"Remove"</button>
                                 </td>
                             </tr> }
                         }).collect_view()}
@@ -944,7 +1013,7 @@ fn Device() -> impl IntoView {
                 {move || request.get().map(|r| view! {
                     <div class="stack">
                         <p>"This will let the machine below create tunnels as you."</p>
-                        <table class="table">
+                        <table class="table table-kv">
                             <tr><th>"Machine"</th><td>{r.client_name.clone()}</td></tr>
                             <tr><th>"Address"</th><td>{r.ip.clone().unwrap_or_else(|| "unknown".into())}</td></tr>
                             <tr><th>"Requested"</th><td>{relative(r.created_at)}</td></tr>
@@ -1125,7 +1194,7 @@ fn Account() -> impl IntoView {
                     } else {
                         let l = u.limits.clone();
                         view! {
-                            <table class="table">
+                            <table class="table table-kv">
                                 <tbody>
                                     <tr><th>"Live tunnels (across your machines)"</th><td>{used_of(usage.tunnels, l.tunnels.effective)}</td></tr>
                                     <tr><th>"Machines"</th><td>{used_of(usage.machines, l.machines.effective)}</td></tr>
@@ -1217,17 +1286,17 @@ fn Account() -> impl IntoView {
                 </div>
             </div>
             <div class="card card-tight table-wrap">
-                <div class="row card-head"><h2 class="grow">"Sessions"</h2>
+                <div class="row card-head card-head-actions"><h2 class="grow">"Sessions"</h2>
                     <button class="btn btn-outline btn-sm" on:click=move |_| revoke("others".into())>"Sign out other sessions"</button></div>
-                <table class="table">
-                    <thead><tr><th>"Device"</th><th>"Address"</th><th>"Last active"</th><th></th></tr></thead>
+                <table class="table table-stack">
+                    <thead><tr><th>"Device"</th><th>"Address"</th><th>"Last active"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
                     {move || sessions.get().into_iter().map(|s| {
                         let id = s.id.clone();
                         view! { <tr>
-                            <td>{s.user_agent.clone().unwrap_or_default()}{s.current.then(|| view! { " " <span class="badge badge-info">"this one"</span> })}</td>
-                            <td>{s.ip.clone().unwrap_or_default()}</td>
-                            <td>{relative(s.last_seen_at)}</td>
+                            <td class="cell-main ua">{s.user_agent.clone().unwrap_or_default()}{s.current.then(|| view! { " " <span class="badge badge-info">"this one"</span> })}</td>
+                            <td data-label="Address">{s.ip.clone().unwrap_or_default()}</td>
+                            <td data-label="Last active">{relative(s.last_seen_at)}</td>
                             <td class="actions">{(!s.current).then(|| view! {
                                 <button class="btn btn-outline btn-sm" on:click=move |_| revoke(id.clone())>"Sign out"</button>
                             })}</td>
@@ -1323,9 +1392,9 @@ fn Users(me: User) -> impl IntoView {
                 })}
             </form>
             <div class="card card-tight table-wrap">
-                <table class="table">
+                <table class="table table-stack">
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
-                        <th>{move || format!("Traffic {}", month.get())}</th><th>"Public previews"</th><th>"2FA"</th><th></th></tr></thead>
+                        <th>{move || format!("Traffic {}", month.get())}</th><th>"Public previews"</th><th>"2FA"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
                     {move || users.get().into_iter().map(|row| {
                         let u = row.user.clone();
@@ -1340,12 +1409,12 @@ fn Users(me: User) -> impl IntoView {
                         let is_admin = u.role == "admin";
                         let limits = u.limits.clone();
                         view! { <tr>
-                            <td>{u.username.clone()}{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}</td>
-                            <td>{u.role.clone()}</td>
-                            <td>{used_of(row.clients.max(0) as u64, u.limits.machines.effective)}</td>
-                            <td>{used_of(row.tunnels.max(0) as u64, u.limits.tunnels.effective)}
+                            <td class="cell-main"><span class="name">{u.username.clone()}</span>{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}</td>
+                            <td data-label="Role">{u.role.clone()}</td>
+                            <td data-label="Machines">{used_of(row.clients.max(0) as u64, u.limits.machines.effective)}</td>
+                            <td data-label="Tunnels">{used_of(row.tunnels.max(0) as u64, u.limits.tunnels.effective)}
                                 <div class="muted small">{format!("lifetime {}", u.limits.tunnel_ttl_s.effective.map(duration_text).unwrap_or_else(|| "unlimited".into()))}</div></td>
-                            <td>
+                            <td data-label="Traffic">
                                 <div>{traffic_text(row.traffic_bytes, cap)}
                                     {limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}</div>
                                 {editable.then(|| view! {
@@ -1353,13 +1422,13 @@ fn Users(me: User) -> impl IntoView {
                                         on:click=move |_| reset_traffic(id6.clone())>"Reset month"</button>
                                 })}
                             </td>
-                            <td>{if u.role == "member" {
+                            <td data-label="Public previews">{if u.role == "member" {
                                 if editable { view! {
                                     <label class="check"><input type="checkbox" prop:checked=can_public
                                         on:change=move |ev| update(id1.clone(), json!({ "can_public": event_target_checked(&ev) })) />"allowed"</label>
                                 }.into_any() } else { view! { {if can_public { "allowed" } else { "no" }} }.into_any() }
                             } else { view! { "admin" }.into_any() }}</td>
-                            <td>{if u.totp { "on" } else { "off" }}</td>
+                            <td data-label="2FA">{if u.totp { "on" } else { "off" }}</td>
                             <td class="actions">{editable.then(|| view! {
                                 <button class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
                                     on:click=move |_| editing.update(|e| *e = !*e)>"Limits"</button>" "
@@ -1376,7 +1445,7 @@ fn Users(me: User) -> impl IntoView {
                             })}</td>
                         </tr>
                         {move || editing.get().then(|| view! {
-                            <tr class="limits-row"><td colspan="8" class="links-panel">
+                            <tr class="limits-row panel-row"><td colspan="8" class="links-panel">
                                 <LimitsEditor id=id5.clone() limits=limits.clone() busy=busy error=error update=update />
                             </td></tr>
                         })}
@@ -1387,8 +1456,8 @@ fn Users(me: User) -> impl IntoView {
             </div>
             <div class="card card-tight table-wrap">
                 <h2 class="card-head">"Invites"</h2>
-                <table class="table">
-                    <thead><tr><th>"Role"</th><th>"By"</th><th>"Created"</th><th>"Status"</th><th></th></tr></thead>
+                <table class="table table-stack">
+                    <thead><tr><th>"Role"</th><th>"By"</th><th>"Created"</th><th>"Status"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
                     {move || invites.get().into_iter().map(|i| {
                         let id = i.id.clone();
@@ -1399,10 +1468,10 @@ fn Users(me: User) -> impl IntoView {
                             (None, false) => "expired".into(),
                         };
                         view! { <tr>
-                            <td>{i.role.clone()}</td>
-                            <td>{i.created_by.clone().unwrap_or_default()}</td>
-                            <td>{relative(i.created_at)}</td>
-                            <td>{status}</td>
+                            <td class="cell-main">{i.role.clone()}</td>
+                            <td data-label="By">{i.created_by.clone().unwrap_or_else(|| "—".into())}</td>
+                            <td data-label="Created">{relative(i.created_at)}</td>
+                            <td data-label="Status">{status}</td>
                             <td class="actions">{open.then(|| view! {
                                 <button class="btn btn-outline btn-sm" on:click=move |_| revoke_invite(id.clone())>"Revoke"</button>
                             })}</td>
@@ -1417,12 +1486,12 @@ fn Users(me: User) -> impl IntoView {
                 {move || {
                     let list = services.get();
                     if list.is_empty() { view! { <p class="muted small">"None."</p> }.into_any() } else {
-                        view! { <table class="table">
+                        view! { <table class="table table-stack">
                             <thead><tr><th>"Name"</th><th>"Tunnels"</th><th>"Last used"</th></tr></thead>
                             <tbody>{list.into_iter().map(|s| view! { <tr>
-                                <td>{s["name"].as_str().unwrap_or_default().to_string()}</td>
-                                <td>{format!("{} / {}", s["tunnels"], s["max_tunnels"])}</td>
-                                <td>{s["last_used_at"].as_i64().map(relative).unwrap_or_else(|| "never".into())}</td>
+                                <td class="cell-main">{s["name"].as_str().unwrap_or_default().to_string()}</td>
+                                <td data-label="Tunnels">{format!("{} / {}", s["tunnels"], s["max_tunnels"])}</td>
+                                <td data-label="Last used">{s["last_used_at"].as_i64().map(relative).unwrap_or_else(|| "never".into())}</td>
                             </tr> }).collect_view()}</tbody>
                         </table> }.into_any()
                     }
@@ -1469,7 +1538,7 @@ fn Status() -> impl IntoView {
             <div class="grid2">
                 <div class="card stack">
                     <h2>"Hosts"</h2>
-                    <table class="table">
+                    <table class="table table-kv">
                         <tr><th>"Version"</th><td>{field(&["version"])}</td></tr>
                         <tr><th>"Web UI"</th><td>{field(&["hosts", "ui"])}</td></tr>
                         <tr><th>"API"</th><td>{field(&["hosts", "api"])}</td></tr>
@@ -1481,7 +1550,7 @@ fn Status() -> impl IntoView {
                 </div>
                 <div class="card stack">
                     <h2>"Usage and limits"</h2>
-                    <table class="table">
+                    <table class="table table-kv">
                         <tr><th>"Connected tunnels"</th><td>{field(&["connected_tunnels"])}</td></tr>
                         <tr><th>"Tunnels"</th><td>{field(&["counts", "tunnels"])}</td></tr>
                         <tr><th>"Access links"</th><td>{field(&["counts", "access_links"])}</td></tr>
@@ -1500,15 +1569,15 @@ fn Status() -> impl IntoView {
             </div>
             <div class="card card-tight table-wrap">
                 <h2 class="card-head">"Audit log"</h2>
-                <table class="table">
-                    <thead><tr><th>"When"</th><th>"Who"</th><th>"What"</th><th>"Target"</th><th>"Address"</th></tr></thead>
+                <table class="table table-stack">
+                    <thead><tr><th>"What"</th><th>"When"</th><th>"Who"</th><th>"Target"</th><th>"Address"</th></tr></thead>
                     <tbody>
                     {move || audit.get().into_iter().map(|e| view! { <tr>
-                        <td>{when(e.at)}</td>
-                        <td>{e.user.clone().unwrap_or_else(|| "—".into())}</td>
-                        <td>{e.action.replace('_', " ")}</td>
-                        <td class="mono small">{e.target.clone().unwrap_or_default()}</td>
-                        <td>{e.ip.clone().unwrap_or_default()}</td>
+                        <td class="cell-main">{e.action.replace('_', " ")}</td>
+                        <td data-label="When">{when(e.at)}</td>
+                        <td data-label="Who">{e.user.clone().unwrap_or_else(|| "—".into())}</td>
+                        <td data-label="Target" class="mono small break">{e.target.clone().unwrap_or_default()}</td>
+                        <td data-label="Address">{e.ip.clone().unwrap_or_default()}</td>
                     </tr> }).collect_view()}
                     </tbody>
                 </table>

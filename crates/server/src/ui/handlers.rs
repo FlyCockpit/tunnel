@@ -52,7 +52,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/ui/api/machines", get(list_machines).post(add_machine))
         .route("/ui/api/machines/{name}", delete(delete_machine).patch(rename_machine))
         .route("/ui/api/tunnels", get(list_tunnels))
-        .route("/ui/api/tunnels/{id}", delete(delete_tunnel))
+        .route("/ui/api/tunnels/{id}", delete(delete_tunnel).patch(rename_tunnel))
+        .route("/ui/api/tunnels/{id}/open", post(open_tunnel))
         .route("/ui/api/tunnels/{id}/links", get(list_links).post(create_link))
         .route("/ui/api/links/{id}", delete(revoke_link))
         .route("/ui/api/device/lookup", post(device_lookup))
@@ -806,15 +807,24 @@ struct UiTunnel {
     /// The machine (or service) that created it.
     owner: Option<String>,
     user: Option<String>,
+    /// One of the signed-in user's own machines created it: Open signs them
+    /// in without the visitor prompt.
+    mine: bool,
 }
 
 async fn list_tunnels(State(state): State<Arc<AppState>>, s: Signed, q: Query<AllQuery>) -> ApiResult<Json<Value>> {
     // Stored bytes and unflushed ones from the same side of any flush.
     let _reading = state.traffic.reading().await;
     let rows = state.db.list_user_tunnels(scope(&s, &q)?).await?;
+    let me = &s.user().id;
     let tunnels: Vec<UiTunnel> = rows
         .into_iter()
-        .map(|(row, owner, user)| UiTunnel { view: api::tunnel_view(&state, &row), owner, user })
+        .map(|(row, owner, user)| UiTunnel {
+            mine: row.user_id.as_ref() == Some(me),
+            view: api::tunnel_view(&state, &row),
+            owner,
+            user,
+        })
         .collect();
     Ok(Json(json!({ "tunnels": tunnels })))
 }
@@ -845,6 +855,97 @@ async fn delete_tunnel(State(state): State<Arc<AppState>>, s: Signed, Path(id): 
         }
         DeleteOutcome::NotFound => Err(ApiError::not_found("tunnel")),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameTunnel {
+    /// `""` removes the name.
+    name: String,
+}
+
+/// Rename a tunnel (whoever may manage it, checked again in the write's
+/// transaction). The name is a label only: the tunnel's URLs and links stay
+/// as they are.
+async fn rename_tunnel(
+    State(state): State<Arc<AppState>>,
+    s: Signed,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<RenameTunnel>,
+) -> ApiResult<Json<Value>> {
+    let name = api::tunnel_name(&req.name)?;
+    if !tokens::is_valid_tunnel_id(&id) {
+        return Err(ApiError::not_found("tunnel"));
+    }
+    let old = state
+        .db
+        .rename_tunnel_for(id.clone(), name.clone(), s.user().id.clone(), s.session.id_hash.clone())
+        .await?
+        .ok_or_else(|| ApiError::not_found("tunnel"))?;
+    state.invalidate_tunnel(&id);
+    if old != name {
+        let shown = |n: &Option<String>| n.clone().unwrap_or_else(|| "(no name)".into());
+        let target = format!("{id}: {} -> {}", shown(&old), shown(&name));
+        audit(&state, Some(&s.user().id), "tunnel_renamed", Some(target), &s.ctx).await;
+    }
+    Ok(Json(json!({ "id": id, "name": name })))
+}
+
+/// Label, longest lifetime and the shortest acceptable lifetime of the
+/// links Open mints (a link may not outlive its tunnel).
+const OPEN_LABEL: &str = "Opened from the dashboard";
+const OPEN_TTL_S: i64 = 60;
+const OPEN_MIN_TTL_S: i64 = 30;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenTunnel {
+    port: u16,
+}
+
+/// Open: a single-use owner link for one connected port of the signed-in
+/// user's own tunnel. The browser goes through it to the preview and gets
+/// the normal gate session, so the tunnel's own visitor sign-in (password
+/// or access link) is skipped for its owner. Nobody else, admins included,
+/// can mint one: they make an ordinary access link under Links instead.
+async fn open_tunnel(
+    State(state): State<Arc<AppState>>,
+    s: Signed,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<OpenTunnel>,
+) -> ApiResult<(StatusCode, Json<api::AccessLinkResponse>)> {
+    let row = ui_tunnel(&state, &s, &id).await?;
+    if row.user_id.as_ref() != Some(&s.user().id) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_owner",
+            "only the tunnel's owner can open it without signing in; make an access link under Links instead",
+        ));
+    }
+    if row.is_expired() {
+        return Err(ApiError::expired());
+    }
+    let connected = state.registry.get(&id).is_some_and(|l| l.ports().contains(&req.port));
+    if !connected {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "port_not_connected",
+            "this port is not connected: start the app and the tunnel on its machine",
+        ));
+    }
+    let ttl = OPEN_TTL_S.min(row.expires_at - crate::tokens::now() - 5);
+    if ttl < OPEN_MIN_TTL_S {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "tunnel_ending",
+            "this tunnel ends in less than a minute; it can no longer be opened",
+        ));
+    }
+    let ui = (s.user().id.clone(), s.session.id_hash.clone());
+    let link = api::mint_owner_link(&state, &row, req.port, ttl as u64, OPEN_LABEL, ui).await?;
+    let target = format!("{} {} port {}", row.id, link.id, req.port);
+    audit(&state, Some(&s.user().id), "tunnel_opened", Some(target), &s.ctx).await;
+    Ok((StatusCode::CREATED, Json(link)))
 }
 
 async fn list_links(

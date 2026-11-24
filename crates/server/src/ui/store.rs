@@ -284,6 +284,8 @@ pub struct LinkSummary {
     pub session_ttl_s: i64,
     pub created_at: i64,
     pub expires_at: i64,
+    /// `visitor` or `owner` (Open in the web UI).
+    pub kind: String,
 }
 
 const USER_COLUMNS: &str = "u.id, u.username, u.role, u.disabled_at IS NOT NULL, u.can_public, \
@@ -1451,6 +1453,57 @@ impl Db {
         .await
     }
 
+    /// Rename live tunnel `id` from the web UI: the session must still be
+    /// valid and `actor` may manage the tunnel (their own; admins members';
+    /// the owner anyone's; service and admin-token tunnels admins only),
+    /// checked here, in the transaction. `Ok(Some(old name))` when renamed,
+    /// `Ok(None)` when not found (or not theirs, or signed out meanwhile).
+    pub async fn rename_tunnel_for(
+        &self,
+        id: String,
+        name: Option<String>,
+        actor: String,
+        session: String,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        self.call(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !authorized(&tx, &actor, None, &session)? {
+                return Ok(None);
+            }
+            let actor_role =
+                Role::parse(
+                    &tx.query_row("SELECT role FROM users WHERE id = ?1", params![actor], |r| r.get::<_, String>(0))?,
+                );
+            let found: Option<(Option<String>, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT t.name, c.user_id, u.role FROM tunnels t
+                     LEFT JOIN clients c ON c.id = t.client_id LEFT JOIN users u ON u.id = c.user_id
+                     WHERE t.id = ?1 AND t.expires_at > ?2",
+                    params![id, now()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((old, owner, owner_role)) = found else {
+                return Ok(None);
+            };
+            let allowed = match owner {
+                Some(owner) => {
+                    owner == actor
+                        || actor_role == Role::Owner
+                        || (actor_role == Role::Admin && owner_role.as_deref() == Some("member"))
+                }
+                None => actor_role.is_admin(),
+            };
+            if !allowed {
+                return Ok(None);
+            }
+            tx.execute("UPDATE tunnels SET name = ?2 WHERE id = ?1", params![id, name])?;
+            tx.commit()?;
+            Ok(Some(old))
+        })
+        .await
+    }
+
     /// Machines of `user_id`, or of everyone when `None`.
     pub async fn list_machines(&self, user_id: Option<String>) -> anyhow::Result<Vec<Machine>> {
         self.call(move |c| {
@@ -1520,7 +1573,7 @@ impl Db {
         self.call(move |c| {
             let sql = "SELECT t.id, t.label, t.metadata, t.max_ports, t.host_header, t.inject_ice, t.created_at, t.expires_at,
                         t.last_seen_at, t.access_mode, t.password_user, t.password_hash, t.client_id,
-                        t.bytes_in, t.bytes_out, c.user_id, COALESCE(c.name, s.name), u.username
+                        t.bytes_in, t.bytes_out, c.user_id, t.name, COALESCE(c.name, s.name), u.username
                  FROM tunnels t
                  LEFT JOIN clients c ON c.id = t.client_id
                  LEFT JOIN users u ON u.id = c.user_id
@@ -1583,6 +1636,9 @@ impl Db {
                 return Ok(false);
             };
             let allowed = match owner {
+                // An owner link (Open) is only ever for the tunnel's own user.
+                Some(owner) if l.owner_port.is_some() => owner == actor,
+                None if l.owner_port.is_some() => false,
                 Some(owner) => {
                     owner == actor
                         || actor_role == Role::Owner
@@ -1594,9 +1650,20 @@ impl Db {
                 return Ok(false);
             }
             tx.execute(
-                "INSERT INTO access_links (id, tunnel_id, token_hash, single_use, label, session_ttl_s, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![l.id, l.tunnel_id, l.token_hash, l.single_use, l.label, l.session_ttl_s, t, l.expires_at],
+                "INSERT INTO access_links (id, tunnel_id, token_hash, single_use, label, session_ttl_s, created_at, expires_at, kind, port)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    l.id,
+                    l.tunnel_id,
+                    l.token_hash,
+                    l.single_use,
+                    l.label,
+                    l.session_ttl_s,
+                    t,
+                    l.expires_at,
+                    if l.owner_port.is_some() { "owner" } else { "visitor" },
+                    l.owner_port,
+                ],
             )?;
             tx.commit()?;
             Ok(true)
@@ -1607,7 +1674,7 @@ impl Db {
     pub async fn list_access_links(&self, tunnel_id: String) -> anyhow::Result<Vec<LinkSummary>> {
         self.call(move |c| {
             let mut stmt = c.prepare(
-                "SELECT id, label, single_use, used_at, session_ttl_s, created_at, expires_at FROM access_links
+                "SELECT id, label, single_use, used_at, session_ttl_s, created_at, expires_at, kind FROM access_links
                  WHERE tunnel_id = ?1 ORDER BY created_at DESC LIMIT 500",
             )?;
             Ok(stmt
@@ -1620,6 +1687,7 @@ impl Db {
                         session_ttl_s: r.get(4)?,
                         created_at: r.get(5)?,
                         expires_at: r.get(6)?,
+                        kind: r.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?)

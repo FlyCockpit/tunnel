@@ -7,14 +7,20 @@ use crate::{ctx, navigate};
 
 /// `<a>` that navigates without a reload.
 #[component]
-pub fn A(href: &'static str, children: Children) -> impl IntoView {
+pub fn A(
+    href: &'static str,
+    #[prop(optional)] class: &'static str,
+    #[prop(optional, into)] title: Option<Signal<String>>,
+    children: Children,
+) -> impl IntoView {
     let c = ctx();
     let current = move || {
         let p = c.path.get();
         (p == href || (href != "/" && p.starts_with(href))).then_some("page")
     };
     view! {
-        <a href=href aria-current=current on:click=move |ev| { ev.prevent_default(); navigate(href); }>
+        <a href=href class=class title=move || title.map(|t| t.get()) aria-current=current
+            on:click=move |ev| { ev.prevent_default(); navigate(href); }>
             {children()}
         </a>
     }
@@ -39,7 +45,7 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
         <header class="header">
             <a class="brand" href="/" on:click=move |ev| { ev.prevent_default(); navigate("/"); }>
                 <img src="/assets/logo-64.png" alt="" width="24" height="24" />
-                <span>"Tunnel"</span>
+                <span class="brand-text">"Tunnel"</span>
             </a>
             <Show when=signed_in>
                 <nav class="nav" aria-label="Main">
@@ -55,7 +61,10 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
             <div class="spacer"></div>
             <ThemeToggle />
             <Show when=signed_in>
-                <A href="/account">{move || user().map(|u| u.username).unwrap_or_default()}</A>
+                <A href="/account" class="account-link"
+                    title=Signal::derive(move || format!("Account: {}", user().map(|u| u.username).unwrap_or_default()))>
+                    {move || user().map(|u| u.username).unwrap_or_default()}
+                </A>
                 <button class="btn btn-ghost btn-sm" on:click=sign_out>"Sign out"</button>
             </Show>
         </header>

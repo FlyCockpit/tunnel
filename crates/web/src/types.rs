@@ -141,6 +141,12 @@ pub struct Tunnel {
     pub id: String,
     #[serde(default)]
     pub label: Option<String>,
+    /// Display name (a label only; URLs never change).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// One of the signed-in user's own machines made it (Open skips its sign-in).
+    #[serde(default)]
+    pub mine: bool,
     pub access: Access,
     #[serde(default)]
     pub connected: bool,
@@ -169,6 +175,9 @@ pub struct Link {
     pub id: String,
     #[serde(default)]
     pub label: Option<String>,
+    /// `visitor`, or `owner` (made by Open for the tunnel's own user).
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub single_use: bool,
     #[serde(default)]

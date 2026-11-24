@@ -206,15 +206,18 @@ impl Status {
     }
 
     pub fn print(&self, json: bool) {
-        self.print_access(json, None);
+        self.print_access(json, None, None);
     }
 
     /// `--json` output: the daemon's status plus, when the CLI could read the
     /// tunnel from the server, `mode` (`link` | `password` | `public`),
     /// `username` (password mode; never the password) and each port's
     /// `login_url` (password mode).
-    pub fn to_json(&self, access: Option<&AccessInfo>) -> serde_json::Result<serde_json::Value> {
+    pub fn to_json(&self, access: Option<&AccessInfo>, name: Option<&str>) -> serde_json::Result<serde_json::Value> {
         let mut v = serde_json::to_value(self)?;
+        if let Some(name) = name {
+            v["name"] = name.into();
+        }
         if let Some(access) = access {
             v["mode"] = access.mode.clone().into();
             if access.mode == "password" {
@@ -229,10 +232,10 @@ impl Status {
         Ok(v)
     }
 
-    /// [`Status::print`] with the tunnel's access settings, if known.
-    pub fn print_access(&self, json: bool, access: Option<&AccessInfo>) {
+    /// [`Status::print`] with the tunnel's access settings and display name, if known.
+    pub fn print_access(&self, json: bool, access: Option<&AccessInfo>, name: Option<&str>) {
         if json {
-            match self.to_json(access).and_then(|v| serde_json::to_string_pretty(&v)) {
+            match self.to_json(access, name).and_then(|v| serde_json::to_string_pretty(&v)) {
                 Ok(s) => println!("{s}"),
                 Err(e) => eprintln!("tunnel: encoding status: {e}"),
             }
@@ -241,6 +244,9 @@ impl Status {
         println!("state: {}", self.state.as_str());
         if let Some(id) = &self.tunnel_id {
             println!("tunnel: {}", crate::paths::terminal_text(id));
+        }
+        if let Some(name) = name {
+            println!("name: {}", crate::paths::terminal_text(name));
         }
         match access {
             Some(a) if a.mode == "password" => println!(
@@ -478,12 +484,12 @@ mod tests {
             target: None,
             features: vec![],
         };
-        let plain = status.to_json(None).unwrap();
+        let plain = status.to_json(None, None).unwrap();
         assert!(plain.get("mode").is_none() && plain.get("username").is_none());
         assert_eq!(plain, serde_json::to_value(&status).unwrap());
 
         let password = AccessInfo { mode: "password".into(), username: Some("preview".into()) };
-        let v = status.to_json(Some(&password)).unwrap();
+        let v = status.to_json(Some(&password), None).unwrap();
         assert_eq!(v["mode"], "password");
         assert_eq!(v["username"], "preview");
         assert_eq!(v["ports"][0]["login_url"], "https://p.example/__login?to=3000-ab12cd3efg&next=%2F");
@@ -491,7 +497,7 @@ mod tests {
         assert!(!v.to_string().contains("password\":\"") && v.get("password").is_none());
 
         for mode in ["link", "public"] {
-            let v = status.to_json(Some(&AccessInfo { mode: mode.into(), username: Some("x".into()) })).unwrap();
+            let v = status.to_json(Some(&AccessInfo { mode: mode.into(), username: Some("x".into()) }), None).unwrap();
             assert_eq!(v["mode"], mode);
             assert!(v.get("username").is_none(), "{mode}");
             assert!(v["ports"][0].get("login_url").is_none(), "{mode}");

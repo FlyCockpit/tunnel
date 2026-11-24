@@ -26,14 +26,21 @@ user asked for something else.
 ## Share
 
 ```sh
-tunnel share 3000 --json                # link-only tunnel (8 h); one single-use link per port
-tunnel share 3000 5173 --ttl 1h --json  # several ports, shorter lifetime
+tunnel share 3000 --name "Checkout redesign" --json   # link-only tunnel (8 h); one single-use link per port
+tunnel share 3000 5173 --ttl 1h --name "API + UI" --json  # several ports, shorter lifetime
 ```
+
+**Name what you share** with `--name "<what it is>"` (up to 80 characters):
+the user sees it first in the web UI's tunnel list and in `tunnel status`,
+instead of a random id. It is a label only: the URL keeps its random id, the
+name need not be unique, and `--name` on a share that is already running
+renames it without changing any link. Describe the app ("Checkout redesign",
+"Docs preview, PR 412"); never put secrets, passwords or links in a name.
 
 `--json` prints one line you can parse:
 
 ```json
-{"tunnel":"ab12cd3efg","mode":"link","expires_at":1795400000,
+{"tunnel":"ab12cd3efg","name":"Checkout redesign","mode":"link","expires_at":1795400000,
  "links":[{"port":3000,"url":"https://…","connected":true,"id":"lk…","expires_at":1795370000,"single_use":true}]}
 ```
 

@@ -485,6 +485,7 @@ mod tests {
                     id: "abcdefghij".into(),
                     token_hash: tokens::hash_token("tntun_new"),
                     label: None,
+                    name: None,
                     metadata: None,
                     max_ports: 8,
                     host_header: HostHeaderMode::Rewrite,

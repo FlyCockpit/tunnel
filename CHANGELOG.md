@@ -49,6 +49,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   owner anyone's; audited), `tunnel-server client rename`, and
   `PATCH /v1/clients/{name}` for the admin token. New machine and service names
   made only of dots, or `enroll`, are refused (they collide with URL paths).
+- Tunnel display names: `tunnel share --name`, `name` on the tunnel API, and
+  Rename in the web UI (audited). A label only: URLs and links never change.
+  Shown first in the dashboard and in `tunnel status`.
+- Open on your own tunnel in the web UI goes to the preview signed in, without
+  its password or link prompt, through a single-use owner link bound to that
+  port (a minute at most, audited; a browser's repeated request from the same
+  address within seconds still lands). Others' tunnels get Visit (their normal
+  sign-in).
+- The web UI works on phones and tablets: a two-row header, tables that
+  become one card per row, and 44 px touch targets.
 - `tunnel-server user invite [--role member|admin] [--hours N]` and
   `user delete <name>` for managing accounts from the server's shell.
 - Traffic counters per tunnel and per user and month (request/response bodies

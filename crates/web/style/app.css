@@ -88,7 +88,6 @@ p { margin: 0 0 8px; }
 .btn-destructive { background: color-mix(in oklch, var(--destructive) 10%, transparent); color: var(--destructive); }
 .btn-destructive:hover { background: color-mix(in oklch, var(--destructive) 20%, transparent); }
 .btn-sm { height: 26px; padding: 0 8px; }
-@media (max-width: 760px) { .btn { height: 40px; } .btn-sm { height: 34px; } }
 
 /* Form */
 label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 4px; }
@@ -150,7 +149,100 @@ dialog::backdrop { background: rgb(0 0 0 / 40%); }
 .limits .row { flex-wrap: wrap; }
 .input.input-sm { height: 26px; width: 14rem; padding: 0 8px; }
 .input.input-sm.input-num { width: 6rem; }
-@media (max-width: 760px) { .input.input-sm { height: 34px; width: 100%; } }
 .grow { flex: 1; }
 .card-head { padding: 16px 16px 4px; margin: 0; }
 .row.card-head > h2 { margin: 0; }
+
+/* Page-head controls ("Show all users", Refresh) stay together. */
+.head-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.tunnel-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.tunnel-name .dot { flex: none; }
+/* Names may be one unbroken 80-character word: let them break anywhere,
+   and keep the name column from being squeezed below a readable width. */
+td .name { font-weight: 600; overflow-wrap: break-word; }
+.tunnel-name .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+.tunnels-table td.cell-main { min-width: 9rem; }
+.break { overflow-wrap: anywhere; }
+.table .actions { display: table-cell; }
+.table .actions > * + * { margin-left: 4px; }
+.table-kv th { width: 45%; font-weight: 500; color: var(--muted-foreground); font-size: 12px; }
+.table-kv :is(th, td) { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.table-kv tr:last-child :is(th, td) { border-bottom: 0; }
+.table-kv :is(th, td):first-child { padding-left: var(--table-inset); }
+.table-kv :is(th, td):last-child { padding-right: var(--table-inset); }
+a.btn { text-decoration: none; }
+.row-fill > .input { flex: 1 1 12rem; width: auto; }
+
+/* Touch: every control at least 44px tall (phones, tablets, and any
+   coarse pointer), and 16px input text so iOS does not zoom on focus. */
+@media (max-width: 820px), (pointer: coarse) {
+  .btn, .btn-sm { min-height: 44px; height: auto; padding: 0 14px; font-size: 13px; }
+  .input, select.input, .input.input-sm { height: 44px; font-size: 16px; }
+  .input.input-sm { width: auto; }
+  .check { min-height: 44px; }
+  .check input { width: 20px; height: 20px; }
+  .nav a { min-height: 44px; display: inline-flex; align-items: center; }
+  .brand, .account-link { min-height: 44px; display: inline-flex; align-items: center; }
+  .brand { min-width: 44px; }
+  .copy .btn { min-width: 64px; }
+  a.tap { display: inline-flex; align-items: center; min-height: 44px; }
+  .table .actions > * + * { margin-left: 0; }
+  .table .actions { white-space: normal; }
+  .table td.actions { display: table-cell; }
+  .table .actions .btn { margin: 2px 0 2px 4px; }
+}
+
+/* Phones and narrow tablets: the header becomes two rows (brand and
+   account controls, then the page links as a strip that scrolls sideways
+   if it must). */
+@media (max-width: 820px) {
+  .header { height: auto; flex-wrap: wrap; gap: 0 4px; padding: 0 16px; }
+  .header .spacer { min-width: 0; }
+  .nav {
+    order: 10; flex: 1 0 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none;
+    margin: 0 -16px; padding: 0 12px; border-top: 1px solid var(--border);
+  }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav a { flex: none; white-space: nowrap; padding: 0 10px; }
+  .account-link {
+    max-width: 8.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block;
+    line-height: 44px; padding: 0 6px; font-size: 13px;
+  }
+  .header .btn-ghost { padding: 0 8px; }
+}
+
+/* Phones: data tables become one card per row with labelled fields. */
+@media (max-width: 760px) {
+  .page { padding: 20px 16px 48px; }
+  .page-head { align-items: flex-start; }
+  .page-head > div:first-child { min-width: 100%; }
+  .narrow { margin: 24px 16px; }
+
+  .table-stack, .table-stack tbody, .table-stack tr, .table-stack td { display: block; width: 100%; }
+  .table-stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .table-stack tr { padding: 12px var(--table-inset); border-bottom: 1px solid var(--border); }
+  .table-stack tr:last-child { border-bottom: 0; }
+  .table.table-stack td { border: 0; padding: 3px 0; overflow-wrap: anywhere; }
+  .table.table-stack td[data-label] { position: relative; padding-left: 7.5rem; min-height: 24px; }
+  .table-stack td[data-label]::before {
+    content: attr(data-label); position: absolute; left: 0; top: 3px; width: 7rem;
+    color: var(--muted-foreground); font-size: 12px; font-weight: 500;
+  }
+  .table.table-stack td.cell-main { padding-bottom: 6px; font-size: 14px; }
+  .table.table-stack td.actions { display: flex; flex-wrap: wrap; gap: 8px; text-align: left; padding-top: 8px; }
+  .table-stack td.actions:empty { display: none; }
+  .table-stack td.actions .btn { margin: 0; flex: 1 1 auto; }
+  .table-stack tr.panel-row { padding: 0; }
+  .table.table-stack td.links-panel { padding: 12px var(--table-inset); }
+  .card-tight > .table-stack { --table-inset: 16px; }
+  .table-wrap { overflow-x: visible; }
+  .card-head-actions { flex-wrap: wrap; }
+  .ua { font-size: 12px; }
+  .link-form > * { flex: 1 1 auto; }
+  .limits-grid { grid-template-columns: 1fr; }
+  .limits .row > select { flex: 1 1 100%; }
+}
+@media (max-width: 400px) {
+  .brand-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .account-link { max-width: 7rem; }
+}

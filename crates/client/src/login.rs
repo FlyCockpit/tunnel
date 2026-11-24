@@ -294,6 +294,9 @@ pub struct TunnelInfo {
     pub expired: bool,
     pub expires_at: i64,
     pub access: AccessInfo,
+    /// Display name (`share --name`, or renamed in the web UI).
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub traffic_limited: bool,
 }
@@ -332,11 +335,20 @@ impl<'a> Api<'a> {
         self.http.request(method, format!("{}{path}", self.login.api)).bearer_auth(&self.login.token)
     }
 
-    pub async fn create_tunnel(&self, label: &str, ttl: Ttl, access: &Value) -> anyhow::Result<Created> {
-        let body = match ttl {
+    pub async fn create_tunnel(
+        &self,
+        label: &str,
+        name: Option<&str>,
+        ttl: Ttl,
+        access: &Value,
+    ) -> anyhow::Result<Created> {
+        let mut body = match ttl {
             Ttl::Seconds(ttl_s) => json!({ "label": label, "ttl_s": ttl_s, "access": access }),
             Ttl::Never => json!({ "label": label, "never_expires": true, "access": access }),
         };
+        if let Some(name) = name {
+            body["name"] = json!(name);
+        }
         decode(self.req(reqwest::Method::POST, "/v1/tunnels").json(&body).send().await?, "creating tunnel").await
     }
 
@@ -356,6 +368,16 @@ impl<'a> Api<'a> {
             .send()
             .await?;
         decode::<Value>(resp, "changing access").await.map(|_| ())
+    }
+
+    /// Set the tunnel's display name (`""` removes it).
+    pub async fn rename_tunnel(&self, id: &str, name: &str) -> anyhow::Result<()> {
+        let resp = self
+            .req(reqwest::Method::PATCH, &format!("/v1/tunnels/{id}"))
+            .json(&json!({ "name": name }))
+            .send()
+            .await?;
+        decode::<Value>(resp, "naming tunnel").await.map(|_| ())
     }
 
     /// A new access link that opens `port`'s preview.
@@ -422,6 +444,32 @@ pub fn parse_ttl(s: &str) -> Result<Ttl, String> {
     parse_duration(s).map(Ttl::Seconds).map_err(|e| format!("{e}, or 'never'"))
 }
 
+/// Longest tunnel display name, in characters (the server's limit).
+pub const MAX_NAME_CHARS: usize = 80;
+
+/// `--name`: trimmed, 1..=80 characters, no control, zero-width or bidi
+/// characters (the server's rules, checked before anything is created).
+pub fn parse_name(s: &str) -> Result<String, String> {
+    let name = s.trim();
+    if name.is_empty() {
+        return Err("the name is empty".into());
+    }
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(format!("at most {MAX_NAME_CHARS} characters"));
+    }
+    let hidden = |c: char| {
+        matches!(c, '\u{00AD}' | '\u{034F}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}' | '\u{180E}'
+            | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FEFF}'
+            | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+    };
+    if name.chars().any(|c| c.is_control() || hidden(c)) {
+        return Err("no control, zero-width or bidi characters".into());
+    }
+    Ok(name.to_string())
+}
+
 pub fn parse_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -440,6 +488,33 @@ pub fn parse_duration(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn names_are_trimmed_bounded_and_printable() {
+        assert_eq!(parse_name("  Checkout redesign ").unwrap(), "Checkout redesign");
+        assert_eq!(parse_name("Café 🦀 <b>&amp;").unwrap(), "Café 🦀 <b>&amp;");
+        assert_eq!(parse_name(&"é".repeat(80)).unwrap().chars().count(), 80);
+        assert!(parse_name(&"é".repeat(81)).is_err());
+        for bad in [
+            "",
+            "   ",
+            "a\u{1b}[31mb",
+            "a\nb",
+            "a\u{7f}",
+            "a\u{202e}b",
+            "a\u{200b}b",
+            "a\u{2066}b",
+            "a\u{61c}b",
+            "a\u{ad}b",
+            "\u{3164}",
+            "\u{206a}",
+            "a\u{e0041}b",
+            "\u{feff}",
+        ] {
+            assert!(parse_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

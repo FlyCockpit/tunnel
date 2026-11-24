@@ -8,7 +8,9 @@
 //! session set here covers every preview.
 //!
 //! - `GET /__access/{port}-{id}/{token}` (or `/__access/{id}/{token}`): redeem,
-//!   then go to `https://{port}-{id}.<zone>/`.
+//!   then go to `https://{port}-{id}.<zone>/`. Owner links (the web UI's
+//!   Open) only through their own port; a repeat of the same request from
+//!   the same address within seconds signs in again instead of failing.
 //! - `GET /__login?to={port}-{id}&next=/path`: the form; `POST /__login`: sign in,
 //!   then go to `https://{port}-{id}.<zone>/path`.
 
@@ -90,7 +92,9 @@ async fn live_tunnel(state: &AppState, id: &str) -> Option<TunnelRow> {
 }
 
 async fn access(state: &Arc<AppState>, peer: SocketAddr, rest: &str, req: &Request<Incoming>) -> Response<Body> {
-    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+    // Only a navigation redeems: a HEAD (link checkers, previews) must not
+    // use up a single-use link.
+    if *req.method() != Method::GET {
         return pages::not_found();
     }
     let Some((target, token)) = rest.split_once('/') else {
@@ -102,13 +106,14 @@ async fn access(state: &Arc<AppState>, peer: SocketAddr, rest: &str, req: &Reque
     if token.is_empty() || token.contains('/') {
         return pages::not_found();
     }
+    let named_port = port;
     let port = port.or_else(|| state.registry.get(id).and_then(|l| l.ports().first().copied()));
     let location = match port {
         Some(p) => format!("{}/", preview_origin(state, p, id)),
         None => String::new(),
     };
     let cookies = gate::split_cookies(req.headers());
-    let resp = gate::redeem(state, peer.ip(), id, token, &cookies.values, &location).await;
+    let resp = gate::redeem(state, peer.ip(), id, named_port, token, &cookies.values, &location).await;
     if resp.status() == StatusCode::UNAUTHORIZED {
         // A used or expired link still leads somewhere useful when the tunnel
         // has another way in. Unknown and ended tunnels keep the generic 401.

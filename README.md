@@ -428,6 +428,36 @@ switching one to public (link and password mode stay available).
   `Accept: application/json`, else HTML). There is no HTTP Basic.
 - **Public**: anyone with the preview URL can visit without a gate session.
 
+**Names.** A tunnel can carry a display name for people: `tunnel share 3000
+--name "Checkout redesign"`, `name` on `POST`/`PATCH /v1/tunnels`, or Rename
+on the web UI's Tunnels page (whoever may manage the tunnel: its user, admins
+for members', the owner for anyone's; audited as `tunnel_renamed`). It is a
+label only: URLs keep their random ids, names need not be unique, and renaming
+never changes or ends a link. Names are trimmed, at most 80 characters, and
+may not contain control, zero-width or bidi-override characters (HTTP 422);
+`""` removes one. The dashboard shows the name first and the preview host
+under it; `tunnel status` prints `name:`, and `share --json`/`status --json`
+carry `name`. `label` stays a separate, machine-readable tag (`share-<host>`
+by default) that `GET /v1/tunnels?label=` matches exactly.
+
+**Open (owner sign-in).** On the Tunnels page, Open on one of your own tunnels
+takes you to the preview signed in, without its password or link prompt: the
+click asks the server (`POST /ui/api/tunnels/{id}/open`, CSRF-protected) for
+a single-use owner link to that port, valid for a minute at most (less in a
+tunnel's last minute; refused in its last 30 seconds), and the new tab goes
+through it. Redeeming it on the zone host sets the normal gate session, so it
+works with the preview zone on another registrable domain than the UI. An owner
+link opens only the port it was made for, is listed under Links (kind
+`owner`, "Opened from the dashboard") and audited (`tunnel_opened`); its token
+is only ever in that one response and the tab's first navigation. Browsers can
+send one navigation twice (a retry on a fresh connection); the same address
+may therefore redeem a used owner link again within 10 seconds, and nobody
+else can. Only the tunnel's own user gets Open: an admin looking at other
+users' tunnels ("Show all users") gets Visit, which goes to the preview and its
+normal sign-in; an admin who needs in can make an ordinary access link under
+Links (as before, and audited as `link_created`). A `HEAD` request never
+redeems a link.
+
 Mint links with `POST /v1/tunnels/{id}/access-links` (or `tunnel link`).
 The response's `url` points to
 `https://<zone>/__access/{port}-{id}/{token}`. Links can be single-use or reusable until

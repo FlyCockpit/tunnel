@@ -2542,6 +2542,7 @@ zone = "example.com"
                 id: "abcdefghij".into(),
                 token_hash: "test-token-hash".into(),
                 label: None,
+                name: None,
                 metadata: None,
                 max_ports: 8,
                 host_header: crate::db::HostHeaderMode::Rewrite,
