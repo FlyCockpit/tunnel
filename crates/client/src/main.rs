@@ -13,7 +13,6 @@ mod ice;
 mod ipc;
 mod login;
 mod paths;
-mod session;
 mod share;
 mod state;
 

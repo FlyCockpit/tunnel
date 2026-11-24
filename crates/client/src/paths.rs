@@ -224,6 +224,14 @@ pub fn ice_port() -> u16 {
     }
 }
 
+/// `--target`, else `$TUNNEL_TARGET_HOST`; validated (IP literals only).
+pub(crate) fn resolve_target(flag: Option<String>) -> anyhow::Result<Option<String>> {
+    match flag {
+        Some(t) => Ok(Some(parse_target(&t)?.to_string())),
+        None => Ok(env_target()?.map(|ip| ip.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

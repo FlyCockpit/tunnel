@@ -1,5 +1,5 @@
 //! The background daemon: persisted state, the IPC socket, and the shared
-//! state the tunnel session (`session.rs`) and ICE endpoint (`ice.rs`) use.
+//! state the tunnel session (`session`) and the local ICE endpoint (`endpoint`) use; both are the daemon's own.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -21,8 +21,10 @@ use tunnel_protocol::{ClientMsg, EXIT_REPLACED, EXIT_REVOKED, IceConfig, read_js
 use crate::ice;
 use crate::ipc::{ConnState, Expect, PortStatus, Request, Response, Status, host_for};
 use crate::paths::{self, ENV_SERVER, ENV_TOKEN, Paths, env_nonempty, terminal_text};
-use crate::session;
 use crate::state::{Persisted, normalize_server, resolve_server, write_atomic};
+
+mod endpoint;
+mod session;
 
 /// Wait for a server reply on the control stream.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,7 +73,7 @@ struct Inner {
 pub struct Daemon {
     paths: Paths,
     pub ice_file: PathBuf,
-    /// Bearer token for the local `/ice` endpoint (see `ice::serve_http`).
+    /// Bearer token for the local `/ice` endpoint (see `endpoint::serve_http`).
     pub ice_token: String,
     pub ice_port: u16,
     /// Whether `/ice` is actually served (the port may be taken by someone
@@ -609,11 +611,11 @@ pub async fn run() -> anyhow::Result<()> {
         ice_file = %ice_file.display(),
         "daemon starting"
     );
-    let ice_listener = ice::bind_http(ice_port).await;
+    let ice_listener = endpoint::bind_http(ice_port).await;
     let daemon = Arc::new(Daemon::new(paths, ice_file, ice_token, ice_port, ice_listener.is_some(), persisted));
     tokio::spawn(accept_ipc(daemon.clone(), listener));
     if let Some(ice_listener) = ice_listener {
-        tokio::spawn(ice::serve_http(daemon.clone(), ice_listener, ice_port));
+        tokio::spawn(endpoint::serve_http(daemon.clone(), ice_listener, ice_port));
     }
     tokio::spawn(daemon.clone().exit_on_signal());
     session::run(daemon).await;
@@ -938,7 +940,7 @@ mod tests {
         let (link, mut rx) = fixture.connect();
         let daemon = fixture.daemon.clone();
         let reconcile_link = link.clone();
-        let task = tokio::spawn(crate::session::reconcile_ports(daemon, reconcile_link, vec![3000], vec![5173]));
+        let task = tokio::spawn(session::reconcile_ports(daemon, reconcile_link, vec![3000], vec![5173]));
         let Some(ClientMsg::Unexpose { id, port: 3000 }) = rx.recv().await else {
             panic!("expected stale unexpose first");
         };
@@ -964,7 +966,7 @@ mod tests {
             ports: hello.clone(),
         };
         let (stale, missing) = fixture.daemon.connected(link.clone(), welcome, &hello).unwrap();
-        let task = tokio::spawn(crate::session::reconcile_ports(fixture.daemon.clone(), link.clone(), stale, missing));
+        let task = tokio::spawn(session::reconcile_ports(fixture.daemon.clone(), link.clone(), stale, missing));
         let Some(ClientMsg::Unexpose { id: removing, port: 3000 }) = rx.recv().await else {
             panic!("expected first stale removal");
         };
@@ -1045,12 +1047,8 @@ mod tests {
     async fn superseded_reconciliation_preserves_new_ports_and_error() {
         let fixture = Fixture::new(vec![3000, 5173]);
         let (link, mut rx) = fixture.connect();
-        let task = tokio::spawn(crate::session::reconcile_ports(
-            fixture.daemon.clone(),
-            link.clone(),
-            vec![],
-            vec![3000, 5173],
-        ));
+        let task =
+            tokio::spawn(session::reconcile_ports(fixture.daemon.clone(), link.clone(), vec![], vec![3000, 5173]));
         let Some(ClientMsg::Expose { id, port: 3000 }) = rx.recv().await else {
             panic!("expected expose");
         };
