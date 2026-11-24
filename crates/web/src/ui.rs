@@ -204,6 +204,19 @@ pub fn parse_gb(s: &str) -> Option<u64> {
     whole.checked_mul(1_000_000_000)?.checked_add(frac).filter(|b| *b > 0)
 }
 
+/// `90 s`, `30 min`, `8 h`, `7 d`, `1 d 12 h`.
+pub fn duration_text(s: u64) -> String {
+    let mut parts = Vec::new();
+    let mut left = s;
+    for (unit, size) in [("d", 86_400), ("h", 3600), ("min", 60), ("s", 1)] {
+        if left >= size {
+            parts.push(format!("{} {unit}", left / size));
+            left %= size;
+        }
+    }
+    if parts.is_empty() { "0 s".into() } else { parts.join(" ") }
+}
+
 /// `used of cap`, or `used (no cap)`.
 pub fn traffic_text(used: u64, cap: Option<u64>) -> String {
     match cap {

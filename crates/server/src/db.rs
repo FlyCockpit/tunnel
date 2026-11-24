@@ -14,6 +14,10 @@ use crate::tokens::now;
 
 pub const SCHEMA_VERSION: i32 = 1;
 
+/// `expires_at` of a tunnel that never expires (9999-12-31T23:59:59Z): every
+/// expiry check (`expires_at > now`, the sweep) keeps working unchanged.
+pub const NEVER_EXPIRES: i64 = 253_402_300_799;
+
 const SCHEMA: &str = r#"
 CREATE TABLE tunnels (
     id           TEXT PRIMARY KEY,
@@ -116,17 +120,21 @@ CREATE TABLE users (
     role               TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     disabled_at        INTEGER,
     can_public         INTEGER NOT NULL DEFAULT 0,
-    max_tunnels        INTEGER NOT NULL,
-    max_clients        INTEGER NOT NULL,
-    -- Monthly traffic cap in bytes (both directions); NULL: none.
-    traffic_cap        INTEGER,
     created_at         INTEGER NOT NULL,
     -- Bumped by every change to how the user signs in (password, TOTP, role,
     -- disabling): a session is issued only if it is unchanged since the check.
     auth_epoch         INTEGER NOT NULL DEFAULT 0,
     -- Wrong TOTP or recovery codes in a row, and the lockout they caused.
     factor_failures    INTEGER NOT NULL DEFAULT 0,
-    factor_locked_until INTEGER
+    factor_locked_until INTEGER,
+    -- Per-user limits (see `limits.rs`): NULL follows the server default for
+    -- the role, -1 is unlimited. Live tunnels across the user's machines,
+    -- machines, longest tunnel lifetime (seconds) and monthly traffic (bytes,
+    -- both directions).
+    limit_tunnels       INTEGER CHECK (limit_tunnels >= -1),
+    limit_clients       INTEGER CHECK (limit_clients >= -1),
+    limit_tunnel_ttl_s  INTEGER CHECK (limit_tunnel_ttl_s >= -1),
+    limit_traffic_bytes INTEGER CHECK (limit_traffic_bytes >= -1)
 );
 CREATE UNIQUE INDEX users_one_owner ON users(role) WHERE role = 'owner';
 CREATE TABLE recovery_codes (
@@ -323,9 +331,19 @@ pub struct NewTunnel {
     pub client_id: Option<String>,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("live-tunnel quota reached")]
-pub struct TunnelQuotaExceeded;
+/// Which live-tunnel limit refused a new tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TunnelQuotaExceeded {
+    /// The user's limit across all their machines.
+    #[error("live-tunnel limit of the account reached")]
+    Account { limit: u64, role: crate::ui::store::Role },
+    /// `limits.max_tunnels_per_client`.
+    #[error("live-tunnel limit of the machine reached")]
+    Machine { limit: u32 },
+    /// The service's own quota.
+    #[error("live-tunnel quota of the service reached")]
+    Service { limit: u32 },
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct TunnelPatch {
@@ -351,40 +369,75 @@ pub struct TunnelPatch {
 pub struct Policy {
     /// `limits.allow_public_for_clients`.
     pub allow_all_public: bool,
-    /// Longest lifetime for a member's machine, in seconds from now.
-    pub member_max_ttl_s: i64,
+    /// What "Server default" means for per-user limits.
+    pub defaults: crate::limits::Defaults,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("the tunnel lifetime is longer than this account may set")]
-pub struct TtlTooLong;
+/// A lifetime longer than the owner's limit, or "never expires" with a limit.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("the tunnel lifetime is longer than this caller may set")]
+pub struct TtlTooLong {
+    /// Seconds.
+    pub limit: u64,
+    /// The machine's user's role; `None` for a service.
+    pub account: Option<crate::ui::store::Role>,
+}
 
-/// The current permissions of tunnel owner `owner` (a client or service id):
-/// whether it may create public previews, and its longest lifetime. `None`
-/// if the owner is gone or its user is disabled.
-fn owner_rules(
-    tx: &rusqlite::Transaction<'_>,
-    owner: &str,
-    policy: Policy,
-) -> anyhow::Result<Option<(bool, Option<i64>)>> {
-    let service: bool =
-        tx.query_row("SELECT EXISTS (SELECT 1 FROM services WHERE id = ?1)", params![owner], |r| r.get(0))?;
-    if service {
-        return Ok(Some((policy.allow_all_public, None)));
+/// The current rules for tunnel owner `owner` (a client or service id).
+#[derive(Debug, Clone, Copy)]
+struct OwnerRules {
+    /// May create public previews.
+    public: bool,
+    /// Longest lifetime in seconds; `None`: unlimited (may never expire).
+    ttl_s: Option<u64>,
+    /// A service's own live-tunnel quota.
+    service_max: Option<u32>,
+    /// A machine's user: role and live-tunnel limit across their machines.
+    account: Option<(crate::ui::store::Role, Option<u64>)>,
+}
+
+impl OwnerRules {
+    /// Whether `expires_at`, set at `at`, is within the lifetime limit.
+    fn check_expiry(&self, expires_at: i64, at: i64) -> Result<(), TtlTooLong> {
+        let Some(limit) = self.ttl_s else { return Ok(()) };
+        if expires_at == NEVER_EXPIRES || expires_at.saturating_sub(at) > i64::try_from(limit).unwrap_or(i64::MAX) {
+            return Err(TtlTooLong { limit, account: self.account.map(|(role, _)| role) });
+        }
+        Ok(())
     }
-    let user: Option<(String, bool)> = tx
+}
+
+/// `None` if the owner is gone or its user is disabled.
+fn owner_rules(tx: &rusqlite::Transaction<'_>, owner: &str, policy: Policy) -> anyhow::Result<Option<OwnerRules>> {
+    use crate::limits::{Kind, Setting};
+    use crate::ui::store::Role;
+    let service: Option<u32> =
+        tx.query_row("SELECT max_tunnels FROM services WHERE id = ?1", params![owner], |r| r.get(0)).optional()?;
+    if let Some(max) = service {
+        return Ok(Some(OwnerRules {
+            public: policy.allow_all_public,
+            ttl_s: Some(policy.defaults.max_tunnel_ttl_s),
+            service_max: Some(max),
+            account: None,
+        }));
+    }
+    let user: Option<(String, bool, Option<i64>, Option<i64>)> = tx
         .query_row(
-            "SELECT u.role, u.can_public FROM clients c JOIN users u ON u.id = c.user_id
+            "SELECT u.role, u.can_public, u.limit_tunnels, u.limit_tunnel_ttl_s FROM clients c
+             JOIN users u ON u.id = c.user_id
              WHERE c.id = ?1 AND u.disabled_at IS NULL",
             params![owner],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    Ok(user.map(|(role, can_public)| {
-        if role == "member" {
-            (can_public || policy.allow_all_public, Some(policy.member_max_ttl_s))
-        } else {
-            (true, None)
+    Ok(user.map(|(role, can_public, tunnels, ttl)| {
+        let role = Role::parse(&role);
+        let d = policy.defaults;
+        OwnerRules {
+            public: role.is_admin() || can_public || policy.allow_all_public,
+            ttl_s: d.resolve(Kind::TunnelTtl, role, Setting::from_column(ttl)),
+            service_max: None,
+            account: Some((role, d.resolve(Kind::Tunnels, role, Setting::from_column(tunnels)))),
         }
     }))
 }
@@ -447,6 +500,7 @@ pub struct ClientAuth {
     pub user_id: String,
     pub role: crate::ui::store::Role,
     pub can_public: bool,
+    pub limits: crate::limits::Settings,
 }
 
 /// Why a new client was refused.
@@ -455,8 +509,11 @@ pub enum NewClientError {
     NameTaken,
     /// The owner is unknown or disabled.
     NoUser,
-    /// A member already has `max_clients` machines.
-    Quota,
+    /// The user already has as many machines as their limit allows.
+    Quota {
+        limit: u64,
+        role: crate::ui::store::Role,
+    },
 }
 
 /// Outcome of redeeming an access link.
@@ -516,6 +573,8 @@ fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+    /// What "Server default" means for per-user limits (from the config).
+    defaults: Arc<std::sync::RwLock<crate::limits::Defaults>>,
 }
 
 impl Db {
@@ -541,7 +600,23 @@ impl Db {
             );
         }
         tx.commit()?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        let defaults = crate::limits::Defaults::new(&crate::config::Limits::default());
+        Ok(Self { conn: Arc::new(Mutex::new(conn)), defaults: Arc::new(std::sync::RwLock::new(defaults)) })
+    }
+
+    /// Open the configured database, with the configured limit defaults.
+    pub fn open_configured(cfg: &crate::config::Config) -> anyhow::Result<Self> {
+        let db = Self::open(&cfg.db_path())?;
+        db.set_limit_defaults(crate::limits::Defaults::new(&cfg.limits));
+        Ok(db)
+    }
+
+    pub fn set_limit_defaults(&self, defaults: crate::limits::Defaults) {
+        *self.defaults.write().unwrap_or_else(std::sync::PoisonError::into_inner) = defaults;
+    }
+
+    pub fn limit_defaults(&self) -> crate::limits::Defaults {
+        *self.defaults.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Run `f` with the connection on a blocking thread.
@@ -577,11 +652,17 @@ impl Db {
     /// longer exists (deleted after the request authenticated). The owner
     /// existence and live-tunnel quota checks share the INSERT's write
     /// transaction, including across connections. Clients are limited by
-    /// `max_tunnels_per_client`, services by their own `max_tunnels`;
-    /// admin-owned tunnels are not limited.
+    /// `max_tunnels_per_client` and their user's limit across all their
+    /// machines, services by their own `max_tunnels`; admin-owned tunnels are
+    /// not limited.
     #[cfg(test)]
     pub async fn create_tunnel(&self, t: NewTunnel, max_tunnels_per_client: u32) -> anyhow::Result<Option<TunnelRow>> {
-        let unrestricted = Policy { allow_all_public: true, member_max_ttl_s: i64::MAX };
+        let defaults = crate::limits::Defaults::new(&crate::config::Limits {
+            max_tunnel_ttl_s: crate::limits::MAX_TTL_S,
+            member_max_tunnel_ttl_s: crate::limits::MAX_TTL_S,
+            ..Default::default()
+        });
+        let unrestricted = Policy { allow_all_public: true, defaults };
         self.create_tunnel_with(t, max_tunnels_per_client, unrestricted).await
     }
 
@@ -597,34 +678,53 @@ impl Db {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let created = now();
-            if let Some(owner) = &t.client_id
-                && let Some((public, cap)) = owner_rules(&tx, owner, policy)?
-            {
-                if t.access.mode == AccessMode::Public && !public {
+            let mut user_id = None;
+            if let Some(owner) = &t.client_id {
+                // The owner was deleted (or its user disabled) meanwhile.
+                let Some(rules) = owner_rules(&tx, owner, policy)? else { return Ok(None) };
+                if t.access.mode == AccessMode::Public && !rules.public {
                     return Err(PublicNotAllowed.into());
                 }
-                if cap.is_some_and(|cap| t.expires_at - created > cap) {
-                    return Err(TtlTooLong.into());
+                rules.check_expiry(t.expires_at, created)?;
+                let live: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM tunnels WHERE client_id = ?1 AND expires_at > ?2",
+                    params![owner, created],
+                    |r| r.get(0),
+                )?;
+                match rules.service_max {
+                    Some(limit) if live >= i64::from(limit) => {
+                        return Err(TunnelQuotaExceeded::Service { limit }.into());
+                    }
+                    None if live >= i64::from(max_tunnels_per_client) => {
+                        return Err(TunnelQuotaExceeded::Machine { limit: max_tunnels_per_client }.into());
+                    }
+                    _ => {}
+                }
+                if rules.account.is_some() {
+                    user_id = Some(
+                        tx.query_row("SELECT user_id FROM clients WHERE id = ?1", params![owner], |r| {
+                            r.get::<_, String>(0)
+                        })?,
+                    );
+                }
+                // The user's limit covers the tunnels of all their machines.
+                if let (Some((role, Some(limit))), Some(user)) = (rules.account, &user_id) {
+                    let across: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM tunnels t JOIN clients c ON c.id = t.client_id
+                         WHERE c.user_id = ?1 AND t.expires_at > ?2",
+                        params![user, created],
+                        |r| r.get(0),
+                    )?;
+                    if across.max(0) as u64 >= limit {
+                        return Err(TunnelQuotaExceeded::Account { limit, role }.into());
+                    }
                 }
             }
             let metadata = t.metadata.as_ref().map(|m| m.to_string());
-            let inserted = tx.execute(
+            tx.execute(
                 "INSERT INTO tunnels (id, token_hash, label, metadata, max_ports, host_header, inject_ice, created_at, expires_at,
                                       access_mode, password_user, password_hash, client_id)
-                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
-                 WHERE ?13 IS NULL OR (
-                     (EXISTS (SELECT 1 FROM clients c JOIN users u ON u.id = c.user_id
-                              WHERE c.id = ?13 AND u.disabled_at IS NULL)
-                      OR EXISTS (SELECT 1 FROM services WHERE id = ?13))
-                     AND (SELECT COUNT(*) FROM tunnels WHERE client_id = ?13 AND expires_at > ?8)
-                         < COALESCE((SELECT max_tunnels FROM services WHERE id = ?13), ?14)
-                     -- A member's quota covers the tunnels of all their machines.
-                     AND NOT EXISTS (
-                         SELECT 1 FROM clients c JOIN users u ON u.id = c.user_id
-                         WHERE c.id = ?13 AND u.role = 'member'
-                           AND (SELECT COUNT(*) FROM tunnels t JOIN clients c2 ON c2.id = t.client_id
-                                WHERE c2.user_id = u.id AND t.expires_at > ?8) >= u.max_tunnels)
-                 )",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     t.id,
                     t.token_hash,
@@ -639,28 +739,8 @@ impl Db {
                     t.access.password_user,
                     t.access.password_hash,
                     t.client_id,
-                    max_tunnels_per_client,
                 ],
             )?;
-            if inserted == 0 {
-                let owner_exists: bool = tx.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM clients c JOIN users u ON u.id = c.user_id
-                                    WHERE c.id = ?1 AND u.disabled_at IS NULL)
-                         OR EXISTS (SELECT 1 FROM services WHERE id = ?1)",
-                    params![t.client_id],
-                    |r| r.get(0),
-                )?;
-                if owner_exists {
-                    return Err(TunnelQuotaExceeded.into());
-                }
-                return Ok(None);
-            }
-            let user_id: Option<String> = match &t.client_id {
-                Some(owner) => tx
-                    .query_row("SELECT user_id FROM clients WHERE id = ?1", params![owner], |r| r.get(0))
-                    .optional()?,
-                None => None,
-            };
             tx.commit()?;
             Ok(Some(TunnelRow {
                 id: t.id,
@@ -767,8 +847,8 @@ impl Db {
                 None => None,
             };
             if let Some(v) = patch.expires_at {
-                if rules.and_then(|(_, cap)| cap).is_some_and(|cap| v - now() > cap) {
-                    return Err(TtlTooLong.into());
+                if let Some(rules) = &rules {
+                    rules.check_expiry(v, now())?;
                 }
                 tx.execute("UPDATE tunnels SET expires_at = ?2 WHERE id = ?1", params![id, v])?;
             }
@@ -782,7 +862,7 @@ impl Db {
                 tx.execute("UPDATE tunnels SET inject_ice = ?2 WHERE id = ?1", params![id, v])?;
             }
             if let Some(mut access) = patch.access {
-                let may_public = rules.is_none_or(|(public, _)| public);
+                let may_public = rules.is_none_or(|r| r.public);
                 if !may_public && access.mode == AccessMode::Public && current.access.mode != AccessMode::Public {
                     return Err(PublicNotAllowed.into());
                 }
@@ -1035,6 +1115,7 @@ impl Db {
         code_expires_at: i64,
         session: Option<String>,
     ) -> anyhow::Result<Result<ClientRow, NewClientError>> {
+        let defaults = self.limit_defaults();
         self.call(move |c| {
             let t = now();
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1044,7 +1125,7 @@ impl Db {
             {
                 return Ok(Err(NewClientError::NoUser));
             }
-            if let Err(e) = client_admissible(&tx, &name, &user_id)? {
+            if let Err(e) = client_admissible(&tx, &name, &user_id, defaults)? {
                 return Ok(Err(e));
             }
             tx.execute(
@@ -1099,22 +1180,45 @@ impl Db {
 
     /// The client holding `token_hash` (its owner enabled), recording use at
     /// most once a minute.
+    /// A user's machines and live tunnels across them.
+    pub async fn user_usage(&self, user_id: String) -> anyhow::Result<(u64, u64)> {
+        self.call(move |c| {
+            let (machines, tunnels): (i64, i64) = c.query_row(
+                "SELECT (SELECT COUNT(*) FROM clients WHERE user_id = ?1),
+                        (SELECT COUNT(*) FROM tunnels t JOIN clients c ON c.id = t.client_id
+                         WHERE c.user_id = ?1 AND t.expires_at > ?2)",
+                params![user_id, now()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((machines.max(0) as u64, tunnels.max(0) as u64))
+        })
+        .await
+    }
+
     pub async fn client_by_token_hash(&self, token_hash: String) -> anyhow::Result<Option<ClientAuth>> {
         self.call(move |c| {
             let t = now();
             let found = c
                 .query_row(
-                    "SELECT c.id, c.name, u.id, u.role, u.can_public FROM clients c
-                     JOIN users u ON u.id = c.user_id
+                    "SELECT c.id, c.name, u.id, u.role, u.can_public,
+                            u.limit_tunnels, u.limit_clients, u.limit_tunnel_ttl_s, u.limit_traffic_bytes
+                     FROM clients c JOIN users u ON u.id = c.user_id
                      WHERE c.token_hash = ?1 AND u.disabled_at IS NULL",
                     params![token_hash],
                     |r| {
+                        use crate::limits::Setting;
                         Ok(ClientAuth {
                             id: r.get(0)?,
                             name: r.get(1)?,
                             user_id: r.get(2)?,
                             role: crate::ui::store::Role::parse(&r.get::<_, String>(3)?),
                             can_public: r.get(4)?,
+                            limits: crate::limits::Settings {
+                                tunnels: Setting::from_column(r.get(5)?),
+                                machines: Setting::from_column(r.get(6)?),
+                                tunnel_ttl_s: Setting::from_column(r.get(7)?),
+                                traffic_bytes: Setting::from_column(r.get(8)?),
+                            },
                         })
                     },
                 )
@@ -1519,23 +1623,26 @@ pub(crate) fn client_admissible(
     tx: &rusqlite::Transaction<'_>,
     name: &str,
     user_id: &str,
+    defaults: crate::limits::Defaults,
 ) -> anyhow::Result<Result<(), NewClientError>> {
     let taken: i64 = tx.query_row("SELECT COUNT(*) FROM clients WHERE name = ?1", params![name], |r| r.get(0))?;
     if taken > 0 {
         return Ok(Err(NewClientError::NameTaken));
     }
-    let user: Option<(String, i64, i64)> = tx
+    let user: Option<(String, Option<i64>, i64)> = tx
         .query_row(
-            "SELECT u.role, u.max_clients, (SELECT COUNT(*) FROM clients c WHERE c.user_id = u.id)
+            "SELECT u.role, u.limit_clients, (SELECT COUNT(*) FROM clients c WHERE c.user_id = u.id)
              FROM users u WHERE u.id = ?1 AND u.disabled_at IS NULL",
             params![user_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    Ok(match user {
-        None => Err(NewClientError::NoUser),
-        Some((role, max, have)) if role == "member" && have >= max => Err(NewClientError::Quota),
-        Some(_) => Ok(()),
+    let Some((role, setting, have)) = user else { return Ok(Err(NewClientError::NoUser)) };
+    let role = crate::ui::store::Role::parse(&role);
+    let limit = defaults.resolve(crate::limits::Kind::Machines, role, crate::limits::Setting::from_column(setting));
+    Ok(match limit {
+        Some(limit) if have.max(0) as u64 >= limit => Err(NewClientError::Quota { limit, role }),
+        _ => Ok(()),
     })
 }
 
@@ -1590,7 +1697,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO users (id, username, password_hash, role, max_tunnels, max_clients, created_at)
+                "INSERT INTO users (id, username, password_hash, role, limit_tunnels, limit_clients, created_at)
                  VALUES ('utest', 'tester', 'x', 'member', 1000, 1000, 0)",
                 [],
             )
@@ -2064,7 +2171,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let policy = Policy { allow_all_public: false, member_max_ttl_s: 3600 };
+        let defaults = crate::limits::Defaults::new(&crate::config::Limits {
+            member_max_tunnel_ttl_s: 3600,
+            ..Default::default()
+        });
+        let policy = Policy { allow_all_public: false, defaults };
         let public = Access { mode: AccessMode::Public, password_user: None, password_hash: None };
         let mut t = new_tunnel("aaaaaaaaaa", Some("c1"), now() + 600);
         t.access = public.clone();

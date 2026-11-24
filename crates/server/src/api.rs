@@ -37,7 +37,7 @@ use crate::tokens::{self, now};
 use crate::ui::store::Role;
 use crate::util::{Body, full, json_response};
 
-const MIN_TUNNEL_TTL_S: u64 = 60;
+pub(crate) const MIN_TUNNEL_TTL_S: u64 = 60;
 const MIN_LINK_TTL_S: u64 = 30;
 const MIN_ICE_TTL_S: u64 = 60;
 const MAX_LABEL_LEN: usize = 200;
@@ -190,6 +190,7 @@ pub struct ClientUser {
     pub id: String,
     pub role: Role,
     pub can_public: bool,
+    pub limits: crate::limits::Settings,
 }
 
 impl Caller {
@@ -231,15 +232,80 @@ impl Caller {
         Ok(())
     }
 
-    /// Longest tunnel lifetime this caller may set: members are capped lower.
-    fn max_tunnel_ttl_s(&self, limits: &crate::config::Limits) -> u64 {
+    /// Longest tunnel lifetime this caller may set; `None`: unlimited (its
+    /// tunnels may never expire). A machine follows its user's limit.
+    fn tunnel_ttl_limit(&self, limits: &crate::config::Limits) -> Option<u64> {
         match self {
-            Self::Client { user, .. } if user.role == Role::Member => {
-                limits.max_tunnel_ttl_s.min(limits.member_max_tunnel_ttl_s)
-            }
-            _ => limits.max_tunnel_ttl_s,
+            Self::Client { user, .. } => crate::limits::Defaults::new(limits).resolve(
+                crate::limits::Kind::TunnelTtl,
+                user.role,
+                user.limits.tunnel_ttl_s,
+            ),
+            _ => Some(limits.max_tunnel_ttl_s),
         }
     }
+
+    /// The machine's user's role, for limit messages.
+    fn account_role(&self) -> Option<Role> {
+        match self {
+            Self::Client { user, .. } => Some(user.role),
+            _ => None,
+        }
+    }
+
+    /// The expiry asked for with `ttl_s` (from now) or `never_expires`,
+    /// checked against this caller's lifetime limit. `None`: neither given.
+    fn requested_expiry(
+        &self,
+        ttl_s: Option<u64>,
+        never_expires: bool,
+        limits: &crate::config::Limits,
+    ) -> ApiResult<Option<i64>> {
+        let limit = self.tunnel_ttl_limit(limits);
+        match (ttl_s, never_expires) {
+            (Some(_), true) => Err(ApiError::validation("give ttl_s or never_expires, not both")),
+            (None, false) => Ok(None),
+            (None, true) => match limit {
+                Some(limit) => Err(ttl_refused(limit, self.account_role(), true)),
+                None => Ok(Some(crate::db::NEVER_EXPIRES)),
+            },
+            (Some(ttl), false) => {
+                let max = limit.unwrap_or(crate::limits::MAX_TTL_S);
+                if ttl < MIN_TUNNEL_TTL_S || (limit.is_none() && ttl > max) {
+                    return Err(ApiError::validation(format!("ttl_s must be within {MIN_TUNNEL_TTL_S}..={max}")));
+                }
+                if ttl > max {
+                    return Err(ttl_refused(max, self.account_role(), false));
+                }
+                Ok(Some(now() + ttl as i64))
+            }
+        }
+    }
+}
+
+/// A lifetime beyond the caller's limit (422 `tunnel_ttl_limit`).
+fn ttl_refused(limit: u64, account: Option<Role>, never: bool) -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "tunnel_ttl_limit",
+        crate::limits::ttl_limit_message(limit, account, never),
+    )
+}
+
+/// A refused new tunnel (429 `tunnel_quota`), naming the limit.
+fn quota_refused(q: TunnelQuotaExceeded) -> ApiError {
+    let message = match q {
+        TunnelQuotaExceeded::Account { limit, role } => crate::limits::tunnel_limit_message(limit, role),
+        TunnelQuotaExceeded::Machine { limit } => format!(
+            "this machine's live-tunnel limit ({limit}, limits.max_tunnels_per_client) is reached; \
+             delete a tunnel first (`tunnel unshare`, or the Tunnels page)"
+        ),
+        TunnelQuotaExceeded::Service { limit } => format!(
+            "this service's live-tunnel quota ({limit}) is reached; delete a tunnel first, \
+             or ask the server's operator to raise it (`tunnel-server service set`)"
+        ),
+    };
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "tunnel_quota", message)
 }
 
 fn public_refused() -> ApiError {
@@ -255,8 +321,7 @@ fn public_refused() -> ApiError {
 fn policy(limits: &crate::config::Limits) -> crate::db::Policy {
     crate::db::Policy {
         allow_all_public: limits.allow_public_for_clients,
-        member_max_ttl_s: i64::try_from(limits.max_tunnel_ttl_s.min(limits.member_max_tunnel_ttl_s))
-            .unwrap_or(i64::MAX),
+        defaults: crate::limits::Defaults::new(limits),
     }
 }
 
@@ -288,7 +353,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             return Ok(Self::Client {
                 id: c.id,
                 name: c.name,
-                user: ClientUser { id: c.user_id, role: c.role, can_public: c.can_public },
+                user: ClientUser { id: c.user_id, role: c.role, can_public: c.can_public, limits: c.limits },
             });
         }
         if token.starts_with(SERVICE_TOKEN_PREFIX)
@@ -355,8 +420,14 @@ fn optional_json<T: DeserializeOwned + Default>(body: &Bytes) -> ApiResult<T> {
 pub struct CreateTunnelRequest {
     #[serde(default)]
     pub label: Option<String>,
-    /// Lifetime in seconds (60 ..= server max).
-    pub ttl_s: u64,
+    /// Lifetime in seconds (60 ..= the caller's limit, `GET /v1/server`
+    /// `limits.max_tunnel_ttl_s`). Required unless `never_expires`.
+    #[serde(default)]
+    pub ttl_s: Option<u64>,
+    /// A tunnel that never expires (until deleted), instead of `ttl_s`; only
+    /// for machines whose account has an unlimited tunnel lifetime.
+    #[serde(default)]
+    pub never_expires: bool,
     /// Ports the sandbox may expose (default 8).
     #[serde(default)]
     pub max_ports: Option<u16>,
@@ -406,8 +477,11 @@ pub struct CreateTunnelResponse {
     pub tunnel_token: String,
     /// e.g. `{port}-ab12cd3efg.previews.example.com`
     pub host_template: String,
-    /// Unix seconds.
+    /// Unix seconds; 253402300799 (9999-12-31) when `never_expires`.
     pub expires_at: i64,
+    /// The tunnel never expires; it lives until deleted.
+    #[serde(default)]
+    pub never_expires: bool,
     /// The creating machine's account has reached its monthly traffic cap:
     /// visitors see "traffic limit reached" until it is raised or the month ends.
     #[serde(default)]
@@ -417,9 +491,13 @@ pub struct CreateTunnelResponse {
 #[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PatchTunnelRequest {
-    /// New lifetime from now, in seconds.
+    /// New lifetime from now, in seconds (a renewal, within the caller's
+    /// current lifetime limit).
     #[serde(default)]
     pub ttl_s: Option<u64>,
+    /// Make the tunnel never expire, instead of `ttl_s` (unlimited lifetime only).
+    #[serde(default)]
+    pub never_expires: bool,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -458,7 +536,10 @@ pub struct TunnelView {
     pub host_header: HostHeaderMode,
     pub inject_ice: bool,
     pub created_at: i64,
+    /// Unix seconds; 253402300799 (9999-12-31) when `never_expires`.
     pub expires_at: i64,
+    /// The tunnel never expires; it lives until deleted.
+    pub never_expires: bool,
     pub last_seen_at: Option<i64>,
     /// Proxied bytes visitor → app (request bodies, WebSocket messages).
     pub bytes_in: u64,
@@ -586,6 +667,8 @@ pub struct TurnCredentialsResponse {
         AccessLinkList,
         ServerInfo,
         ServerLimits,
+        AccountLimits,
+        LimitUse,
         crate::traffic::TrafficView,
         crate::device::DeviceCodeRequest,
         crate::device::DeviceCodeResponse,
@@ -701,7 +784,9 @@ pub struct ServerInfo {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ServerLimits {
-    pub max_tunnel_ttl_s: u64,
+    /// Longest tunnel lifetime this caller may set; `null`: unlimited (it may
+    /// create tunnels with `never_expires`).
+    pub max_tunnel_ttl_s: Option<u64>,
     pub default_max_ports: u16,
     pub hard_max_ports: u16,
     pub default_session_ttl_s: u64,
@@ -710,6 +795,31 @@ pub struct ServerLimits {
     /// This month's traffic of the caller's account (machine callers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic: Option<crate::traffic::TrafficView>,
+    /// The limits of the caller's account and its use (machine callers only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountLimits>,
+}
+
+/// A machine's account: its limits (`null`: unlimited) and what it uses.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AccountLimits {
+    pub role: String,
+    /// Live tunnels across all the account's machines.
+    pub tunnels: LimitUse,
+    pub machines: LimitUse,
+    /// Longest tunnel lifetime in seconds; `null`: tunnels may never expire.
+    pub tunnel_ttl_s: Option<u64>,
+    /// Monthly traffic in bytes (see `traffic` for this month's use).
+    pub traffic_bytes: Option<u64>,
+    /// Who can raise these: `an admin` or `the server's owner` (`null` for the owner).
+    pub raised_by: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LimitUse {
+    /// `null`: unlimited.
+    pub limit: Option<u64>,
+    pub used: u64,
 }
 
 /// Any bearer caller: where things live and what this caller may do.
@@ -717,9 +827,21 @@ pub struct ServerLimits {
 async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> ApiResult<Json<ServerInfo>> {
     let cfg = &state.config;
     let limits = &cfg.limits;
-    let traffic = match &caller {
-        Caller::Client { user, .. } => Some(crate::traffic::view(&state, &user.id).await?),
-        _ => None,
+    let (traffic, account) = match &caller {
+        Caller::Client { user, .. } => {
+            let effective = crate::limits::Defaults::new(limits).effective(user.role, &user.limits);
+            let (machines, tunnels) = state.db.user_usage(user.id.clone()).await?;
+            let account = AccountLimits {
+                role: user.role.as_str().to_string(),
+                tunnels: LimitUse { limit: effective.tunnels, used: tunnels },
+                machines: LimitUse { limit: effective.machines, used: machines },
+                tunnel_ttl_s: effective.tunnel_ttl_s,
+                traffic_bytes: effective.traffic_bytes,
+                raised_by: (user.role != Role::Owner).then(|| crate::limits::raiser(user.role).to_string()),
+            };
+            (Some(crate::traffic::view(&state, &user.id).await?), Some(account))
+        }
+        _ => (None, None),
     };
     Ok(Json(ServerInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -731,12 +853,13 @@ async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> ApiR
         preview_zone: cfg.preview_zone.clone(),
         webrtc: cfg.webrtc.enabled,
         limits: ServerLimits {
-            max_tunnel_ttl_s: caller.max_tunnel_ttl_s(limits),
+            max_tunnel_ttl_s: caller.tunnel_ttl_limit(limits),
             default_max_ports: limits.default_max_ports,
             hard_max_ports: limits.hard_max_ports,
             default_session_ttl_s: limits.default_session_ttl_s,
             public_allowed: caller.check_public(AccessMode::Public, limits).is_ok(),
             traffic,
+            account,
         },
     }))
 }
@@ -753,8 +876,8 @@ async fn fallback() -> ApiError {
         (status = 201, description = "Tunnel created", body = CreateTunnelResponse),
         (status = 401, body = ErrorBody),
         (status = 403, description = "Public access requested by a client or service while `allow_public_for_clients` is off", body = ErrorBody),
-        (status = 429, description = "Live-tunnel quota reached (clients: `max_tunnels_per_client`; services: their own `max_tunnels`); admin tokens are unlimited", body = ErrorBody),
-        (status = 422, body = ErrorBody),
+        (status = 429, description = "Live-tunnel quota reached (`tunnel_quota`; clients: `max_tunnels_per_client` and their account's limit across its machines; services: their own `max_tunnels`); admin tokens are unlimited", body = ErrorBody),
+        (status = 422, description = "Invalid request, or a lifetime beyond the caller's limit (`tunnel_ttl_limit`)", body = ErrorBody),
     )
 )]
 async fn create_tunnel(
@@ -763,7 +886,10 @@ async fn create_tunnel(
     ApiJson(req): ApiJson<CreateTunnelRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateTunnelResponse>)> {
     let limits = &state.config.limits;
-    validate_tunnel_ttl(req.ttl_s, caller.max_tunnel_ttl_s(limits))?;
+    let never = req.never_expires;
+    let expires_at = caller
+        .requested_expiry(req.ttl_s, req.never_expires, limits)?
+        .ok_or_else(|| ApiError::validation("ttl_s is required (or never_expires: true)"))?;
     let max_ports = req.max_ports.unwrap_or(limits.default_max_ports);
     if !(1..=limits.hard_max_ports).contains(&max_ports) {
         return Err(ApiError::validation(format!("max_ports must be within 1..={}", limits.hard_max_ports)));
@@ -797,7 +923,7 @@ async fn create_tunnel(
                 max_ports,
                 host_header: req.host_header.unwrap_or(HostHeaderMode::Rewrite),
                 inject_ice: req.inject_ice.unwrap_or(true),
-                expires_at: now() + req.ttl_s as i64,
+                expires_at,
                 access,
                 client_id: caller.owner_id().map(str::to_string),
             },
@@ -810,14 +936,10 @@ async fn create_tunnel(
         .map_err(|e| {
             if e.is::<PublicNotAllowed>() {
                 public_refused()
-            } else if e.is::<TtlTooLong>() {
-                ApiError::validation("ttl_s is longer than this account may set")
-            } else if e.is::<TunnelQuotaExceeded>() {
-                ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "tunnel_quota",
-                    "live-tunnel quota reached; delete a tunnel or ask an admin for a higher limit",
-                )
+            } else if let Some(t) = e.downcast_ref::<TtlTooLong>() {
+                ttl_refused(t.limit, t.account, never)
+            } else if let Some(q) = e.downcast_ref::<TunnelQuotaExceeded>() {
+                quota_refused(*q)
             } else {
                 ApiError::internal(e)
             }
@@ -834,6 +956,7 @@ async fn create_tunnel(
         Json(CreateTunnelResponse {
             host_template: state.config.host_template(&row.id),
             traffic_limited: row.user_id.as_deref().is_some_and(|u| state.traffic.user_blocked(u)),
+            never_expires: row.expires_at == crate::db::NEVER_EXPIRES,
             id: row.id,
             tunnel_token: token,
             expires_at: row.expires_at,
@@ -942,9 +1065,8 @@ async fn patch_tunnel(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<PatchTunnelRequest>,
 ) -> ApiResult<Json<TunnelView>> {
-    if let Some(ttl) = req.ttl_s {
-        validate_tunnel_ttl(ttl, caller.max_tunnel_ttl_s(&state.config.limits))?;
-    }
+    let never = req.never_expires;
+    let expires_at = caller.requested_expiry(req.ttl_s, req.never_expires, &state.config.limits)?;
     validate_label(req.label.as_deref())?;
     // Expiry is revocation: an expired tunnel cannot be revived by extending it.
     let current = active_tunnel(&state, &caller, &id).await?;
@@ -956,7 +1078,7 @@ async fn patch_tunnel(
     };
 
     let patch = TunnelPatch {
-        expires_at: req.ttl_s.map(|ttl| now() + ttl as i64),
+        expires_at,
         label: req.label,
         host_header: req.host_header,
         inject_ice: req.inject_ice,
@@ -972,8 +1094,8 @@ async fn patch_tunnel(
             ApiError::validation(e.to_string())
         } else if e.is::<PublicNotAllowed>() {
             public_refused()
-        } else if e.is::<TtlTooLong>() {
-            ApiError::validation("ttl_s is longer than this account may set")
+        } else if let Some(t) = e.downcast_ref::<TtlTooLong>() {
+            ttl_refused(t.limit, t.account, never)
         } else {
             ApiError::internal(e)
         }
@@ -1284,14 +1406,6 @@ async fn turn_credentials(
 
 // ----------------------------------------------------------------- helpers
 
-fn validate_tunnel_ttl(ttl_s: u64, max: u64) -> ApiResult<()> {
-    if (MIN_TUNNEL_TTL_S..=max).contains(&ttl_s) {
-        Ok(())
-    } else {
-        Err(ApiError::validation(format!("ttl_s must be within {MIN_TUNNEL_TTL_S}..={max}")))
-    }
-}
-
 fn validate_label(label: Option<&str>) -> ApiResult<()> {
     match label {
         Some(l) if l.chars().count() > MAX_LABEL_LEN => {
@@ -1408,10 +1522,10 @@ async fn create_client(
         Err(clients::AddError::Taken) => {
             Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a client with this name exists; delete it first"))
         }
-        Err(clients::AddError::Quota) => Err(ApiError::new(
+        Err(clients::AddError::Quota { limit, .. }) => Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "client_quota",
-            "this user has as many machines as allowed",
+            format!("this user's machine limit ({limit}) is reached; raise it in the web UI's Users page"),
         )),
         Err(clients::AddError::NoUser) => {
             Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "no_user", "the user is unknown or disabled"))
@@ -1856,6 +1970,7 @@ pub(crate) fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
         inject_ice: row.inject_ice,
         created_at: row.created_at,
         expires_at: row.expires_at,
+        never_expires: row.expires_at == crate::db::NEVER_EXPIRES,
         last_seen_at: row.last_seen_at,
         bytes_in: row.bytes_in.max(0) as u64 + unflushed.0,
         bytes_out: row.bytes_out.max(0) as u64 + unflushed.1,
@@ -2070,7 +2185,7 @@ mod tests {
             .call(|c| {
                 let tx = c.transaction()?;
                 tx.execute(
-                    "INSERT INTO users (id, username, password_hash, role, max_tunnels, max_clients, created_at)
+                    "INSERT INTO users (id, username, password_hash, role, limit_tunnels, limit_clients, created_at)
                      VALUES ('utest', 'tester', 'x', 'member', 1000, 1000, 0)",
                     [],
                 )?;

@@ -167,17 +167,18 @@ pub struct Limits {
     /// admin token is not restricted.
     #[serde(default)]
     pub allow_public_for_clients: bool,
-    /// Defaults for new members (admins can change them per user): live
-    /// tunnels across all their machines, and machines.
+    /// Server defaults for members (admins set other values per user, see
+    /// `limits.rs`): live tunnels across all their machines, and machines.
     #[serde(default = "default_member_max_tunnels")]
     pub member_max_tunnels: u32,
     #[serde(default = "default_member_max_clients")]
     pub member_max_clients: u32,
-    /// Longest tunnel lifetime a member's machine may set.
+    /// Longest tunnel lifetime a member's machine may set by default (at most
+    /// `max_tunnel_ttl_s`).
     #[serde(default = "default_member_max_ttl")]
     pub member_max_tunnel_ttl_s: u64,
-    /// Monthly traffic cap (GB, 10^9 bytes, both directions) given to new
-    /// members; admins change it per user. Unset: no cap.
+    /// Members' default monthly traffic cap (GB, 10^9 bytes, both
+    /// directions); admins set other values per user. Unset: no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_monthly_traffic_gb: Option<u64>,
     /// Web UI sign-in attempts per IP and per username per minute.

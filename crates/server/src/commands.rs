@@ -23,7 +23,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let certs = tls::CertStore::new(cfg.cert_dir());
     certs.reload().with_context(|| {
         format!(
@@ -350,7 +350,7 @@ pub async fn client_add(config_path: &Path, name: &str, user: Option<&str>) -> a
     ensure_can_write(config_path, "client add")?;
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     // Without --user the machine is the owner's; on a server used without the
     // web UI that account is created here, without a password.
     let owner = match user {
@@ -382,8 +382,11 @@ pub async fn client_add(config_path: &Path, name: &str, user: Option<&str>) -> a
         Err(crate::clients::AddError::Taken) => {
             anyhow::bail!("client {name} exists; `client delete {name}` first to re-register it")
         }
-        Err(crate::clients::AddError::Quota) => {
-            anyhow::bail!("{} has as many machines as allowed; raise their limit in the web UI", owner.username)
+        Err(crate::clients::AddError::Quota { limit, .. }) => {
+            anyhow::bail!(
+                "{} has reached their machine limit ({limit}); raise it in the web UI's Users page",
+                owner.username
+            )
         }
         Err(crate::clients::AddError::NoUser) => anyhow::bail!("{} is disabled", owner.username),
         Err(crate::clients::AddError::Other(e)) => Err(e),
@@ -404,7 +407,7 @@ pub async fn admin_link(config_path: &Path, first_run: bool) -> anyhow::Result<(
         anyhow::bail!("the web UI is off: turn it on with `tunnel-server setup --ui-host <name>`");
     };
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let owner = db.owner().await?;
     // An owner created for machines without the UI has no password yet: it signs up.
     let unclaimed = db.owner_without_password().await?;
@@ -447,7 +450,7 @@ pub async fn admin_link(config_path: &Path, first_run: bool) -> anyhow::Result<(
 pub async fn user_list(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let users = db.list_users(crate::traffic::month_of(crate::tokens::now())).await;
     drop(db);
     restore_ownership(config_path, &cfg)?;
@@ -457,17 +460,21 @@ pub async fn user_list(config_path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("{:<24} {:<8} {:<9} {:>8} {:>8} {:>4}", "USERNAME", "ROLE", "STATUS", "MACHINES", "TUNNELS", "2FA");
+    let defaults = crate::limits::Defaults::new(&cfg.limits);
+    let of = |n: Option<u64>| n.map_or_else(|| "-".to_string(), |n| n.to_string());
     for u in users {
+        let limits = defaults.effective(u.user.role, &u.user.limits);
         println!(
             "{:<24} {:<8} {:<9} {:>8} {:>8} {:>4}",
             u.user.username,
             u.user.role.as_str(),
             if u.user.disabled { "disabled" } else { "active" },
-            format!("{}/{}", u.clients, u.user.max_clients),
-            format!("{}/{}", u.tunnels, u.user.max_tunnels),
+            format!("{}/{}", u.clients, of(limits.machines)),
+            format!("{}/{}", u.tunnels, of(limits.tunnels)),
             if u.user.totp { "on" } else { "off" }
         );
     }
+    println!("(\"-\": unlimited; admins and the owner set per-user limits in the web UI's Users page)");
     Ok(())
 }
 
@@ -480,7 +487,7 @@ pub async fn user_invite(config_path: &Path, role: crate::ui::store::Role, hours
         anyhow::bail!("the web UI is off: turn it on with `tunnel-server setup --ui-host <name>`");
     };
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let token = crate::tokens::random_token(crate::ui::INVITE_PREFIX);
     let id = format!("in{}", crate::tokens::random_tunnel_id());
     let expires_at = crate::tokens::now() + i64::from(hours) * 3600;
@@ -507,7 +514,7 @@ pub async fn user_delete(config_path: &Path, username: &str) -> anyhow::Result<(
     ensure_can_write(config_path, "user delete")?;
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let result = db.delete_user(username.to_ascii_lowercase()).await;
     if let Ok(Ok(_)) = &result {
         let _ = db.audit(None, "user_deleted", Some(format!("{username} (server shell)")), None).await;
@@ -534,7 +541,7 @@ pub async fn user_delete(config_path: &Path, username: &str) -> anyhow::Result<(
 pub async fn client_list(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let clients = db.list_clients().await?;
     drop(db);
     restore_ownership(config_path, &cfg)?;
@@ -555,7 +562,7 @@ pub async fn client_delete(config_path: &Path, name: &str) -> anyhow::Result<()>
     ensure_can_write(config_path, "client delete")?;
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let deleted = db.delete_client(name.to_string()).await?;
     drop(db);
     restore_ownership(config_path, &cfg)?;
@@ -576,7 +583,7 @@ pub async fn client_rename(config_path: &Path, name: &str, new_name: &str) -> an
     ensure_can_write(config_path, "client rename")?;
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let result = db.rename_client(name.to_string(), new_name.to_string(), None).await;
     if let Ok(Ok(())) = &result
         && name != new_name
@@ -664,7 +671,7 @@ fn open_for_write(config_path: &Path, what: &str) -> anyhow::Result<(Config, Db)
     ensure_can_write(config_path, what)?;
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     Ok((cfg, db))
 }
 
@@ -717,7 +724,7 @@ pub async fn service_set(config_path: &Path, name: &str, max_tunnels: u32) -> an
 pub async fn service_list(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
-    let db = Db::open(&cfg.db_path())?;
+    let db = Db::open_configured(&cfg)?;
     let services = db.list_services(None, None).await;
     drop(db);
     restore_ownership(config_path, &cfg)?;

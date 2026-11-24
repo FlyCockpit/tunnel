@@ -275,6 +275,20 @@ fn server_summary(state: &AppState) -> ServerSummary {
     }
 }
 
+/// A user for the UI API, with their limits: per limit the setting, the
+/// server default for the role and the limit in force (`null`: unlimited).
+fn user_json(state: &AppState, user: &User) -> Value {
+    let mut v = serde_json::to_value(user).unwrap_or_default();
+    v["limits"] = state.db.limit_defaults().view(user.role, &user.limits);
+    v
+}
+
+/// What the user uses of their tunnel and machine limits.
+async fn usage_json(state: &AppState, user_id: &str) -> ApiResult<Value> {
+    let (machines, tunnels) = state.db.user_usage(user_id.to_string()).await?;
+    Ok(json!({ "tunnels": tunnels, "machines": machines }))
+}
+
 async fn session(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Json<Value>> {
     // An owner someone can sign in as: one created for machines before anyone
     // signed up has no password yet, and the sign-in page should say how to claim it.
@@ -282,9 +296,10 @@ async fn session(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Json
     let server = server_summary(&state);
     Ok(Json(match &ctx.session {
         Some((id, s)) if !s.pending => json!({
-            "user": s.user, "pending": false, "csrf": keys(&state)?.csrf_token(id),
+            "user": user_json(&state, &s.user), "pending": false, "csrf": keys(&state)?.csrf_token(id),
             "owner_exists": owner_exists, "server": server,
             "traffic": crate::traffic::view(&state, &s.user.id).await?,
+            "usage": usage_json(&state, &s.user.id).await?,
         }),
         Some((_, s)) => {
             json!({ "user": null, "pending": true, "pending_user": s.user.username, "csrf": null, "owner_exists": owner_exists, "server": server })
@@ -453,20 +468,16 @@ async fn invite_accept(
     let (invite, _) = state.db.invite_by_token(hash.clone()).await?.ok_or_else(invalid_invite)?;
     validate_password(&req.password)?;
     let password_hash = password::hash(req.password).await.map_err(|_| busy())?;
-    let limits = &state.config.limits;
     let acceptance = if invite.kind == InviteKind::OwnerReset {
         Acceptance::OwnerReset { password_hash, revoke_machines: req.revoke_machines }
     } else {
         let username = validate_username(req.username.as_deref().unwrap_or_default())?;
-        let member = invite.kind == InviteKind::Invite && invite.role == Role::Member;
+        // New users start on the server defaults for their role.
         Acceptance::NewUser(NewUser {
             id: format!("us{}", tokens::random_tunnel_id()),
             username,
             password_hash,
             can_public: false,
-            max_tunnels: if member { limits.member_max_tunnels } else { 1000 },
-            max_clients: if member { limits.member_max_clients } else { 100 },
-            traffic_cap: if member { member_traffic_cap(limits) } else { None },
         })
     };
     let (user_id, epoch, tunnels) = match state.db.accept_invite(hash, acceptance).await? {
@@ -713,18 +724,14 @@ async fn add_machine(
         Err(clients::AddError::Taken) => {
             Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a machine with this name exists; pick another"))
         }
-        Err(clients::AddError::Quota) => Err(client_quota()),
+        Err(clients::AddError::Quota { limit, role }) => Err(client_quota(limit, role)),
         Err(clients::AddError::NoUser) => Err(ApiError::new(StatusCode::FORBIDDEN, "disabled", "account disabled")),
         Err(clients::AddError::Other(e)) => Err(e.into()),
     }
 }
 
-fn client_quota() -> ApiError {
-    ApiError::new(
-        StatusCode::TOO_MANY_REQUESTS,
-        "client_quota",
-        "you have as many machines as allowed; remove one or ask an admin for a higher limit",
-    )
+fn client_quota(limit: u64, role: Role) -> ApiError {
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "client_quota", crate::limits::machine_limit_message(limit, role))
 }
 
 /// May `actor` act on what `target_user_id` owns? Their own things, admins
@@ -932,7 +939,7 @@ async fn device_decide(
             Ok(Json(json!({ "status": if req.approve { "approved" } else { "denied" }, "client_name": name })))
         }
         Err(DecideError::NotFound) => Err(unknown_code()),
-        Err(DecideError::Client(NewClientError::Quota)) => Err(client_quota()),
+        Err(DecideError::Client(NewClientError::Quota { limit, role })) => Err(client_quota(limit, role)),
         Err(DecideError::Client(NewClientError::NoUser)) => {
             Err(ApiError::new(StatusCode::FORBIDDEN, "disabled", "account disabled"))
         }
@@ -949,6 +956,14 @@ async fn list_users(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiR
     for u in &mut users {
         u.traffic_bytes = crate::traffic::used_or(&state, &u.user.id, u.traffic_bytes);
     }
+    let users: Vec<Value> = users
+        .iter()
+        .map(|u| {
+            let mut v = serde_json::to_value(u).unwrap_or_default();
+            v["limits"] = user_json(&state, &u.user)["limits"].take();
+            v
+        })
+        .collect();
     Ok(Json(json!({ "users": users, "month": crate::traffic::month_label(state.traffic.month()) })))
 }
 
@@ -959,25 +974,12 @@ struct UserUpdate {
     role: Option<Role>,
     #[serde(default)]
     can_public: Option<bool>,
+    /// Any of `tunnels`, `machines`, `tunnel_ttl_s` (seconds) and
+    /// `traffic_bytes` (per month): `"default"`, `"unlimited"` or a number.
     #[serde(default)]
-    max_tunnels: Option<u32>,
-    #[serde(default)]
-    max_clients: Option<u32>,
-    /// Monthly traffic cap in bytes; `null` removes it.
-    #[serde(default, deserialize_with = "some_or_null")]
-    traffic_cap: Option<Option<u64>>,
+    limits: Option<crate::limits::SettingsPatch>,
     #[serde(default)]
     disabled: Option<bool>,
-}
-
-/// Tells a JSON `null` (`Some(None)`) from a missing field (`None`).
-fn some_or_null<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
-    Option::<T>::deserialize(d).map(Some)
-}
-
-/// The cap new members get, in bytes.
-fn member_traffic_cap(limits: &crate::config::Limits) -> Option<u64> {
-    limits.member_monthly_traffic_gb.map(|gb| gb * 1_000_000_000)
 }
 
 async fn update_user(
@@ -1000,59 +1002,65 @@ async fn update_user(
     if req.role == Some(Role::Owner) {
         return Err(ApiError::validation("there is exactly one owner"));
     }
-    if req.max_tunnels.is_some_and(|n| n > 10_000) || req.max_clients.is_some_and(|n| n > 1000) {
-        return Err(ApiError::validation("max_tunnels must be 0..=10000 and max_clients 0..=1000"));
+    let limits = req.limits.unwrap_or_default();
+    limits.validate().map_err(ApiError::validation)?;
+    if req.role.is_some() && limits != crate::limits::SettingsPatch::default() {
+        return Err(ApiError::validation(
+            "change the role and the limits in separate requests: a role change resets the limits to the server default",
+        ));
     }
-    if let Some(Some(cap)) = req.traffic_cap
-        && !(crate::traffic::MIN_CAP..=crate::traffic::MAX_CAP).contains(&cap)
-    {
-        return Err(ApiError::validation("traffic_cap must be at least 1000000 bytes (1 MB), or null for no cap"));
-    }
-    let patch = UserPatch {
-        role: req.role,
-        can_public: req.can_public,
-        max_tunnels: req.max_tunnels,
-        max_clients: req.max_clients,
-        traffic_cap: req.traffic_cap,
-    };
-    let limits = &state.config.limits;
-    let member = super::store::MemberDefaults {
-        max_tunnels: limits.member_max_tunnels,
-        max_clients: limits.member_max_clients,
-        traffic_cap: member_traffic_cap(limits),
-    };
+    let patch = UserPatch { role: req.role, can_public: req.can_public, limits };
     // The checks above give clear errors; this transaction is the authority
     // (the session may have ended, or roles changed, since they ran).
     // The new cap takes effect in memory in the same task as the commit, so
     // a cancelled request cannot leave the old one enforced.
     // The traffic lock is held from the commit until the cap is applied, so
-    // two changes apply in commit order; the cap's audit entry is written in
-    // the same task.
-    let cap_changed = req.traffic_cap.is_some() || req.role.is_some();
-    let cap_audit = req.traffic_cap.map(|cap| {
-        let cap = cap.map_or_else(|| "none".to_string(), |b| format!("{b} bytes"));
-        format!("{} {cap}", target.username)
-    });
+    // two changes apply in commit order; the limits' audit entries are
+    // written in the same task.
     let task = {
         let (state, actor, session, id, disabled, ip) =
             (state.clone(), actor.id.clone(), s.session.id_hash.clone(), id.clone(), req.disabled, s.ctx.ip_string());
+        let username = target.username.clone();
         tokio::spawn(async move {
             let changes = state.traffic.changes().await;
-            let updated = state.db.admin_update_user(actor.clone(), session, id, patch, disabled, member).await?;
-            if let Ok((user, _)) = &updated {
-                if cap_changed {
-                    crate::traffic::set_cap(&state, &changes, &user.id, user.traffic_cap).await?;
+            let updated = state.db.admin_update_user(actor.clone(), session, id, patch, disabled).await?;
+            if let Ok((user, update)) = &updated {
+                let defaults = state.db.limit_defaults();
+                // Always the committed row's cap: a role or limit change by a
+                // concurrent request may have committed just before this one.
+                let cap = defaults.resolve(crate::limits::Kind::Traffic, user.role, user.limits.traffic_bytes);
+                crate::traffic::set_cap(&state, &changes, &user.id, cap).await?;
+                for t in &update.shortened {
+                    state.invalidate_tunnel(t);
                 }
-                if let Some(target) = cap_audit
-                    && let Err(e) = state.db.audit(Some(actor), "traffic_cap_set", Some(target), ip).await
-                {
-                    tracing::warn!(error = %format!("{e:#}"), "audit write failed");
+                let mut entries: Vec<(&'static str, String)> = update
+                    .limits
+                    .iter()
+                    .map(|c| {
+                        let (old, new) = (
+                            defaults.describe(c.kind, c.old_role, c.old),
+                            defaults.describe(c.kind, c.new_role, c.new),
+                        );
+                        ("limit_set", format!("{username}: {} {old} → {new}", c.kind.label()))
+                    })
+                    .collect();
+                if !update.shortened.is_empty() {
+                    let limit = defaults
+                        .resolve(crate::limits::Kind::TunnelTtl, user.role, user.limits.tunnel_ttl_s)
+                        .map_or_else(String::new, crate::limits::duration_text);
+                    let n = update.shortened.len();
+                    entries.push(("tunnels_shortened", format!("{username}: {n} tunnel(s) now end within {limit}")));
+                }
+                for (action, entry) in entries {
+                    if let Err(e) = state.db.audit(Some(actor.clone()), action, Some(entry), ip.clone()).await {
+                        tracing::warn!(error = %format!("{e:#}"), "audit write failed");
+                    }
                 }
             }
             anyhow::Ok(updated)
         })
     };
-    let (user, tunnels) = match task.await.map_err(|e| ApiError::internal(e.into()))?? {
+    let (user, update) = match task.await.map_err(|e| ApiError::internal(e.into()))?? {
         Ok(found) => found,
         Err(super::store::AdminError::NotFound) => return Err(ApiError::not_found("user")),
         Err(super::store::AdminError::Forbidden) => {
@@ -1060,7 +1068,7 @@ async fn update_user(
         }
         Err(super::store::AdminError::SignedOut) => return Err(changed_meanwhile()),
     };
-    for t in &tunnels {
+    for t in &update.closed {
         state.delete_tunnel(t, CloseReason::Deleted).await?;
     }
     audit(&state, Some(&actor.id), "user_updated", Some(target.username.clone()), &s.ctx).await;
@@ -1068,7 +1076,7 @@ async fn update_user(
         let action = if disabled { "user_disabled" } else { "user_enabled" };
         audit(&state, Some(&actor.id), action, Some(target.username.clone()), &s.ctx).await;
     }
-    Ok(Json(json!({ "user": user })))
+    Ok(Json(json!({ "user": user_json(&state, &user), "shortened_tunnels": update.shortened.len() })))
 }
 
 /// Start the user's traffic for this month again from zero (audited).

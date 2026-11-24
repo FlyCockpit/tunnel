@@ -31,8 +31,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `tunnel_access_cuts_total` counts them.
 - Accounts and a web UI on its own `ui_host`: an owner created with
   `tunnel-server admin link` (also the recovery path), admins and members
-  invited with single-use expiring links, per-member quotas (live tunnels,
-  machines, tunnel lifetime), public previews only for admins or members an
+  invited with single-use expiring links, per-user limits set by admins (for
+  members) and the owner (for admins) in the Users page — live tunnels,
+  machines, tunnel lifetime and monthly traffic, each Server default, a number
+  or Unlimited (an unlimited lifetime allows tunnels that never expire),
+  audited, shown on the Account page and in `GET /v1/server` — public previews only for admins or members an
   admin allows, disabling users, TOTP two-factor sign-in with recovery codes,
   an audit log, and strict CSRF, `Origin` and `Sec-Fetch-Site` checks on the
   cookie-authenticated `/ui/api/*`. Every machine client belongs to an account.

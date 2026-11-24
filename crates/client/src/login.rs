@@ -332,8 +332,11 @@ impl<'a> Api<'a> {
         self.http.request(method, format!("{}{path}", self.login.api)).bearer_auth(&self.login.token)
     }
 
-    pub async fn create_tunnel(&self, label: &str, ttl_s: u64, access: &Value) -> anyhow::Result<Created> {
-        let body = json!({ "label": label, "ttl_s": ttl_s, "access": access });
+    pub async fn create_tunnel(&self, label: &str, ttl: Ttl, access: &Value) -> anyhow::Result<Created> {
+        let body = match ttl {
+            Ttl::Seconds(ttl_s) => json!({ "label": label, "ttl_s": ttl_s, "access": access }),
+            Ttl::Never => json!({ "label": label, "never_expires": true, "access": access }),
+        };
         decode(self.req(reqwest::Method::POST, "/v1/tunnels").json(&body).send().await?, "creating tunnel").await
     }
 
@@ -404,6 +407,21 @@ impl<'a> Api<'a> {
 }
 
 /// `90`, `30m`, `8h`, `2d` → seconds.
+/// A tunnel lifetime: a duration, or `never` (accounts with an unlimited
+/// tunnel lifetime only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ttl {
+    Seconds(u64),
+    Never,
+}
+
+pub fn parse_ttl(s: &str) -> Result<Ttl, String> {
+    if s.trim().eq_ignore_ascii_case("never") {
+        return Ok(Ttl::Never);
+    }
+    parse_duration(s).map(Ttl::Seconds).map_err(|e| format!("{e}, or 'never'"))
+}
+
 pub fn parse_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, mult) = match s.chars().last() {
@@ -423,6 +441,15 @@ pub fn parse_duration(s: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttls() {
+        assert_eq!(parse_ttl("8h"), Ok(Ttl::Seconds(28_800)));
+        assert_eq!(parse_ttl("never"), Ok(Ttl::Never));
+        assert_eq!(parse_ttl(" Never "), Ok(Ttl::Never));
+        assert!(parse_ttl("forever").unwrap_err().contains("or 'never'"));
+        assert!(parse_ttl("0").is_err());
+    }
 
     #[test]
     fn login_arg() {

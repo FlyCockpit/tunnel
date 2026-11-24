@@ -110,6 +110,7 @@ const TOKEN_LOCK_SHARDS: usize = 64;
 impl AppState {
     pub fn new(config: Config, db: Db, certs: Arc<CertStore>) -> Arc<Self> {
         let access_limiter = RateLimiter::new(config.limits.access_rate_per_min);
+        db.set_limit_defaults(crate::limits::Defaults::new(&config.limits));
         Arc::new(Self {
             ui: crate::ui::UiState::new(&config),
             config,

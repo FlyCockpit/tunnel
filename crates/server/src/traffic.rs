@@ -493,17 +493,20 @@ impl Db {
     /// `(cap, stored total of month)` of a user; the owner never has a cap,
     /// and an unknown user counts as `(None, 0)`.
     pub async fn user_traffic(&self, user_id: String, month: u32) -> anyhow::Result<(Option<u64>, u64)> {
+        let defaults = self.limit_defaults();
         self.call(move |c| {
             let row = c
                 .query_row(
-                    "SELECT CASE WHEN u.role = 'owner' THEN NULL ELSE u.traffic_cap END,
+                    "SELECT u.role, u.limit_traffic_bytes,
                             COALESCE((SELECT bytes_in + bytes_out FROM traffic WHERE user_id = u.id AND month = ?2), 0)
                      FROM users u WHERE u.id = ?1",
                     params![user_id, month],
                     |r| {
-                        let cap: Option<i64> = r.get(0)?;
-                        let total: i64 = r.get(1)?;
-                        Ok((cap.map(|c| c.max(0) as u64).filter(|c| *c != 0), total.max(0) as u64))
+                        let role = crate::ui::store::Role::parse(&r.get::<_, String>(0)?);
+                        let setting = crate::limits::Setting::from_column(r.get(1)?);
+                        let total: i64 = r.get(2)?;
+                        let cap = defaults.resolve(crate::limits::Kind::Traffic, role, setting);
+                        Ok((cap.filter(|c| *c != 0), total.max(0) as u64))
                     },
                 )
                 .optional()?;
@@ -586,12 +589,26 @@ impl Db {
 
     /// Users with a cap whose stored total of `month` reaches it.
     pub async fn users_over_cap(&self, month: u32) -> anyhow::Result<Vec<String>> {
+        let defaults = self.limit_defaults();
         self.call(move |c| {
             let mut stmt = c.prepare(
-                "SELECT u.id FROM users u JOIN traffic t ON t.user_id = u.id AND t.month = ?1
-                 WHERE u.traffic_cap > 0 AND u.role != 'owner' AND t.bytes_in + t.bytes_out >= u.traffic_cap",
+                "SELECT u.id, u.role, u.limit_traffic_bytes, t.bytes_in + t.bytes_out FROM users u
+                 JOIN traffic t ON t.user_id = u.id AND t.month = ?1 WHERE u.role != 'owner'",
             )?;
-            Ok(stmt.query_map(params![month], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)
+            let rows = stmt.query_map(params![month], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(3)?))
+            })?;
+            let mut over = Vec::new();
+            for row in rows {
+                let (id, role, setting, total) = row?;
+                let role = crate::ui::store::Role::parse(&role);
+                let cap =
+                    defaults.resolve(crate::limits::Kind::Traffic, role, crate::limits::Setting::from_column(setting));
+                if cap.is_some_and(|cap| cap > 0 && total.max(0) as u64 >= cap) {
+                    over.push(id);
+                }
+            }
+            Ok(over)
         })
         .await
     }

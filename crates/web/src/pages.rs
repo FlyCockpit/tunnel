@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::api::{self, ApiError};
 use crate::types::*;
-use crate::ui::{Copy, Empty, ErrorBox, bytes, gb_text, parse_gb, relative, traffic_text, when};
+use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, relative, traffic_text, when};
 use crate::{ctx, navigate, refresh_session};
 
 pub fn route(path: String) -> AnyView {
@@ -271,6 +271,147 @@ where
     }
 }
 
+/// `3 of 10`, or `3 (unlimited)`.
+fn used_of(used: u64, limit: Option<u64>) -> String {
+    match limit {
+        Some(l) => format!("{used} of {l}"),
+        None => format!("{used} (unlimited)"),
+    }
+}
+
+/// One limit in the editor: Server default, a number or Unlimited.
+#[derive(Clone, Copy)]
+struct LimitField {
+    key: &'static str,
+    label: &'static str,
+    mode: RwSignal<String>,
+    /// As typed: a count, GB for traffic, an amount of `unit` for lifetimes.
+    value: RwSignal<String>,
+    unit: RwSignal<String>,
+    /// The setting the form was opened with.
+    initial: StoredValue<Value>,
+}
+
+impl LimitField {
+    fn new(key: &'static str, label: &'static str, l: &Limit) -> Self {
+        let (value, unit) = crate::limits::form_value(key, l.setting.as_u64());
+        Self {
+            key,
+            label,
+            mode: RwSignal::new(l.mode().to_string()),
+            value: RwSignal::new(value),
+            unit: RwSignal::new(unit),
+            initial: StoredValue::new(l.setting.clone()),
+        }
+    }
+
+    /// The setting to send, `Ok(None)` when unchanged, or what is wrong.
+    fn setting(&self) -> Result<Option<Value>, String> {
+        let wanted = crate::limits::wanted(
+            self.key,
+            self.label,
+            &self.mode.get_untracked(),
+            &self.value.get_untracked(),
+            &self.unit.get_untracked(),
+        )?;
+        Ok(crate::limits::changed(&self.initial.get_value(), &wanted).then_some(wanted))
+    }
+}
+
+/// An admin's editor for a user's four limits.
+#[component]
+fn LimitsEditor<F>(
+    id: String,
+    limits: Limits,
+    busy: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+    update: F,
+) -> impl IntoView
+where
+    F: Fn(String, Value) + Copy + 'static,
+{
+    let fields = [
+        LimitField::new("tunnels", "Live tunnels (across their machines)", &limits.tunnels),
+        LimitField::new("machines", "Machines", &limits.machines),
+        LimitField::new("tunnel_ttl_s", "Longest tunnel lifetime", &limits.tunnel_ttl_s),
+        LimitField::new("traffic_bytes", "Monthly traffic", &limits.traffic_bytes),
+    ];
+    let defaults = [&limits.tunnels, &limits.machines, &limits.tunnel_ttl_s, &limits.traffic_bytes].map(|l| l.default);
+    // Control ids are unique per user: several editors may be open.
+    let id_prefix = id.clone();
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let mut body = serde_json::Map::new();
+        for f in fields {
+            match f.setting() {
+                Ok(Some(v)) => {
+                    body.insert(f.key.to_string(), v);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error.set(Some(e));
+                    return;
+                }
+            }
+        }
+        if body.is_empty() {
+            error.set(Some("Nothing changed.".into()));
+            return;
+        }
+        update(id.clone(), crate::limits::patch_body(body));
+    };
+    view! {
+        <form class="limits stack" on:submit=submit>
+            <div class="limits-grid">
+                {fields.into_iter().zip(defaults).map(|(f, default)| {
+                    let select_id = format!("limit-{}-{}", f.key, id_prefix);
+                    let value_id = format!("{select_id}-value");
+                    let default_text = match (f.key, default) {
+                        (_, None) => "unlimited".to_string(),
+                        ("tunnel_ttl_s", Some(s)) => duration_text(s),
+                        ("traffic_bytes", Some(b)) => bytes(b),
+                        (_, Some(n)) => n.to_string(),
+                    };
+                    view! {
+                        <div class="field">
+                            <label for=select_id.clone()>{f.label}</label>
+                            <div class="row">
+                                <select id=select_id class="input input-sm w-auto"
+                                    on:change=move |ev| f.mode.set(value(&ev))>
+                                    <option value="default" selected=move || f.mode.get() == "default">{format!("Server default ({default_text})")}</option>
+                                    <option value="number" selected=move || f.mode.get() == "number">"Number"</option>
+                                    <option value="unlimited" selected=move || f.mode.get() == "unlimited">"Unlimited"</option>
+                                </select>
+                                <Show when=move || f.mode.get() == "number">
+                                    <label class="sr-only" for=value_id.clone()>{format!("{} value", f.label)}</label>
+                                    <input id=value_id.clone() class="input input-sm input-num"
+                                        inputmode=if f.key == "traffic_bytes" { "decimal" } else { "numeric" }
+                                        prop:value=move || f.value.get() on:input=move |ev| f.value.set(value(&ev)) />
+                                    {match f.key {
+                                        "traffic_bytes" => view! { <span class="muted small">"GB"</span> }.into_any(),
+                                        "tunnel_ttl_s" => view! {
+                                            <select class="input input-sm w-auto" aria-label="Unit"
+                                                on:change=move |ev| f.unit.set(value(&ev))>
+                                                <option value="s" selected=move || f.unit.get() == "s">"seconds"</option>
+                                                <option value="m" selected=move || f.unit.get() == "m">"minutes"</option>
+                                                <option value="h" selected=move || f.unit.get() == "h">"hours"</option>
+                                                <option value="d" selected=move || f.unit.get() == "d">"days"</option>
+                                            </select>
+                                        }.into_any(),
+                                        _ => ().into_any(),
+                                    }}
+                                </Show>
+                            </div>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+            <p class="muted small">"Lowering a limit never stops what already runs: existing tunnels and machines stay, new ones are refused with a message naming the limit. A lifetime limit applies to new tunnels and renewals, and the user's tunnels that would outlive it now end at most that long from now. Unlimited lifetime lets their tunnels never expire. A traffic limit applies at once. Changing the role resets all four to the server default."</p>
+            <div><button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save limits"</button></div>
+        </form>
+    }
+}
+
 // ------------------------------------------------------------------ tunnels
 
 /// Label and lifetime of the links the Open button mints, and the server's
@@ -443,7 +584,11 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                                 {bytes(t.bytes_in + t.bytes_out)}
                                                 {t.traffic_limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}
                                             </td>
-                                            <td title=when(t.expires_at)>{relative(t.expires_at)}</td>
+                                            {if t.never_expires {
+                                                view! { <td title="This tunnel lives until it is deleted.">"never"</td> }.into_any()
+                                            } else {
+                                                view! { <td title=when(t.expires_at)>{relative(t.expires_at)}</td> }.into_any()
+                                            }}
                                             <td class="actions">
                                                 {open_buttons(&t, error)}
                                                 <button class="btn btn-outline btn-sm" on:click=move |_| {
@@ -972,6 +1117,30 @@ fn Account() -> impl IntoView {
             </div></div>
             <ErrorBox error=error />
             {move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}
+            {move || c.session.get().and_then(|s| s.user.map(|u| (u, s.usage.unwrap_or_default()))).map(|(u, usage)| view! {
+                <div class="card stack">
+                    <h2>"Your limits"</h2>
+                    {if u.role == "owner" {
+                        view! { <p>"You are the server's owner: no limits apply to you."</p> }.into_any()
+                    } else {
+                        let l = u.limits.clone();
+                        view! {
+                            <table class="table">
+                                <tbody>
+                                    <tr><th>"Live tunnels (across your machines)"</th><td>{used_of(usage.tunnels, l.tunnels.effective)}</td></tr>
+                                    <tr><th>"Machines"</th><td>{used_of(usage.machines, l.machines.effective)}</td></tr>
+                                    <tr><th>"Longest tunnel lifetime"</th><td>{l.tunnel_ttl_s.effective.map(duration_text)
+                                        .unwrap_or_else(|| "unlimited (tunnels may never expire: tunnel share --ttl never)".into())}</td></tr>
+                                    <tr><th>"Monthly traffic"</th><td>{l.traffic_bytes.effective.map(bytes).unwrap_or_else(|| "unlimited".into())}</td></tr>
+                                </tbody>
+                            </table>
+                            <p class="muted small">{format!(
+                                "Set by {}. At a limit, new tunnels or machines are refused and longer lifetimes are refused; what already runs keeps running.",
+                                if u.role == "admin" { "the server's owner" } else { "an admin" })}</p>
+                        }.into_any()
+                    }}
+                </div>
+            })}
             {move || c.session.get().and_then(|s| s.traffic).map(|t| view! {
                 <div class="card stack">
                     <h2>"Traffic this month"</h2>
@@ -1163,46 +1332,25 @@ fn Users(me: User) -> impl IntoView {
                         let editable = u.role != "owner" && u.id != me_id && (owner || u.role == "member");
                         let (id1, id2, id3, id4) = (u.id.clone(), u.id.clone(), u.id.clone(), u.id.clone());
                         let (id5, id6) = (u.id.clone(), u.id.clone());
-                        let cap_input_id = format!("cap-{}", u.id);
-                        let cap = u.traffic_cap;
+                        let cap = u.limits.traffic_bytes.effective;
                         let limited = cap.is_some_and(|c| row.traffic_bytes >= c);
-                        // The cap in GB as typed; empty: no cap.
-                        let cap_gb = RwSignal::new(cap.map(gb_text).unwrap_or_default());
-                        let set_cap = move |ev: leptos::ev::SubmitEvent| {
-                            ev.prevent_default();
-                            let typed = cap_gb.get_untracked();
-                            let typed = typed.trim();
-                            let cap = if typed.is_empty() {
-                                Value::Null
-                            } else {
-                                match parse_gb(typed) {
-                                    Some(b) => json!(b),
-                                    None => { error.set(Some("Enter the cap in GB, e.g. 50 or 0.5, or leave it empty for no cap.".into())); return; }
-                                }
-                            };
-                            update(id5.clone(), json!({ "traffic_cap": cap }));
-                        };
+                        let editing = RwSignal::new(false);
                         let can_public = u.can_public;
                         let disabled = u.disabled;
                         let is_admin = u.role == "admin";
+                        let limits = u.limits.clone();
                         view! { <tr>
                             <td>{u.username.clone()}{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}</td>
                             <td>{u.role.clone()}</td>
-                            <td>{format!("{} / {}", row.clients, u.max_clients)}</td>
-                            <td>{format!("{} / {}", row.tunnels, u.max_tunnels)}</td>
+                            <td>{used_of(row.clients.max(0) as u64, u.limits.machines.effective)}</td>
+                            <td>{used_of(row.tunnels.max(0) as u64, u.limits.tunnels.effective)}
+                                <div class="muted small">{format!("lifetime {}", u.limits.tunnel_ttl_s.effective.map(duration_text).unwrap_or_else(|| "unlimited".into()))}</div></td>
                             <td>
                                 <div>{traffic_text(row.traffic_bytes, cap)}
                                     {limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}</div>
                                 {editable.then(|| view! {
-                                    <form class="row" on:submit=set_cap>
-                                        <label class="sr-only" for=cap_input_id.clone()>"Monthly traffic cap (GB)"</label>
-                                        <input id=cap_input_id.clone() class="input input-sm input-num" inputmode="decimal" placeholder="no cap"
-                                            prop:value=move || cap_gb.get() on:input=move |ev| cap_gb.set(value(&ev)) />
-                                        <span class="muted small">"GB"</span>
-                                        <button class="btn btn-outline btn-sm" type="submit" disabled=move || busy.get()>"Set cap"</button>
-                                        <button class="btn btn-ghost btn-sm" type="button" disabled=move || busy.get()
-                                            on:click=move |_| reset_traffic(id6.clone())>"Reset month"</button>
-                                    </form>
+                                    <button class="btn btn-ghost btn-sm" type="button" disabled=move || busy.get()
+                                        on:click=move |_| reset_traffic(id6.clone())>"Reset month"</button>
                                 })}
                             </td>
                             <td>{if u.role == "member" {
@@ -1213,6 +1361,8 @@ fn Users(me: User) -> impl IntoView {
                             } else { view! { "admin" }.into_any() }}</td>
                             <td>{if u.totp { "on" } else { "off" }}</td>
                             <td class="actions">{editable.then(|| view! {
+                                <button class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
+                                    on:click=move |_| editing.update(|e| *e = !*e)>"Limits"</button>" "
                                 {(owner && !disabled).then(|| view! {
                                     <button class="btn btn-outline btn-sm" on:click=move |_| update(id2.clone(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
                                         {if is_admin { "Make member" } else { "Make admin" }}
@@ -1224,7 +1374,13 @@ fn Users(me: User) -> impl IntoView {
                                 </button>
                                 <span class="sr-only">{id4.clone()}</span>
                             })}</td>
-                        </tr> }
+                        </tr>
+                        {move || editing.get().then(|| view! {
+                            <tr class="limits-row"><td colspan="8" class="links-panel">
+                                <LimitsEditor id=id5.clone() limits=limits.clone() busy=busy error=error update=update />
+                            </td></tr>
+                        })}
+                        }
                     }).collect_view()}
                     </tbody>
                 </table>
@@ -1329,9 +1485,13 @@ fn Status() -> impl IntoView {
                         <tr><th>"Connected tunnels"</th><td>{field(&["connected_tunnels"])}</td></tr>
                         <tr><th>"Tunnels"</th><td>{field(&["counts", "tunnels"])}</td></tr>
                         <tr><th>"Access links"</th><td>{field(&["counts", "access_links"])}</td></tr>
-                        <tr><th>"Member tunnels / machines"</th><td>{move || format!("{} / {}", field(&["limits", "member_max_tunnels"])(), field(&["limits", "member_max_clients"])())}</td></tr>
+                        <tr><th>"Members' default tunnels / machines"</th><td>{move || format!("{} / {}", field(&["limits", "member_max_tunnels"])(), field(&["limits", "member_max_clients"])())}</td></tr>
+                        <tr><th>"Members' default tunnel lifetime"</th><td>{move || status.get()
+                            .and_then(|s| Some(s["limits"]["member_max_tunnel_ttl_s"].as_u64()?.min(s["limits"]["max_tunnel_ttl_s"].as_u64()?)))
+                            .map(duration_text)
+                            .unwrap_or_default()}</td></tr>
                         <tr><th>"Public previews for everyone"</th><td>{field(&["limits", "allow_public_for_clients"])}</td></tr>
-                        <tr><th>"New members' monthly traffic"</th><td>{move || status.get()
+                        <tr><th>"Members' default monthly traffic"</th><td>{move || status.get()
                             .and_then(|s| s["limits"]["member_monthly_traffic_gb"].as_u64())
                             .map(|gb| format!("{gb} GB"))
                             .unwrap_or_else(|| "no cap".into())}</td></tr>

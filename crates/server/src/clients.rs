@@ -23,8 +23,11 @@ pub struct Enrollment {
 pub enum AddError {
     Invalid(String),
     Taken,
-    /// The owning user already has as many machines as allowed.
-    Quota,
+    /// The owning user already has as many machines as their limit allows.
+    Quota {
+        limit: u64,
+        role: crate::ui::store::Role,
+    },
     /// The owning user is unknown or disabled.
     NoUser,
     Other(anyhow::Error),
@@ -87,7 +90,7 @@ pub async fn add(
             })
         }
         Err(NewClientError::NameTaken) => Err(AddError::Taken),
-        Err(NewClientError::Quota) => Err(AddError::Quota),
+        Err(NewClientError::Quota { limit, role }) => Err(AddError::Quota { limit, role }),
         Err(NewClientError::NoUser) => Err(AddError::NoUser),
     }
 }

@@ -99,10 +99,11 @@ enum Cmd {
         /// Username for --password (default "preview").
         #[arg(long, requires = "password")]
         username: Option<String>,
-        /// How long the tunnel lives, e.g. 30m, 8h, 2d; the daemon keeps it up
-        /// after this command ends, until `tunnel unshare`. Not with --for.
-        #[arg(long, default_value = "8h", value_parser = login::parse_duration)]
-        ttl: u64,
+        /// How long the tunnel lives, e.g. 30m, 8h, 2d, or `never` (only if your
+        /// account's tunnel lifetime is Unlimited); the daemon keeps it up after
+        /// this command ends, until `tunnel unshare`. Not with --for.
+        #[arg(long, default_value = "8h", value_parser = login::parse_ttl)]
+        ttl: login::Ttl,
         /// Stay in the foreground, then unshare: `--for` (1h) or `--for=30m`;
         /// Ctrl-C (or SIGTERM) unshares sooner. Always makes a new tunnel. Not with --ttl.
         #[arg(long = "for", value_name = "DURATION", num_args = 0..=1, require_equals = true,

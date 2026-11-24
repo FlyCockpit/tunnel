@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Db, NewClientError, client_admissible, expire_owner_tunnels};
+use crate::limits::{Kind, Setting, Settings, SettingsPatch};
 use crate::tokens::now;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,12 +44,11 @@ pub struct User {
     pub role: Role,
     pub disabled: bool,
     pub can_public: bool,
-    pub max_tunnels: u32,
-    pub max_clients: u32,
     pub totp: bool,
     pub created_at: i64,
-    /// Monthly traffic cap in bytes (both directions); `None`: no cap.
-    pub traffic_cap: Option<u64>,
+    /// As set; the API shows them with what they resolve to (`limits.rs`).
+    #[serde(skip)]
+    pub limits: Settings,
 }
 
 /// A user with the secrets needed to sign them in.
@@ -73,14 +73,6 @@ pub const FACTOR_FAILURES: i64 = 5;
 /// …for this long, doubling with every further run of failures (at most a day).
 pub const FACTOR_LOCK_S: i64 = 15 * 60;
 
-/// Member defaults applied when someone becomes a member.
-#[derive(Clone, Copy)]
-pub struct MemberDefaults {
-    pub max_tunnels: u32,
-    pub max_clients: u32,
-    pub traffic_cap: Option<u64>,
-}
-
 /// A user in the admin list, with usage.
 #[derive(Debug, Clone, Serialize)]
 pub struct UserSummary {
@@ -97,25 +89,33 @@ pub struct NewUser {
     pub username: String,
     pub password_hash: String,
     pub can_public: bool,
-    pub max_tunnels: u32,
-    pub max_clients: u32,
-    pub traffic_cap: Option<u64>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct UserPatch {
     pub role: Option<Role>,
     pub can_public: Option<bool>,
-    pub max_tunnels: Option<u32>,
-    pub max_clients: Option<u32>,
-    /// `Some(None)`: remove the cap; absent: unchanged.
-    #[serde(default, deserialize_with = "some_or_null")]
-    pub traffic_cap: Option<Option<u64>>,
+    pub limits: SettingsPatch,
 }
 
-/// Tells a JSON `null` (`Some(None)`) from a missing field (`None`).
-fn some_or_null<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
-    Option::<T>::deserialize(d).map(Some)
+/// One limit an admin's change set to another value (for the audit log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitChange {
+    pub kind: Kind,
+    pub old: Setting,
+    pub old_role: Role,
+    pub new: Setting,
+    pub new_role: Role,
+}
+
+/// What [`Db::admin_update_user`] changed besides the row itself.
+#[derive(Debug, Clone, Default)]
+pub struct AdminUpdate {
+    /// Tunnels to close (the user was disabled).
+    pub closed: Vec<String>,
+    pub limits: Vec<LimitChange>,
+    /// Tunnels whose expiry moved earlier to fit a lower lifetime limit.
+    pub shortened: Vec<String>,
 }
 
 /// A signed-in (or half signed-in) UI session.
@@ -286,10 +286,11 @@ pub struct LinkSummary {
     pub expires_at: i64,
 }
 
-const USER_COLUMNS: &str = "u.id, u.username, u.role, u.disabled_at IS NOT NULL, u.can_public, u.max_tunnels, \
-     u.max_clients, u.totp_secret_sealed IS NOT NULL, u.created_at, u.traffic_cap";
+const USER_COLUMNS: &str = "u.id, u.username, u.role, u.disabled_at IS NOT NULL, u.can_public, \
+     u.totp_secret_sealed IS NOT NULL, u.created_at, u.limit_tunnels, u.limit_clients, u.limit_tunnel_ttl_s, \
+     u.limit_traffic_bytes";
 /// Columns `user_from_row` reads; queries add theirs after these.
-const USER_COLS: usize = 10;
+const USER_COLS: usize = 11;
 
 fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
@@ -298,11 +299,14 @@ fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         role: Role::parse(&r.get::<_, String>(2)?),
         disabled: r.get(3)?,
         can_public: r.get(4)?,
-        max_tunnels: r.get(5)?,
-        max_clients: r.get(6)?,
-        totp: r.get(7)?,
-        created_at: r.get(8)?,
-        traffic_cap: r.get::<_, Option<i64>>(9)?.map(|b| b.max(0) as u64),
+        totp: r.get(5)?,
+        created_at: r.get(6)?,
+        limits: Settings {
+            tunnels: Setting::from_column(r.get(7)?),
+            machines: Setting::from_column(r.get(8)?),
+            tunnel_ttl_s: Setting::from_column(r.get(9)?),
+            traffic_bytes: Setting::from_column(r.get(10)?),
+        },
     })
 }
 
@@ -413,10 +417,13 @@ impl Db {
     /// transaction: `actor` must still be signed in with `session`, be the
     /// owner or an admin, the target must not be the owner or the actor, an
     /// admin may change members only, and only the owner changes roles.
-    /// A role change ends the user's sessions; becoming a member resets public
-    /// previews and quotas to member defaults and drops the unused invites
-    /// they made. Disabling ends sessions and logins and deletes machines; the
-    /// returned tunnel ids must be closed by the caller.
+    /// A role change ends the user's sessions and resets the four limits to
+    /// the server default; becoming a member also resets public previews and
+    /// drops the unused invites they made. A lower lifetime limit (a changed
+    /// lifetime or role) moves the expiry of the user's tunnels that would
+    /// outlive it to that long from now. Disabling ends sessions and logins
+    /// and deletes machines; the tunnels in `closed` must be closed by the
+    /// caller.
     pub async fn admin_update_user(
         &self,
         actor: String,
@@ -424,8 +431,8 @@ impl Db {
         id: String,
         patch: UserPatch,
         disabled: Option<bool>,
-        member: MemberDefaults,
-    ) -> anyhow::Result<Result<(User, Vec<String>), AdminError>> {
+    ) -> anyhow::Result<Result<(User, AdminUpdate), AdminError>> {
+        let defaults = self.limit_defaults();
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if !authorized(&tx, &actor, None, &session)? {
@@ -447,31 +454,61 @@ impl Db {
             if !allowed {
                 return Ok(Err(AdminError::Forbidden));
             }
-            if let Some(new_role) = patch.role.filter(|r| *r != role) {
+            let before = tx.query_row(
+                &format!("SELECT {USER_COLUMNS} FROM users u WHERE u.id = ?1"),
+                params![id],
+                user_from_row,
+            )?;
+            let mut settings = before.limits;
+            let mut new_role = role;
+            if let Some(changed) = patch.role.filter(|r| *r != role) {
+                new_role = changed;
                 tx.execute(
                     "UPDATE users SET role = ?2, auth_epoch = auth_epoch + 1 WHERE id = ?1",
-                    params![id, new_role.as_str()],
+                    params![id, changed.as_str()],
                 )?;
                 tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![id])?;
-                if new_role == Role::Member {
-                    tx.execute(
-                        "UPDATE users SET can_public = 0, max_tunnels = ?2, max_clients = ?3, traffic_cap = ?4 WHERE id = ?1",
-                        params![id, member.max_tunnels, member.max_clients, member.traffic_cap.map(|b| b as i64)],
-                    )?;
+                settings = Settings::default();
+                if changed == Role::Member {
+                    tx.execute("UPDATE users SET can_public = 0 WHERE id = ?1", params![id])?;
                     tx.execute("DELETE FROM invites WHERE created_by = ?1 AND used_at IS NULL", params![id])?;
                 }
             }
             if let Some(v) = patch.can_public {
                 tx.execute("UPDATE users SET can_public = ?2 WHERE id = ?1", params![id, v])?;
             }
-            if let Some(v) = patch.max_tunnels {
-                tx.execute("UPDATE users SET max_tunnels = ?2 WHERE id = ?1", params![id, v])?;
+            for kind in Kind::ALL {
+                if let Some(v) = patch.limits.get(kind) {
+                    settings.set(kind, v);
+                }
             }
-            if let Some(v) = patch.max_clients {
-                tx.execute("UPDATE users SET max_clients = ?2 WHERE id = ?1", params![id, v])?;
+            let mut update = AdminUpdate::default();
+            for kind in Kind::ALL {
+                let (old, new) = (before.limits.get(kind), settings.get(kind));
+                if old != new {
+                    tx.execute(
+                        &format!("UPDATE users SET {} = ?2 WHERE id = ?1", kind.column()),
+                        params![id, new.to_column()],
+                    )?;
+                }
+                // Also a limit a role change moved (e.g. Server default for
+                // an admin → for a member).
+                if old != new || defaults.resolve(kind, role, old) != defaults.resolve(kind, new_role, new) {
+                    update.limits.push(LimitChange { kind, old, old_role: role, new, new_role });
+                }
             }
-            if let Some(v) = patch.traffic_cap {
-                tx.execute("UPDATE users SET traffic_cap = ?2 WHERE id = ?1", params![id, v.map(|b| b as i64)])?;
+            let lifetime_changed = new_role != role || before.limits.tunnel_ttl_s != settings.tunnel_ttl_s;
+            if lifetime_changed
+                && let Some(limit) = defaults.resolve(Kind::TunnelTtl, new_role, settings.tunnel_ttl_s)
+            {
+                let latest = now().saturating_add(i64::try_from(limit).unwrap_or(i64::MAX));
+                let mut stmt = tx.prepare(
+                    "UPDATE tunnels SET expires_at = ?2
+                     WHERE expires_at > ?2 AND client_id IN (SELECT id FROM clients WHERE user_id = ?1)
+                     RETURNING id",
+                )?;
+                update.shortened =
+                    stmt.query_map(params![id, latest], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             }
             let mut tunnels = Vec::new();
             match disabled {
@@ -503,7 +540,8 @@ impl Db {
                 user_from_row,
             )?;
             tx.commit()?;
-            Ok(Ok((user, tunnels)))
+            update.closed = tunnels;
+            Ok(Ok((user, update)))
         })
         .await
     }
@@ -1115,18 +1153,24 @@ impl Db {
                     let id = format!("us{}", crate::tokens::random_tunnel_id());
                     let mut name = "owner".to_string();
                     let mut n = 2;
-                    while tx.query_row("SELECT EXISTS (SELECT 1 FROM users WHERE username = ?1)", params![name], |r| {
-                        r.get::<_, bool>(0)
-                    })? {
+                    while tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM users WHERE username = ?1)",
+                        params![name],
+                        |r| r.get::<_, bool>(0),
+                    )? {
                         name = format!("owner-{n}");
                         n += 1;
                     }
                     tx.execute(
-                        "INSERT INTO users (id, username, password_hash, role, can_public, max_tunnels, max_clients, created_at)
-                         VALUES (?1, ?2, ?3, 'owner', 1, 1000, 1000, ?4)",
+                        "INSERT INTO users (id, username, password_hash, role, can_public, created_at)
+                         VALUES (?1, ?2, ?3, 'owner', 1, ?4)",
                         params![id, name, NO_PASSWORD, now()],
                     )?;
-                    tx.query_row(&format!("SELECT {USER_COLUMNS} FROM users u WHERE u.id = ?1"), params![id], user_from_row)?
+                    tx.query_row(
+                        &format!("SELECT {USER_COLUMNS} FROM users u WHERE u.id = ?1"),
+                        params![id],
+                        user_from_row,
+                    )?
                 }
             };
             tx.commit()?;
@@ -1201,6 +1245,7 @@ impl Db {
         approve: bool,
         session: String,
     ) -> anyhow::Result<Result<String, DecideError>> {
+        let defaults = self.limit_defaults();
         self.call(move |c| {
             let t = now();
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1220,7 +1265,7 @@ impl Db {
             };
             if approve {
                 let unique = unique_client_name(&tx, &name)?;
-                if let Err(e) = client_admissible(&tx, &unique, &user_id)? {
+                if let Err(e) = client_admissible(&tx, &unique, &user_id, defaults)? {
                     return Ok(Err(DecideError::Client(e)));
                 }
             }
@@ -1243,6 +1288,7 @@ impl Db {
         client_id: String,
         token_hash: String,
     ) -> anyhow::Result<Option<Poll>> {
+        let defaults = self.limit_defaults();
         self.call(move |c| {
             let t = now();
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1281,7 +1327,7 @@ impl Db {
                 ("approved", Some(user_id)) => {
                     tx.execute("DELETE FROM device_logins WHERE device_code_hash = ?1", params![device_code_hash])?;
                     let unique = unique_client_name(&tx, &name)?;
-                    match client_admissible(&tx, &unique, &user_id)? {
+                    match client_admissible(&tx, &unique, &user_id, defaults)? {
                         Ok(()) => {
                             tx.execute(
                                 "INSERT INTO clients (id, name, token_hash, created_at, last_used_at, user_id)
@@ -1610,7 +1656,7 @@ impl Db {
         let (id, username) = (id.to_string(), username.to_string());
         self.call(move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO users (id, username, password_hash, role, max_tunnels, max_clients, created_at)
+                "INSERT OR IGNORE INTO users (id, username, password_hash, role, limit_tunnels, limit_clients, created_at)
                  VALUES (?1, ?2, 'x', ?3, 1000, 1000, 0)",
                 params![id, username, role.as_str()],
             )?;
@@ -1641,19 +1687,9 @@ pub(crate) fn authorized(
 /// Insert `u` with `role`; `None` if the username is taken.
 fn insert_user(tx: &rusqlite::Transaction<'_>, u: NewUser, role: Role, t: i64) -> anyhow::Result<Option<String>> {
     let inserted = tx.execute(
-        "INSERT INTO users (id, username, password_hash, role, can_public, max_tunnels, max_clients, traffic_cap, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(username) DO NOTHING",
-        params![
-            u.id,
-            u.username,
-            u.password_hash,
-            role.as_str(),
-            u.can_public,
-            u.max_tunnels,
-            u.max_clients,
-            u.traffic_cap.map(|b| b as i64),
-            t
-        ],
+        "INSERT INTO users (id, username, password_hash, role, can_public, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(username) DO NOTHING",
+        params![u.id, u.username, u.password_hash, role.as_str(), u.can_public, t],
     )?;
     Ok((inserted == 1).then_some(u.id))
 }

@@ -276,9 +276,7 @@ Accounts are owner, admin or member. Admins invite people with single-use,
 expiring links (`https://<ui_host>/invite#…`, 7 days by default; the token
 stays in the fragment, out of logs), manage members, and see every tunnel;
 only the owner invites or changes admins. Members see and manage only their
-own machines, tunnels and links, within their quotas (defaults
-`limits.member_max_tunnels` 10 live tunnels across their machines,
-`member_max_clients` 5 machines, `member_max_tunnel_ttl_s` 7 days). Members
+own machines, tunnels and links, within their limits (below). Members
 cannot create public previews unless an admin allows it for them
 (`can_public`) or `limits.allow_public_for_clients` is on; access links and
 password mode always work. Disabling a user ends their sessions, removes their
@@ -297,14 +295,45 @@ owner would make one) and `user delete <name>` removes an account other than
 the owner, with its sessions and machines. There is no open sign-up, no email
 and no SSO.
 
+**Limits.** Every account has four limits: live tunnels across all its
+machines, machines, the longest tunnel lifetime, and monthly traffic. In the
+Users page, admins set them for members and the owner sets them for admins
+(nobody limits the owner, who is always unlimited; nobody changes their own).
+Each is one of:
+
+| Setting | Members | Admins |
+|---|---|---|
+| Server default (follows the config; a changed value applies after a restart) | `limits.member_max_tunnels` (10), `member_max_clients` (5), `member_max_tunnel_ttl_s` (7 days, at most `max_tunnel_ttl_s`), `member_monthly_traffic_gb` (unset: none) | no tunnel, machine or traffic limit; lifetime `limits.max_tunnel_ttl_s` (30 days) |
+| A number | that many live tunnels or machines (0 allowed), that many seconds of lifetime (60 s to 100 years; it replaces `max_tunnel_ttl_s` for this user), that many bytes a month (at least 1 MB) | same |
+| Unlimited | no limit; an unlimited lifetime lets the user's machines create tunnels that **never expire** (`tunnel share --ttl never`, API `never_expires: true`) until deleted | same |
+
+New accounts start on the server default, and a role change resets all four
+to it (so `PATCH /ui/api/users/{id}` takes `role` or `limits`, not both). Lowering a limit never stops what already runs: existing tunnels and
+machines stay, and new ones are refused with a message naming the limit, its
+value and who can raise it (HTTP 429 `tunnel_quota` / `client_quota`). A
+lifetime limit applies to new tunnels and to renewals (`PATCH` `ttl_s`,
+HTTP 422 `tunnel_ttl_limit` beyond it), and the user's tunnels that would
+outlive the new limit are shortened to end that long after the change (they
+keep running until then; so tunnels that never expire do not outlive taking
+Unlimited away). A traffic limit applies at once (below). Each change is
+audited (`limit_set`: who, the user, old → new; `tunnels_shortened`). Users
+see their limits and use on the Account page; `GET /v1/server` gives a
+machine's `limits.max_tunnel_ttl_s` (`null`: unlimited) and
+`limits.account` (each limit, `null` for unlimited, with the tunnels and
+machines in use, and who can raise them); the UI API's users carry
+`limits.<name>.setting`, `default` and `effective`. `limits.max_tunnels_per_client`
+(live tunnels per machine) still applies to every machine. Service
+credentials and the admin token keep their own rules (`max_tunnels`,
+`max_tunnel_ttl_s`).
+
 **Traffic.** The server counts what each tunnel relays (request and response
 bodies and WebSocket messages, both directions; headers are not counted) per
 tunnel and, for tunnels of a user's machines, per user and calendar month
 (UTC). Counters live in memory and are written to the database about once a
 minute (nothing is written while idle; a restart may lose the last minute,
-in the user's favour). Admins can give a member a monthly cap (the owner can
-also cap admins; nobody caps the owner) in the Users page, and new members
-get `limits.member_monthly_traffic_gb` if it is set (default: no cap). Once a
+in the user's favour). The monthly cap is the account's traffic limit
+(above; members on the server default follow
+`limits.member_monthly_traffic_gb`, default: no cap). Once a
 user reaches their cap, their tunnels answer **503 "Traffic limit reached"**
 (no caching) and what they were relaying is cut at once (downloads, uploads,
 WebSockets); their machines can still sign in and create tunnels, and the
@@ -330,7 +359,7 @@ UI's audit log records the change. New names (machines and services) are 1–64
 letters, digits, `.`, `_` or `-`; not only dots, and not `enroll`.
 
 **Services** (`tnsvc_`, below) are not accounts: platforms such as a sandbox
-service keep their own quota, and member limits never apply to them.
+service keep their own quota, and account limits never apply to them.
 
 ### WebRTC
 

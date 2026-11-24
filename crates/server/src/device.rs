@@ -193,9 +193,11 @@ pub async fn device_token(
             StatusCode::CONFLICT,
             "client_refused",
             match e {
-                NewClientError::Quota => "approved, but that account has as many machines as allowed; remove one first",
-                NewClientError::NoUser => "approved, but the approving account was disabled",
-                NewClientError::NameTaken => "approved, but no free machine name was left",
+                NewClientError::Quota { limit, role } => {
+                    format!("approved, but {}", crate::limits::machine_limit_message(limit, role))
+                }
+                NewClientError::NoUser => "approved, but the approving account was disabled".to_string(),
+                NewClientError::NameTaken => "approved, but no free machine name was left".to_string(),
             },
         )),
         Some(Poll::Approved { name }) => {

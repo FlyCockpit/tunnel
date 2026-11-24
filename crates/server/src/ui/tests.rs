@@ -799,7 +799,9 @@ async fn roles_limit_what_admins_and_members_can_do() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        adam.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "max_tunnels": 3 }))).await.status,
+        adam.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "limits": { "tunnels": 3 } })))
+            .await
+            .status,
         StatusCode::OK
     );
     // A role change by the owner ends that user's sessions.
@@ -1063,7 +1065,7 @@ async fn demoting_an_admin_resets_member_limits_and_drops_their_invites() {
     let adam_id = state.db.user_by_name("adam".into()).await.unwrap().unwrap().id;
     let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{adam_id}"), Some(json!({ "role": "member" }))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(r.body["user"]["max_tunnels"], state.config.limits.member_max_tunnels);
+    assert_eq!(r.body["user"]["limits"]["tunnels"]["effective"], state.config.limits.member_max_tunnels);
     assert_eq!(r.body["user"]["can_public"], false);
     let info =
         Browser::new(5).call(&state, "POST", "/ui/api/invite/info", Some(json!({ "token": adams_invite }))).await;
@@ -1184,12 +1186,10 @@ async fn admin_changes_are_authorized_inside_the_transaction() {
         .await
         .unwrap();
     let olivia = state.db.user_by_name("olivia".into()).await.unwrap().unwrap().id;
-    let member = super::store::MemberDefaults { max_tunnels: 10, max_clients: 5, traffic_cap: None };
     let promote = super::store::UserPatch { role: Some(Role::Admin), ..Default::default() };
     // The session ends (an owner recovery) while the request is in flight.
     state.db.delete_user_sessions(olivia.clone(), None).await.unwrap();
-    let r =
-        state.db.admin_update_user(olivia.clone(), session.clone(), ann.clone(), promote, None, member).await.unwrap();
+    let r = state.db.admin_update_user(olivia.clone(), session.clone(), ann.clone(), promote, None).await.unwrap();
     assert_eq!(r.unwrap_err(), super::store::AdminError::SignedOut);
     let invite = state
         .db
@@ -1439,25 +1439,48 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
 
     // Caps: validated, admins only, never the owner or oneself.
     for bad in [json!(0), json!(999_999), json!(-1), json!("10")] {
-        let r =
-            owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": bad }))).await;
+        let r = owner
+            .call(
+                &state,
+                "PATCH",
+                &format!("/ui/api/users/{ann_id}"),
+                Some(json!({ "limits": { "traffic_bytes": bad } })),
+            )
+            .await;
         assert!(matches!(r.status, StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST), "{bad}: {}", r.status);
     }
     let olivia = user_id(&users.body, "olivia");
     let r = owner
-        .call(&state, "PATCH", &format!("/ui/api/users/{olivia}"), Some(json!({ "traffic_cap": 2_000_000 })))
+        .call(
+            &state,
+            "PATCH",
+            &format!("/ui/api/users/{olivia}"),
+            Some(json!({ "limits": { "traffic_bytes": 2_000_000 } })),
+        )
         .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "nobody caps the owner");
-    let r = ann.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": null }))).await;
+    let r = ann
+        .call(
+            &state,
+            "PATCH",
+            &format!("/ui/api/users/{ann_id}"),
+            Some(json!({ "limits": { "traffic_bytes": "unlimited" } })),
+        )
+        .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "members cannot lift their own cap");
     let r = ann.call(&state, "POST", &format!("/ui/api/users/{ann_id}/traffic/reset"), Some(json!({}))).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "members cannot reset their own traffic");
 
     let r = owner
-        .call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": 1_000_000 })))
+        .call(
+            &state,
+            "PATCH",
+            &format!("/ui/api/users/{ann_id}"),
+            Some(json!({ "limits": { "traffic_bytes": 1_000_000 } })),
+        )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(r.body["user"]["traffic_cap"], 1_000_000);
+    assert_eq!(r.body["user"]["limits"]["traffic_bytes"]["effective"], 1_000_000);
     assert!(!bytes.blocked());
     let me = ann.call(&state, "GET", "/ui/api/session", None).await;
     assert_eq!(me.body["traffic"]["used_bytes"], 500);
@@ -1480,11 +1503,26 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
 
     // Raising (here: removing) the cap unblocks; lowering it below the total blocks again.
-    let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": null }))).await;
-    assert_eq!((r.status, r.body["user"]["traffic_cap"].clone()), (StatusCode::OK, Value::Null));
+    let r = owner
+        .call(
+            &state,
+            "PATCH",
+            &format!("/ui/api/users/{ann_id}"),
+            Some(json!({ "limits": { "traffic_bytes": "unlimited" } })),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["user"]["limits"]["traffic_bytes"]["effective"].clone()),
+        (StatusCode::OK, Value::Null)
+    );
     assert!(!bytes.blocked());
     let r = owner
-        .call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "traffic_cap": 1_000_000 })))
+        .call(
+            &state,
+            "PATCH",
+            &format!("/ui/api/users/{ann_id}"),
+            Some(json!({ "limits": { "traffic_bytes": 1_000_000 } })),
+        )
         .await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(bytes.blocked());
@@ -1529,7 +1567,7 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     let log = owner.call(&state, "GET", "/ui/api/audit", None).await;
     let actions: Vec<&str> =
         log.body["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
-    assert!(actions.contains(&"traffic_cap_set") && actions.contains(&"traffic_reset"), "{actions:?}");
+    assert!(actions.contains(&"limit_set") && actions.contains(&"traffic_reset"), "{actions:?}");
 }
 
 #[tokio::test]
@@ -1541,14 +1579,17 @@ async fn new_members_get_the_configured_cap_and_admins_none() {
     let token = r.body["url"].as_str().unwrap().split_once('#').unwrap().1.to_string();
     let _adam = sign_up(&state, &token, "adam", 3).await;
     let users = owner.call(&state, "GET", "/ui/api/users", None).await;
-    assert_eq!(listed(&users.body, "ann")["traffic_cap"], 5_000_000_000u64);
-    assert_eq!(listed(&users.body, "adam")["traffic_cap"], Value::Null);
-    assert_eq!(listed(&users.body, "olivia")["traffic_cap"], Value::Null);
+    assert_eq!(listed(&users.body, "ann")["limits"]["traffic_bytes"]["effective"], 5_000_000_000u64);
+    assert_eq!(listed(&users.body, "adam")["limits"]["traffic_bytes"]["effective"], Value::Null);
+    assert_eq!(listed(&users.body, "olivia")["limits"]["traffic_bytes"]["effective"], Value::Null);
     assert!(users.body["month"].as_str().unwrap().len() == 7);
     // Demoting an admin gives them the member default.
     let adam = user_id(&users.body, "adam");
     let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{adam}"), Some(json!({ "role": "member" }))).await;
-    assert_eq!((r.status, r.body["user"]["traffic_cap"].clone()), (StatusCode::OK, json!(5_000_000_000u64)));
+    assert_eq!(
+        (r.status, r.body["user"]["limits"]["traffic_bytes"]["effective"].clone()),
+        (StatusCode::OK, json!(5_000_000_000u64))
+    );
     let status = owner.call(&state, "GET", "/ui/api/status", None).await;
     assert_eq!(status.body["limits"]["member_monthly_traffic_gb"], 5);
 }
@@ -1666,3 +1707,6 @@ async fn open_links_follow_the_link_rules_and_are_labelled() {
     }
     assert!(bob.call(&state, "GET", "/ui/api/tunnels?all=true", None).await.status == StatusCode::FORBIDDEN);
 }
+
+#[path = "limit_tests.rs"]
+mod limit_tests;

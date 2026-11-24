@@ -145,6 +145,9 @@ dialog::backdrop { background: rgb(0 0 0 / 40%); }
 .qr { width: 200px; height: 200px; background: #fff; padding: 8px; }
 .table td.links-panel { background: var(--muted); padding: 12px var(--table-inset); }
 .input.w-auto { width: auto; }
+.limits-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.limits-grid .field + .field { margin-top: 0; }
+.limits .row { flex-wrap: wrap; }
 .input.input-sm { height: 26px; width: 14rem; padding: 0 8px; }
 .input.input-sm.input-num { width: 6rem; }
 @media (max-width: 760px) { .input.input-sm { height: 34px; width: 100%; } }

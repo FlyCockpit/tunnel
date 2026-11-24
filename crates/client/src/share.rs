@@ -171,12 +171,18 @@ fn hostname() -> String {
         .unwrap_or_else(|| "machine".to_string())
 }
 
+/// The server's `expires_at` for a tunnel that never expires (9999-12-31T23:59:59Z).
+pub const NEVER_EXPIRES: i64 = 253_402_300_799;
+
 /// What `share` printed, also its `--json` output.
 #[derive(Serialize)]
 struct ShareOutput {
     tunnel: String,
     mode: String,
     expires_at: i64,
+    /// Present (true) when the tunnel never expires (`expires_at` is then 9999-12-31).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    never_expires: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
     /// Present (true) when the account reached its monthly traffic cap:
@@ -245,7 +251,7 @@ impl Signals {
 pub async fn share(
     ports: Vec<u16>,
     access: ShareAccess,
-    ttl_s: u64,
+    ttl: crate::login::Ttl,
     label: Option<String>,
     target: Option<String>,
     out: Output,
@@ -284,7 +290,7 @@ pub async fn share(
             }
             None => {
                 let wanted = access.to_json()?;
-                let (shared, expires_at, limited) = create_shared(&api, &login, &paths, label, ttl_s, &wanted).await?;
+                let (shared, expires_at, limited) = create_shared(&api, &login, &paths, label, ttl, &wanted).await?;
                 let mode = wanted["mode"].as_str().unwrap_or("link").to_string();
                 (shared.tunnel_id, shared.token.unwrap_or_default(), mode, expires_at, limited)
             }
@@ -307,7 +313,8 @@ pub async fn share(
     // Prompt (for --password) before catching signals, so Ctrl-C still works there.
     let wanted = access.to_json()?;
     let mut signals = Signals::install()?;
-    let (shared, expires_at, limited) = create_shared(&api, &login, &paths, label, fg.duration_s, &wanted).await?;
+    let (shared, expires_at, limited) =
+        create_shared(&api, &login, &paths, label, crate::login::Ttl::Seconds(fg.duration_s), &wanted).await?;
     let created = Instant::now();
     let plan = Plan {
         ports,
@@ -370,11 +377,11 @@ async fn create_shared(
     login: &Login,
     paths: &Paths,
     label: Option<String>,
-    ttl_s: u64,
+    ttl: crate::login::Ttl,
     access: &Value,
 ) -> anyhow::Result<(Shared, i64, bool)> {
     let label = label.unwrap_or_else(|| format!("share-{}", hostname()));
-    let created = api.create_tunnel(&label, ttl_s, access).await?;
+    let created = api.create_tunnel(&label, ttl, access).await?;
     let shared = Shared { tunnel_id: created.id.clone(), api: login.api.clone(), token: Some(created.tunnel_token) };
     let written = share_lock(paths).and_then(|_lock| {
         write_atomic(&shared_path(paths), &serde_json::to_vec(&shared)?, 0o600).map_err(anyhow::Error::from)
@@ -449,7 +456,9 @@ async fn expose_and_show(
             }
         });
     }
-    let shown = ShareOutput { tunnel: tunnel_id, mode, expires_at, username, traffic_limited: limited, links };
+    let never_expires = expires_at == NEVER_EXPIRES;
+    let shown =
+        ShareOutput { tunnel: tunnel_id, mode, expires_at, never_expires, username, traffic_limited: limited, links };
     print_share(&shown, out, foreground)?;
     Ok(Ok(shown))
 }
@@ -487,6 +496,7 @@ fn print_share(shared: &ShareOutput, out: &Output, foreground: Option<&Foregroun
     }
     match foreground {
         Some(f) => println!("Sharing for {}; Ctrl-C stops sharing sooner.", human_duration(f.duration_s)),
+        None if shared.never_expires => println!("This tunnel never expires. Stop sharing: tunnel unshare"),
         None => println!("Stop sharing: tunnel unshare"),
     }
     std::io::stdout().flush()?;
@@ -679,6 +689,7 @@ pub async fn link(
             tunnel: shared.tunnel_id,
             mode: info.access.mode,
             expires_at: info.expires_at,
+            never_expires: info.expires_at == NEVER_EXPIRES,
             username: None,
             traffic_limited: info.traffic_limited,
             links: vec![LinkOutput {
@@ -949,6 +960,7 @@ mod tests {
             tunnel: "t".into(),
             mode: "link".into(),
             expires_at: 9,
+            never_expires: false,
             username: None,
             traffic_limited: false,
             links: vec![link],
@@ -971,13 +983,14 @@ mod tests {
             tunnel: "t".into(),
             mode: "password".into(),
             expires_at: 9,
+            never_expires: true,
             username: Some("bob".into()),
             traffic_limited: true,
             links: vec![public],
         };
         assert_eq!(
             serde_json::to_value(&shown).unwrap(),
-            json!({"tunnel":"t","mode":"password","expires_at":9,"username":"bob","traffic_limited":true,"links":[
+            json!({"tunnel":"t","mode":"password","expires_at":9,"never_expires":true,"username":"bob","traffic_limited":true,"links":[
                 {"port":80,"url":"https://80-t.example/","connected":false,
                  "login_url":"https://example/__login?to=80-t&next=%2F"}]})
         );

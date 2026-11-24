@@ -109,7 +109,12 @@ Deleting the client revokes
 its token and deletes its tunnels. `logout` only removes the local login.
 `expose` also uses the logged-in server when `TUNNEL_SERVER` is unset.
 
-New shares live for 8 hours by default (`share --ttl 30m|8h|2d` overrides this).
+New shares live for 8 hours by default (`share --ttl 30m|8h|2d` overrides this,
+within the account's tunnel lifetime limit; `--ttl never` makes a tunnel that
+lives until `tunnel unshare`, for accounts whose lifetime is Unlimited).
+Refusals name the limit and who can raise it, e.g. `creating tunnel: HTTP 429:
+this account's live-tunnel limit (10, across all its machines) is reached; …
+ask an admin to raise the limit`.
 Reusing a share keeps its existing expiry and preserves its access mode unless
 an access flag is given. Password mode defaults to username `preview`. `share` prints links
 valid for up to 10 minutes; `link` uses the same default (`--ttl` overrides it), and

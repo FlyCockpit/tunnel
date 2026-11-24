@@ -44,6 +44,9 @@ tunnel share 3000 5173 --ttl 1h --json  # several ports, shorter lifetime
 - `"traffic_limited": true` means the user's account has used its monthly
   traffic: visitors will see "Traffic limit reached". Tell the user; only a
   server admin can raise the limit.
+- An HTTP 429 or 422 naming a limit (live tunnels, machines, tunnel lifetime)
+  is the account's limit: tell the user what it says (it names who can raise
+  it); do not delete tunnels you did not create to make room.
 - Never use `--public` unless the user explicitly asked for a public URL.
   Members' public previews are refused unless an admin allowed them; do not
   look for workarounds.
@@ -92,7 +95,10 @@ start).
 `--ttl` and `--for` are exclusive. Pick `--for` for anything you start;
 `--ttl` (default 8h) is for a share the daemon keeps up in the background,
 after your process ends, until someone runs `tunnel unshare`, and it reuses
-the machine's current shared tunnel if there is one.
+the machine's current shared tunnel if there is one. `--ttl never` (only when
+the account's tunnel lifetime is Unlimited, and only when the user asks for a
+share that stays up) makes a tunnel that never expires; `"never_expires": true`
+in the JSON.
 
 ## More links
 
