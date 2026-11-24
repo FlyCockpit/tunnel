@@ -1403,6 +1403,23 @@ fn listed<'a>(users: &'a Value, name: &str) -> &'a Value {
 }
 
 #[tokio::test]
+async fn a_flush_forgets_a_user_nothing_holds_once_their_bytes_are_written() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let _ann = member(&state, &mut owner, "ann", 2).await;
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    let ann_id = user_id(&users.body, "ann");
+    let usage = state.traffic.usage(&state.db, &ann_id).await.unwrap();
+    usage.add(10, false);
+    drop(usage);
+    // The flush writes the pending bytes and, in the same pass, forgets the
+    // unblocked user that no counter holds any more.
+    crate::traffic::flush(&state).await.unwrap();
+    assert_eq!(state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap(), (None, 10));
+    assert!(state.traffic.loaded(&ann_id).is_none());
+}
+
+#[tokio::test]
 async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     let state = state();
     let mut owner = owner(&state).await;

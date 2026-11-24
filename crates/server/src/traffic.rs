@@ -460,18 +460,22 @@ async fn flush_locked(state: &AppState, _: &Changes<'_>, month: u32) -> anyhow::
             marks.push((b, now_in, now_out));
         }
     }
-    let users: Vec<Arc<UserUsage>> = state.traffic.lock().values().filter(|u| u.has_pending()).cloned().collect();
-    let taken: Vec<Cutoff<'_>> = users.iter().map(|u| u.cut_off()).filter(|c| !c.is_empty()).collect();
-    if !tunnels.is_empty() || !taken.is_empty() {
-        let rows = taken.iter().map(Cutoff::row).collect();
-        if let Err(e) = state.db.flush_traffic(month, tunnels, rows).await {
-            for c in taken {
-                c.unflush();
+    // Scoped: the users' references must be gone before the pruning below,
+    // which keeps users that something else still holds.
+    {
+        let users: Vec<Arc<UserUsage>> = state.traffic.lock().values().filter(|u| u.has_pending()).cloned().collect();
+        let taken: Vec<Cutoff<'_>> = users.iter().map(|u| u.cut_off()).filter(|c| !c.is_empty()).collect();
+        if !tunnels.is_empty() || !taken.is_empty() {
+            let rows = taken.iter().map(Cutoff::row).collect();
+            if let Err(e) = state.db.flush_traffic(month, tunnels, rows).await {
+                for c in taken {
+                    c.unflush();
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        for c in taken {
-            c.flushed();
+            for c in taken {
+                c.flushed();
+            }
         }
     }
     for (b, now_in, now_out) in marks {
