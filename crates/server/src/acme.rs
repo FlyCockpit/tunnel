@@ -182,7 +182,7 @@ async fn load_or_create_account(cfg: &Config) -> anyhow::Result<Account> {
         .context("registering ACME account")?;
 
     let stored = StoredAccount { directory: directory.to_string(), credentials };
-    crate::util::write_atomic(&path, &serde_json::to_vec(&stored)?, 0o600)?;
+    crate::files::write_atomic(&path, &serde_json::to_vec(&stored)?, 0o600)?;
     Ok(account)
 }
 

@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use tunnel_protocol::CLIENT_TOKEN_PREFIX;
 use utoipa::ToSchema;
 
+use crate::accounts::Poll;
 use crate::api::{ApiError, ApiJson, ApiResult, ErrorBody, PeerAddr};
 use crate::clients::validate_new_name;
 use crate::db::NewClientError;
 use crate::state::AppState;
 use crate::tokens::{self, now};
-use crate::ui::store::Poll;
 
 pub const DEVICE_CODE_PREFIX: &str = "tndev_";
 pub const DEVICE_TTL_S: i64 = 15 * 60;

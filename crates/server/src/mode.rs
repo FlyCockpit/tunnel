@@ -6,13 +6,14 @@
 //! one-time root changes (unprivileged ports from 80, lingering), which setup
 //! checks and prints as a single command.
 
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Context;
 
-use crate::config::SERVICE_NAME;
+use crate::config::{DEFAULT_DATA_DIR, SERVICE_NAME, SERVICE_USER};
+use crate::files;
 
 pub const SYSTEM_CONFIG_DIR: &str = "/etc/tunnel-server";
 pub const SYSTEM_CONFIG_PATH: &str = "/etc/tunnel-server/config.toml";
@@ -150,9 +151,131 @@ fn xdg(var: &str, fallback: &str) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Reject unsafe data paths before setup or privileged CLI work. System installs
+/// deliberately support ONLY the default data directory: a config file cannot
+/// authorize root to change ownership of a different tree. All existing path
+/// components must be real directories; system parents must be root-owned and
+/// not writable by another account. Rootless installs may use a dedicated path.
+pub fn check_data_dir(path: &Path, privileged: bool) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let raw = path.as_os_str().as_bytes();
+    anyhow::ensure!(path.is_absolute(), "data_dir must be absolute");
+    anyhow::ensure!(
+        raw[1..].split(|b| *b == b'/').all(|p| !p.is_empty() && p != b"." && p != b".."),
+        "data_dir must be normalized, without empty, . or .. components"
+    );
+    let system_dirs = [
+        "/",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/boot",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/var",
+        "/var/lib",
+        "/var/log",
+        "/var/cache",
+        "/var/tmp",
+        "/home",
+        "/root",
+        "/run",
+        "/tmp",
+        "/opt",
+        "/srv",
+        "/mnt",
+        "/media",
+        "/lost+found",
+    ];
+    anyhow::ensure!(!system_dirs.iter().any(|p| path == Path::new(p)), "data_dir cannot be a system directory");
+    for forbidden in
+        ["/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/boot", "/dev", "/proc", "/sys"]
+    {
+        anyhow::ensure!(!path.starts_with(forbidden), "data_dir cannot be inside {forbidden}");
+    }
+    if privileged {
+        anyhow::ensure!(path == Path::new(DEFAULT_DATA_DIR), "root installs require data_dir = {}", DEFAULT_DATA_DIR);
+    }
+    for component in path.ancestors() {
+        match std::fs::symlink_metadata(component) {
+            Ok(meta) => {
+                anyhow::ensure!(
+                    !meta.file_type().is_symlink() && meta.is_dir(),
+                    "data_dir component {} must be a directory, not a symlink",
+                    component.display()
+                );
+                if privileged && component != path {
+                    anyhow::ensure!(
+                        meta.uid() == 0 && meta.mode() & 0o022 == 0,
+                        "data_dir parent {} must be root-owned and not group/world writable",
+                        component.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Restore the system config's root:service ownership after an atomic write.
+/// The containing directory is root:service 0750, so the service cannot replace
+/// either the config or its directory entry. Never operate through a symlink.
+pub fn secure_system_config(path: &Path) -> anyhow::Result<()> {
+    check_system_config_dir(path)?;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(files::O_NOFOLLOW).open(path)?; // O_NOFOLLOW
+    anyhow::ensure!(file.metadata()?.is_file(), "config must be a regular file");
+    files::set_owner_fd(&file, 0, files::group_id(SERVICE_USER)?)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    Ok(())
+}
+
+/// Check before creating/replacing a system config, not only after writing it.
+/// Missing directories may be created by root; existing parents must be trusted.
+pub fn check_system_config_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(path.is_absolute(), "system config path must be absolute");
+    anyhow::ensure!(
+        !path.components().any(|c| c == std::path::Component::ParentDir),
+        "system config path must not contain .."
+    );
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("config has no parent"))?;
+    for component in parent.ancestors() {
+        let meta = match std::fs::symlink_metadata(component) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "config directory must not contain symlinks");
+        anyhow::ensure!(
+            meta.uid() == 0 && meta.mode() & 0o022 == 0,
+            "config directory {} must be root-owned and not group/world writable",
+            component.display()
+        );
+    }
+    Ok(())
+}
+
+/// Recursively restore service ownership, without following symlinks or crossing
+/// filesystems. The guard is inside the entry point so no privileged caller can
+/// forget it. Directory descriptors prevent rename/symlink races during descent.
+pub fn chown_recursive(path: &Path, owner: &str) -> anyhow::Result<()> {
+    check_data_dir(path, uid() == 0)?;
+    files::chown_tree_ids(path, files::account_id(owner, "-u")?, files::group_id(owner)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn system_config_path_is_inside_system_config_dir() {
@@ -171,5 +294,45 @@ mod tests {
             Some(std::ffi::OsStr::new(USER_CONFIG_DIR_NAME)),
             std::path::Path::new(SYSTEM_CONFIG_DIR).file_name()
         );
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tunnel-util-{name}-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn data_dir_guard_rejects_system_relative_and_non_normal_paths() {
+        for path in [
+            "/",
+            "/etc",
+            "/etc/tunnel-server",
+            "relative/tunnel",
+            "/var/lib/../tunnel",
+            "/var/lib/./tunnel",
+            "/var//lib/tunnel",
+            "/var/lib",
+            "/home",
+            "/tmp",
+            "/proc/self",
+        ] {
+            assert!(check_data_dir(Path::new(path), false).is_err(), "accepted {path}");
+        }
+        #[cfg(target_os = "linux")]
+        check_data_dir(Path::new(DEFAULT_DATA_DIR), true).unwrap();
+        assert!(check_data_dir(Path::new("/var/lib/other-tunnel"), true).is_err());
+    }
+
+    #[test]
+    fn data_dir_guard_rejects_symlink_and_symlinked_ancestor() {
+        let dir = test_dir("guard");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        symlink(dir.join("real"), dir.join("link")).unwrap();
+        assert!(check_data_dir(&dir.join("link"), false).is_err());
+        assert!(check_data_dir(&dir.join("link/child"), false).is_err());
+        check_data_dir(&dir.join("real"), false).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

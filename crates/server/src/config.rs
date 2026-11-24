@@ -1,5 +1,4 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -327,7 +326,7 @@ impl Config {
     /// Atomic write with mode 0600. Returns `true` if the file content changed.
     pub fn save(&self, path: &Path) -> anyhow::Result<bool> {
         let content = self.to_toml()?;
-        crate::util::write_if_changed(path, content.as_bytes(), 0o600)
+        crate::files::write_if_changed(path, content.as_bytes(), 0o600)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -429,11 +428,6 @@ pub fn registrable(host: &str) -> String {
         2
     };
     labels[labels.len().saturating_sub(take)..].join(".")
-}
-
-/// Ensure a path has exactly `mode` permissions.
-pub fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use crate::mode::{self, Mode};
 use crate::state::AppState;
 use crate::tls::{self, CertStatus};
 use crate::tokens;
-use crate::{acme, listener, metrics, purge, util};
+use crate::{acme, listener, metrics, purge};
 
 const HEALTH_TOKEN_PREFIX: &str = "tnhlt_";
 
@@ -98,11 +98,11 @@ pub async fn token_rotate(config_path: &Path) -> anyhow::Result<()> {
     let token = tokens::random_token(ADMIN_TOKEN_PREFIX);
     cfg.admin_token_hash = tokens::hash_token(&token);
     if mode == Mode::System {
-        util::check_system_config_dir(config_path)?;
+        mode::check_system_config_dir(config_path)?;
     }
     cfg.save(config_path)?;
     if mode == Mode::System {
-        util::secure_system_config(config_path)?;
+        mode::secure_system_config(config_path)?;
     }
 
     // The server reads the hash at startup; the old token stays valid until it restarts.
@@ -130,11 +130,11 @@ pub async fn health_token(config_path: &Path, set: bool) -> anyhow::Result<()> {
     let token = set.then(|| tokens::random_token(HEALTH_TOKEN_PREFIX));
     cfg.health_token_hash = token.as_deref().map(tokens::hash_token);
     if mode == Mode::System {
-        util::check_system_config_dir(config_path)?;
+        mode::check_system_config_dir(config_path)?;
     }
     cfg.save(config_path)?;
     if mode == Mode::System {
-        util::secure_system_config(config_path)?;
+        mode::secure_system_config(config_path)?;
     }
     if !mode.systemctl_ok(&["try-restart", SERVICE_NAME]) {
         eprintln!("warning: restarting {SERVICE_NAME} failed; restart the service so the change takes effect");
@@ -222,7 +222,7 @@ pub async fn backup(config_path: &Path, out: &Path) -> anyhow::Result<()> {
     }
     drop(db);
     restore_ownership(config_path, &cfg)?;
-    crate::config::set_mode(out, 0o600)?;
+    crate::files::set_mode(out, 0o600)?;
     println!("Wrote {}", out.display());
     Ok(())
 }
@@ -267,7 +267,7 @@ fn restore_backup_file(backup: &Path, db_path: &Path) -> anyhow::Result<()> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(util::O_NOFOLLOW | util::O_CLOEXEC)
+        .custom_flags(crate::files::O_NOFOLLOW | crate::files::O_CLOEXEC)
         .open(&tmp)
         .with_context(|| format!("creating {}", tmp.display()))?;
     let result = (|| -> anyhow::Result<()> {
@@ -400,7 +400,8 @@ pub async fn client_add(config_path: &Path, name: &str, user: Option<&str>) -> a
 /// With `first_run`, nothing happens once the owner has signed up (setup
 /// calls it so a fresh install ends with the owner's link).
 pub async fn admin_link(config_path: &Path, first_run: bool) -> anyhow::Result<()> {
-    use crate::ui::store::{InviteKind, Role};
+    use crate::accounts::InviteKind;
+    use crate::role::Role;
     ensure_can_write(config_path, "admin link")?;
     let cfg = Config::load(config_path)?;
     let Some(ui) = cfg.ui_host.clone() else {
@@ -479,8 +480,8 @@ pub async fn user_list(config_path: &Path) -> anyhow::Result<()> {
 }
 
 /// `user invite`: a sign-up link made from the server's shell (as the owner would).
-pub async fn user_invite(config_path: &Path, role: crate::ui::store::Role, hours: u32) -> anyhow::Result<()> {
-    use crate::ui::store::InviteKind;
+pub async fn user_invite(config_path: &Path, role: crate::role::Role, hours: u32) -> anyhow::Result<()> {
+    use crate::accounts::InviteKind;
     ensure_can_write(config_path, "user invite")?;
     let cfg = Config::load(config_path)?;
     let Some(ui) = cfg.ui_host.clone() else {
@@ -529,10 +530,10 @@ pub async fn user_delete(config_path: &Path, username: &str) -> anyhow::Result<(
             }
             Ok(())
         }
-        Err(crate::ui::store::DeleteUserError::NotFound) => {
+        Err(crate::accounts::DeleteUserError::NotFound) => {
             anyhow::bail!("no user {username}; see `tunnel-server user list`")
         }
-        Err(crate::ui::store::DeleteUserError::Owner) => {
+        Err(crate::accounts::DeleteUserError::Owner) => {
             anyhow::bail!("{username} is the owner and cannot be deleted (`admin link` resets its password instead)")
         }
     }
@@ -597,7 +598,7 @@ pub async fn client_rename(config_path: &Path, name: &str, new_name: &str) -> an
             println!("Renamed {name} to {new_name}; its login and tunnels are unchanged.");
             Ok(())
         }
-        Err(crate::ui::store::RenameError::Taken) => anyhow::bail!("a client named {new_name} exists"),
+        Err(crate::accounts::RenameError::Taken) => anyhow::bail!("a client named {new_name} exists"),
         Err(_) => anyhow::bail!("no client named {name}"),
     }
 }
@@ -785,7 +786,7 @@ fn ensure_can_write(config_path: &Path, what: &str) -> anyhow::Result<()> {
 /// Root CLI operations use the same fixed data directory policy as setup.
 fn check_privileged_data_dir(cfg: &Config) -> anyhow::Result<()> {
     if mode::uid() == 0 {
-        util::check_data_dir(&cfg.data_dir, true)?;
+        mode::check_data_dir(&cfg.data_dir, true)?;
     }
     Ok(())
 }
@@ -794,7 +795,7 @@ fn check_privileged_data_dir(cfg: &Config) -> anyhow::Result<()> {
 /// that the service user cannot write; hand the data dir back.
 fn restore_ownership(_config_path: &Path, cfg: &Config) -> anyhow::Result<()> {
     if mode::uid() == 0 {
-        util::chown_recursive(&cfg.data_dir, SERVICE_USER)?;
+        mode::chown_recursive(&cfg.data_dir, SERVICE_USER)?;
     }
     Ok(())
 }

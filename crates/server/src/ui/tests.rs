@@ -8,8 +8,9 @@ use http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
-use super::store::{InviteKind, Role};
 use super::totp;
+use crate::accounts::InviteKind;
+use crate::role::Role;
 use crate::state::AppState;
 use crate::tokens::{self, now};
 
@@ -905,7 +906,7 @@ async fn wrong_codes_lock_the_second_factor_across_sign_ins() {
     let state = state();
     let mut owner = owner(&state).await;
     let mut codes = enable_totp(&state, &mut owner, "olivia-password").await;
-    for attempt in 0..super::store::FACTOR_FAILURES {
+    for attempt in 0..crate::accounts::FACTOR_FAILURES {
         // A fresh pending sign-in each time does not reset the count.
         let mut b = Browser::new(20 + attempt as u8);
         b.call(&state, "POST", "/ui/api/login", Some(json!({ "username": "olivia", "password": "olivia-password" })))
@@ -1186,11 +1187,11 @@ async fn admin_changes_are_authorized_inside_the_transaction() {
         .await
         .unwrap();
     let olivia = state.db.user_by_name("olivia".into()).await.unwrap().unwrap().id;
-    let promote = super::store::UserPatch { role: Some(Role::Admin), ..Default::default() };
+    let promote = crate::accounts::UserPatch { role: Some(Role::Admin), ..Default::default() };
     // The session ends (an owner recovery) while the request is in flight.
     state.db.delete_user_sessions(olivia.clone(), None).await.unwrap();
     let r = state.db.admin_update_user(olivia.clone(), session.clone(), ann.clone(), promote, None).await.unwrap();
-    assert_eq!(r.unwrap_err(), super::store::AdminError::SignedOut);
+    assert_eq!(r.unwrap_err(), crate::accounts::AdminError::SignedOut);
     let invite = state
         .db
         .create_invite(
@@ -1281,7 +1282,7 @@ async fn an_expired_pending_session_cannot_be_upgraded() {
 
 #[tokio::test]
 async fn deleting_a_user_from_the_shell_ends_everything_and_frees_the_name() {
-    use super::store::DeleteUserError;
+    use crate::accounts::DeleteUserError;
     let state = state();
     let mut owner = owner(&state).await;
     let mut ann = member(&state, &mut owner, "ann", 2).await;

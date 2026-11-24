@@ -7,8 +7,8 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::config::{Config, SERVICE_NAME, SERVICE_USER};
+use crate::files::write_if_changed;
 use crate::mode::Mode;
-use crate::util::write_if_changed;
 
 /// Quote a systemd word (systemd.syntax), including specifier escaping. ExecStart
 /// uses the ':' prefix to disable environment substitution, preserving literal '$'.
@@ -137,7 +137,7 @@ fn install_binary(target: &Path) -> anyhow::Result<bool> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = target.with_extension("new");
     std::fs::write(&tmp, &new).with_context(|| format!("writing {}", tmp.display()))?;
-    crate::config::set_mode(&tmp, 0o755)?;
+    crate::files::set_mode(&tmp, 0o755)?;
     std::fs::rename(&tmp, target).with_context(|| format!("installing {}", target.display()))?;
     println!("Installed {}", target.display());
     Ok(true)

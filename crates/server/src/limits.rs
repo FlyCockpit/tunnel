@@ -7,13 +7,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::ui::store::Role;
+use crate::role::Role;
 
 /// Stored value of an Unlimited setting.
 pub const UNLIMITED: i64 = -1;
 
 /// Longest explicit tunnel lifetime (100 years); longer than that is "never expires".
 pub const MAX_TTL_S: u64 = 100 * 365 * 86_400;
+/// Shortest tunnel lifetime a tunnel may be created or renewed with.
+pub const MIN_TUNNEL_TTL_S: u64 = 60;
+/// The smallest traffic cap an admin may set (1 MB).
+pub const MIN_CAP: u64 = 1_000_000;
+/// The largest traffic cap an admin may set (1 PB).
+pub const MAX_CAP: u64 = 1_000_000_000_000_000;
 
 /// How one limit is set for a user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -188,8 +194,8 @@ impl Kind {
         match self {
             Self::Tunnels => (0, 10_000),
             Self::Machines => (0, 1000),
-            Self::TunnelTtl => (crate::api::MIN_TUNNEL_TTL_S, MAX_TTL_S),
-            Self::Traffic => (crate::traffic::MIN_CAP, crate::traffic::MAX_CAP),
+            Self::TunnelTtl => (MIN_TUNNEL_TTL_S, MAX_TTL_S),
+            Self::Traffic => (MIN_CAP, MAX_CAP),
         }
     }
 

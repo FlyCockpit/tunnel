@@ -56,7 +56,7 @@ pub fn split_cookies(headers: &HeaderMap) -> GateCookies {
             }
             // The web UI's session cookie is host-only on the UI host, so a
             // browser never sends it here; never forward one to an origin anyway.
-            if name.trim_ascii().eq_ignore_ascii_case(crate::ui::UI_COOKIE.as_bytes()) {
+            if name.trim_ascii().eq_ignore_ascii_case(crate::headers::UI_COOKIE.as_bytes()) {
                 continue;
             }
             if !kept.is_empty() {

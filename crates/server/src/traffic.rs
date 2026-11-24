@@ -26,17 +26,14 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use utoipa::ToSchema;
 
+use crate::accounts::AdminError;
 use crate::db::{Db, TunnelRow};
 use crate::metrics::TunnelBytes;
+use crate::role::Role;
 use crate::state::AppState;
-use crate::ui::store::{AdminError, Role};
 
 /// How often counters are written to the database.
 pub const FLUSH_EVERY: Duration = Duration::from_secs(60);
-/// The smallest cap an admin may set (1 MB).
-pub const MIN_CAP: u64 = 1_000_000;
-/// The largest cap an admin may set (1 PB).
-pub const MAX_CAP: u64 = 1_000_000_000_000_000;
 
 /// `YYYYMM` of a Unix time, in UTC.
 pub fn month_of(unix: i64) -> u32 {
@@ -550,7 +547,7 @@ impl Db {
                      FROM users u WHERE u.id = ?1",
                     params![user_id, month],
                     |r| {
-                        let role = crate::ui::store::Role::parse(&r.get::<_, String>(0)?);
+                        let role = crate::role::Role::parse(&r.get::<_, String>(0)?);
                         let setting = crate::limits::Setting::from_column(r.get(1)?);
                         let total: i64 = r.get(2)?;
                         let cap = defaults.resolve(crate::limits::Kind::Traffic, role, setting);
@@ -608,7 +605,7 @@ impl Db {
     ) -> anyhow::Result<Result<String, AdminError>> {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if !crate::ui::store::authorized(&tx, &actor, None, &session)? {
+            if !crate::db::authorized(&tx, &actor, None, &session)? {
                 return Ok(Err(AdminError::SignedOut));
             }
             let actor_role: String =
@@ -649,7 +646,7 @@ impl Db {
             let mut over = Vec::new();
             for row in rows {
                 let (id, role, setting, total) = row?;
-                let role = crate::ui::store::Role::parse(&role);
+                let role = crate::role::Role::parse(&role);
                 let cap =
                     defaults.resolve(crate::limits::Kind::Traffic, role, crate::limits::Setting::from_column(setting));
                 if cap.is_some_and(|cap| cap > 0 && total.max(0) as u64 >= cap) {
