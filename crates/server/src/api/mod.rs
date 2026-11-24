@@ -1343,7 +1343,7 @@ async fn mint_link(
     tracing::info!(tunnel = %tunnel.id, link = %link_id, kind, single_use, expires_at, "access link created");
     Ok(AccessLinkResponse {
         id: link_id,
-        url: crate::gatehost::access_url(&state.config.preview_zone, &tunnel.id, port, &token),
+        url: crate::edge::gatehost::access_url(&state.config.preview_zone, &tunnel.id, port, &token),
         expires_at,
     })
 }

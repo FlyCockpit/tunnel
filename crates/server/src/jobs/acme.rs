@@ -12,7 +12,7 @@ use instant_acme::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::dns::{self, RecordRef};
+use crate::config::dns::{self, RecordRef};
 use crate::state::AppState;
 use crate::tls::{self, CertStatus};
 

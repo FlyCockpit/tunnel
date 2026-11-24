@@ -15,14 +15,16 @@ use http_body::Body as HttpBody;
 use hyper::body::Incoming;
 
 use crate::db::{AccessMode, TunnelLookup, TunnelRow};
-use crate::gate;
-use crate::gatehost;
-use crate::headers;
 use crate::ice;
-use crate::pages;
-use crate::proxy;
 use crate::state::AppState;
 use crate::util::{Body, header_str, json_response, text_response};
+
+pub mod gate;
+pub mod gatehost;
+pub mod headers;
+pub mod inject;
+pub mod pages;
+pub mod proxy;
 
 const ACCESS_PREFIX: &str = "/__access";
 const TUNNEL_PREFIX: &str = "/__tunnel";

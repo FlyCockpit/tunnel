@@ -22,9 +22,9 @@ use http::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 
 use crate::db::{AccessMode, TunnelLookup, TunnelRow};
-use crate::gate::{self, LoginOutcome};
-use crate::headers;
-use crate::pages::{self, LoginTarget};
+use crate::edge::gate::{self, LoginOutcome};
+use crate::edge::headers;
+use crate::edge::pages::{self, LoginTarget};
 use crate::state::AppState;
 use crate::tokens::is_valid_tunnel_id;
 use crate::util::{Body, text_response};

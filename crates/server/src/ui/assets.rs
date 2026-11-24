@@ -86,5 +86,5 @@ pub fn serve(path: &str, method: &Method, headers: &HeaderMap) -> Response<Body>
 
 /// `/install.sh` and `/install.ps1` (see `install.rs`).
 pub fn install_script(state: &AppState, path: &str, method: &Method) -> Response<Body> {
-    crate::install::response(state, path, method)
+    crate::ui::install::response(state, path, method)
 }

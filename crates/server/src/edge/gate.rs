@@ -14,7 +14,7 @@ use http::{Response, StatusCode};
 use tunnel_protocol::{ACCESS_TOKEN_PREFIX, GATE_COOKIE};
 
 use crate::db::Redemption;
-use crate::pages;
+use crate::edge::pages;
 use crate::state::AppState;
 use crate::tokens::{hash_token, now};
 use crate::util::{Body, empty, text_response};
@@ -56,7 +56,7 @@ pub fn split_cookies(headers: &HeaderMap) -> GateCookies {
             }
             // The web UI's session cookie is host-only on the UI host, so a
             // browser never sends it here; never forward one to an origin anyway.
-            if name.trim_ascii().eq_ignore_ascii_case(crate::headers::UI_COOKIE.as_bytes()) {
+            if name.trim_ascii().eq_ignore_ascii_case(crate::edge::headers::UI_COOKIE.as_bytes()) {
                 continue;
             }
             if !kept.is_empty() {

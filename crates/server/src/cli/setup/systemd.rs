@@ -6,9 +6,9 @@ use std::path::Path;
 
 use anyhow::Context;
 
+use crate::config::mode::Mode;
 use crate::config::{Config, SERVICE_NAME, SERVICE_USER};
 use crate::files::write_if_changed;
-use crate::mode::Mode;
 
 /// Quote a systemd word (systemd.syntax), including specifier escaping. ExecStart
 /// uses the ':' prefix to disable environment substitution, preserving literal '$'.

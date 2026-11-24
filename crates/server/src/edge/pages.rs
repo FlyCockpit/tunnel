@@ -12,8 +12,8 @@ use crate::util::{Body, full};
 /// PNG for browsers without SVG icons; `assets/make-gate-icon.py` makes
 /// both). Inline, so these pages never make the browser ask a preview origin
 /// (or anything else) for `/favicon.ico`.
-const ICON_SVG: &[u8] = include_bytes!("../assets/gate-icon.svg");
-const ICON_PNG: &[u8] = include_bytes!("../assets/gate-icon-32.png");
+const ICON_SVG: &[u8] = include_bytes!("../../assets/gate-icon.svg");
+const ICON_PNG: &[u8] = include_bytes!("../../assets/gate-icon-32.png");
 
 /// `<link rel="icon">` tags for [`ICON_PNG`] and [`ICON_SVG`] (the SVG last,
 /// so browsers that support it prefer it).
@@ -249,7 +249,7 @@ mod tests {
     /// (`assets/make-gate-icon.py`) when the logo changes.
     #[test]
     fn the_gate_icon_embeds_the_current_logo() {
-        let logo = include_bytes!("../../web/static/logo-64.png");
+        let logo = include_bytes!("../../../web/static/logo-64.png");
         let svg = std::str::from_utf8(ICON_SVG).unwrap();
         let encoded = base64::engine::general_purpose::STANDARD.encode(logo);
         assert!(svg.contains(&format!(r#"href="data:image/png;base64,{encoded}""#)));
