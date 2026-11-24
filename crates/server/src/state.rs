@@ -215,7 +215,7 @@ impl AppState {
         match tokio::time::timeout(VISITOR_LOOKUP_WAIT, self.visitor_lookups.acquire()).await {
             Ok(Ok(permit)) => Ok(permit),
             _ => {
-                Metrics::inc(&self.metrics.lookups_shed);
+                self.metrics.lookup_shed();
                 Err(LookupsBusy.into())
             }
         }

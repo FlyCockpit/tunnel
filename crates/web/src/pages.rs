@@ -316,6 +316,58 @@ impl LimitField {
         )?;
         Ok(crate::limits::changed(&self.initial.get_value(), &wanted).then_some(wanted))
     }
+
+    /// Put the setting into a limits patch if it changed; what is wrong otherwise.
+    fn add_to(&self, body: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+        if let Some(v) = self.setting()? {
+            body.insert(self.key.to_string(), v);
+        }
+        Ok(())
+    }
+
+    /// The field's controls; `default` is the server default it would follow.
+    fn view(self, id_prefix: &str, default: Option<u64>) -> impl IntoView + use<> {
+        let select_id = format!("limit-{}-{}", self.key, id_prefix);
+        let value_id = format!("{select_id}-value");
+        let default_text = match (self.key, default) {
+            (_, None) => "unlimited".to_string(),
+            ("tunnel_ttl_s", Some(s)) => duration_text(s),
+            ("traffic_bytes", Some(b)) => bytes(b),
+            (_, Some(n)) => n.to_string(),
+        };
+        view! {
+            <div class="field">
+                <label for=select_id.clone()>{self.label}</label>
+                <div class="row">
+                    <select id=select_id class="input input-sm w-auto"
+                        on:change=move |ev| self.mode.set(value(&ev))>
+                        <option value="default" selected=move || self.mode.get() == "default">{format!("Server default ({default_text})")}</option>
+                        <option value="number" selected=move || self.mode.get() == "number">"Number"</option>
+                        <option value="unlimited" selected=move || self.mode.get() == "unlimited">"Unlimited"</option>
+                    </select>
+                    <Show when=move || self.mode.get() == "number">
+                        <label class="sr-only" for=value_id.clone()>{format!("{} value", self.label)}</label>
+                        <input id=value_id.clone() class="input input-sm input-num"
+                            inputmode=if self.key == "traffic_bytes" { "decimal" } else { "numeric" }
+                            prop:value=move || self.value.get() on:input=move |ev| self.value.set(value(&ev)) />
+                        {match self.key {
+                            "traffic_bytes" => view! { <span class="muted small">"GB"</span> }.into_any(),
+                            "tunnel_ttl_s" => view! {
+                                <select class="input input-sm w-auto" aria-label="Unit"
+                                    on:change=move |ev| self.unit.set(value(&ev))>
+                                    <option value="s" selected=move || self.unit.get() == "s">"seconds"</option>
+                                    <option value="m" selected=move || self.unit.get() == "m">"minutes"</option>
+                                    <option value="h" selected=move || self.unit.get() == "h">"hours"</option>
+                                    <option value="d" selected=move || self.unit.get() == "d">"days"</option>
+                                </select>
+                            }.into_any(),
+                            _ => ().into_any(),
+                        }}
+                    </Show>
+                </div>
+            </div>
+        }
+    }
 }
 
 /// An admin's editor for a user's four limits.
@@ -343,15 +395,9 @@ where
         ev.prevent_default();
         let mut body = serde_json::Map::new();
         for f in fields {
-            match f.setting() {
-                Ok(Some(v)) => {
-                    body.insert(f.key.to_string(), v);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    error.set(Some(e));
-                    return;
-                }
+            if let Err(e) = f.add_to(&mut body) {
+                error.set(Some(e));
+                return;
             }
         }
         if body.is_empty() {
@@ -363,48 +409,7 @@ where
     view! {
         <form class="limits stack" on:submit=submit>
             <div class="limits-grid">
-                {fields.into_iter().zip(defaults).map(|(f, default)| {
-                    let select_id = format!("limit-{}-{}", f.key, id_prefix);
-                    let value_id = format!("{select_id}-value");
-                    let default_text = match (f.key, default) {
-                        (_, None) => "unlimited".to_string(),
-                        ("tunnel_ttl_s", Some(s)) => duration_text(s),
-                        ("traffic_bytes", Some(b)) => bytes(b),
-                        (_, Some(n)) => n.to_string(),
-                    };
-                    view! {
-                        <div class="field">
-                            <label for=select_id.clone()>{f.label}</label>
-                            <div class="row">
-                                <select id=select_id class="input input-sm w-auto"
-                                    on:change=move |ev| f.mode.set(value(&ev))>
-                                    <option value="default" selected=move || f.mode.get() == "default">{format!("Server default ({default_text})")}</option>
-                                    <option value="number" selected=move || f.mode.get() == "number">"Number"</option>
-                                    <option value="unlimited" selected=move || f.mode.get() == "unlimited">"Unlimited"</option>
-                                </select>
-                                <Show when=move || f.mode.get() == "number">
-                                    <label class="sr-only" for=value_id.clone()>{format!("{} value", f.label)}</label>
-                                    <input id=value_id.clone() class="input input-sm input-num"
-                                        inputmode=if f.key == "traffic_bytes" { "decimal" } else { "numeric" }
-                                        prop:value=move || f.value.get() on:input=move |ev| f.value.set(value(&ev)) />
-                                    {match f.key {
-                                        "traffic_bytes" => view! { <span class="muted small">"GB"</span> }.into_any(),
-                                        "tunnel_ttl_s" => view! {
-                                            <select class="input input-sm w-auto" aria-label="Unit"
-                                                on:change=move |ev| f.unit.set(value(&ev))>
-                                                <option value="s" selected=move || f.unit.get() == "s">"seconds"</option>
-                                                <option value="m" selected=move || f.unit.get() == "m">"minutes"</option>
-                                                <option value="h" selected=move || f.unit.get() == "h">"hours"</option>
-                                                <option value="d" selected=move || f.unit.get() == "d">"days"</option>
-                                            </select>
-                                        }.into_any(),
-                                        _ => ().into_any(),
-                                    }}
-                                </Show>
-                            </div>
-                        </div>
-                    }
-                }).collect_view()}
+                {fields.into_iter().zip(defaults).map(|(f, default)| f.view(&id_prefix, default)).collect_view()}
             </div>
             <p class="muted small">"Lowering a limit never stops what already runs: existing tunnels and machines stay, new ones are refused with a message naming the limit. A lifetime limit applies to new tunnels and renewals, and the user's tunnels that would outlive it now end at most that long from now. Unlimited lifetime lets their tunnels never expire. A traffic limit applies at once. Changing the role resets all four to the server default."</p>
             <div><button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save limits"</button></div>

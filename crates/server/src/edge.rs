@@ -19,7 +19,6 @@ use crate::gate;
 use crate::gatehost;
 use crate::headers;
 use crate::ice;
-use crate::metrics::Metrics;
 use crate::pages;
 use crate::proxy;
 use crate::state::AppState;
@@ -53,7 +52,7 @@ const PREFLIGHT_HEADERS: &[&str] = &[
 
 /// `label` is the request host minus `.<preview_zone>`, e.g. `3000-ab12cd3efg`.
 pub async fn handle(state: Arc<AppState>, peer: SocketAddr, label: &str, req: Request<Incoming>) -> Response<Body> {
-    Metrics::inc(&state.metrics.requests);
+    state.metrics.request();
     let started = Instant::now();
     let method = req.method().clone();
     let path = log_path(req.uri().path());
@@ -118,7 +117,7 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
         && authorization.is_some()
         && is_forbidden_origin_write(&req, &state.config.preview_zone, id, &state.config.frame_ancestors)
     {
-        Metrics::inc(&state.metrics.gate_denials);
+        state.metrics.gate_denied();
         return pages::forbidden_origin();
     }
     let reserved = is_under(&path, TUNNEL_PREFIX);
@@ -145,7 +144,7 @@ async fn route(state: &Arc<AppState>, peer: SocketAddr, label: &str, req: Reques
                     return forward_live(state, tunnel, port, req, None, peer, None, Some(watch)).await;
                 }
             }
-            Metrics::inc(&state.metrics.gate_denials);
+            state.metrics.gate_denied();
             if let Some(next) = login_next {
                 return pages::redirect(&gatehost::login_url(&state.config.preview_zone, label, &next));
             }

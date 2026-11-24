@@ -14,7 +14,6 @@ use http::{Response, StatusCode};
 use tunnel_protocol::{ACCESS_TOKEN_PREFIX, GATE_COOKIE};
 
 use crate::db::Redemption;
-use crate::metrics::Metrics;
 use crate::pages;
 use crate::state::AppState;
 use crate::tokens::{hash_token, now};
@@ -370,7 +369,7 @@ pub async fn redeem(
         return pages::rate_limited();
     }
     if !token.starts_with(ACCESS_TOKEN_PREFIX) || token.len() > 256 {
-        Metrics::inc(&state.metrics.access_failures);
+        state.metrics.access_failed();
         return pages::unauthorized();
     }
     let outcome = match state
@@ -393,12 +392,12 @@ pub async fn redeem(
 
     let (session_id, expires_at) = match outcome {
         Redemption::Invalid => {
-            Metrics::inc(&state.metrics.access_failures);
+            state.metrics.access_failed();
             return pages::unauthorized();
         }
         Redemption::Granted { session_id, expires_at } => (session_id, expires_at),
     };
-    Metrics::inc(&state.metrics.access_redemptions);
+    state.metrics.access_redeemed();
 
     Response::builder()
         .status(StatusCode::FOUND)
@@ -480,7 +479,7 @@ pub async fn login(
     match crate::password::verify(user, hash.clone(), form.username, form.password).await {
         crate::password::Verdict::Match => {}
         crate::password::Verdict::NoMatch => {
-            Metrics::inc(&state.metrics.access_failures);
+            state.metrics.access_failed();
             return LoginOutcome::Retry(StatusCode::UNAUTHORIZED, "Wrong username or password.");
         }
         crate::password::Verdict::Busy => {
@@ -499,7 +498,7 @@ pub async fn login(
             return LoginOutcome::Internal;
         }
     };
-    Metrics::inc(&state.metrics.access_redemptions);
+    state.metrics.access_redeemed();
     tracing::info!(tunnel = %tunnel.id, "password login");
     LoginOutcome::Granted(gate_cookie(&state.config.preview_zone, &session_id, expires_at - now()))
 }

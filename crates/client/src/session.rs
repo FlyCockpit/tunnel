@@ -79,7 +79,7 @@ pub async fn run(daemon: Arc<Daemon>) {
         let mut connected_at: Option<Instant> = None;
         let end = tokio::select! {
             end = connect(&daemon, &server, &token, generation, &mut connected_at) => end,
-            _ = daemon.reconnect.notified() => End::Superseded,
+            _ = daemon.retargeted() => End::Superseded,
         };
         daemon.disconnected(generation);
         match end {
@@ -106,7 +106,7 @@ pub async fn run(daemon: Arc<Daemon>) {
         debug!(delay_ms = delay.as_millis() as u64, "reconnecting after delay");
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            _ = daemon.reconnect.notified() => {
+            _ = daemon.retargeted() => {
                 failures = 0;
             }
         }

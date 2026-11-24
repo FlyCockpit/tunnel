@@ -69,7 +69,7 @@ struct Inner {
 }
 
 pub struct Daemon {
-    pub paths: Paths,
+    paths: Paths,
     pub ice_file: PathBuf,
     /// Bearer token for the local `/ice` endpoint (see `ice::serve_http`).
     pub ice_token: String,
@@ -80,7 +80,7 @@ pub struct Daemon {
     inner: Mutex<Inner>,
     conn: watch::Sender<ConnState>,
     /// Signalled when the token or server changes: drop the connection now.
-    pub reconnect: Notify,
+    reconnect: Notify,
     next_id: AtomicU64,
 }
 
@@ -516,6 +516,29 @@ impl Daemon {
         Ok(self.status())
     }
 
+    /// Resolves once the token or server changed: the current connection
+    /// (or reconnect wait) must end now.
+    pub async fn retargeted(&self) {
+        self.reconnect.notified().await;
+    }
+
+    /// SIGTERM/SIGINT: exit but keep the state file, so the next command restarts
+    /// the daemon with the same ports.
+    async fn exit_on_signal(self: Arc<Self>) {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            warn!("cannot install signal handlers");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        info!("signal received; daemon exiting");
+        let _ = fs::remove_file(&self.paths.socket);
+        std::process::exit(0);
+    }
+
     fn stop(&self) -> ! {
         let _ = fs::remove_file(&self.paths.state_file);
         let _ = fs::remove_file(&self.ice_file);
@@ -592,7 +615,7 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(ice_listener) = ice_listener {
         tokio::spawn(ice::serve_http(daemon.clone(), ice_listener, ice_port));
     }
-    tokio::spawn(exit_on_signal(daemon.clone()));
+    tokio::spawn(daemon.clone().exit_on_signal());
     session::run(daemon).await;
     Ok(())
 }
@@ -666,23 +689,6 @@ async fn serve_ipc(daemon: Arc<Daemon>, stream: UnixStream) {
             daemon.stop();
         }
     }
-}
-
-/// SIGTERM/SIGINT: exit but keep the state file, so the next command restarts
-/// the daemon with the same ports.
-async fn exit_on_signal(daemon: Arc<Daemon>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
-        warn!("cannot install signal handlers");
-        return;
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
-    }
-    info!("signal received; daemon exiting");
-    let _ = fs::remove_file(&daemon.paths.socket);
-    std::process::exit(0);
 }
 
 #[cfg(test)]
