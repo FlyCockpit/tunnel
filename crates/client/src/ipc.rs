@@ -454,9 +454,93 @@ pub async fn call_on(stream: &mut UnixStream, req: &Request, timeout: Duration) 
     }
 }
 
+/// Covers the daemon's per-port server round trips plus its connect wait.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) enum Answer {
+    Response(Response),
+    /// Already reported; exit with this code.
+    Exit(i32),
+    Stopped,
+}
+
+/// How `ask` reports a tunnel that is gone (revoked or replaced).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// The status as text on stdout.
+    Text,
+    /// The status as JSON on stdout (`status --json`).
+    Json,
+    /// One line on stderr, so stdout keeps its own JSON (`share --json`).
+    Stderr,
+}
+
+pub(crate) async fn ask(req: Request, takeover: bool, report: Report) -> anyhow::Result<Answer> {
+    let paths = Paths::resolve()?;
+    let (token, server, target) = match &req {
+        Request::Expose { token, server, target, .. } => (token.as_deref(), server.as_deref(), target.as_deref()),
+        _ => (None, None, None),
+    };
+    let reach = ensure_daemon(&paths, takeover, token, server, target).await?;
+    let reach = match (reach, target) {
+        (Reach::Running(mut stream), Some(_)) => {
+            require_target_support(&mut stream).await?;
+            Reach::Running(stream)
+        }
+        (reach, _) => reach,
+    };
+    match reach {
+        Reach::Running(stream) => match call(stream, &req, REQUEST_TIMEOUT).await? {
+            Some(Response::Error { message }) => bail!("{message}"),
+            Some(resp) => Ok(Answer::Response(resp)),
+            None => daemon_gone(&paths, report).map(Answer::Exit),
+        },
+        Reach::Terminal(p, state) => Ok(Answer::Exit(report_terminal(&p, state, report))),
+        Reach::Stopped => Ok(Answer::Stopped),
+    }
+}
+
+/// A daemon started by an older binary would ignore the target and expose
+/// loopback; ask first, before anything is exposed, on the same connection
+/// the Expose then uses (so both reach the same daemon).
+async fn require_target_support(stream: &mut UnixStream) -> anyhow::Result<()> {
+    if !daemon_supports(stream, "target").await? {
+        bail!("the running daemon does not support --target / {ENV_TARGET}; run `tunnel stop` and try again");
+    }
+    Ok(())
+}
+
+/// Whether the daemon on `stream` lists `feature` (asked on that connection).
+pub(crate) async fn daemon_supports(stream: &mut UnixStream, feature: &str) -> anyhow::Result<bool> {
+    Ok(match call_on(stream, &Request::Status, REQUEST_TIMEOUT).await? {
+        Some(Response::Status { status }) => status.features.iter().any(|f| f == feature),
+        _ => false,
+    })
+}
+
+fn report_terminal(p: &Persisted, state: ConnState, report: Report) -> i32 {
+    let status = Status::from_persisted(p, state);
+    match report {
+        Report::Text => status.print(false),
+        Report::Json => status.print(true),
+        Report::Stderr => eprintln!("tunnel: {}", status.terminal_summary()),
+    }
+    status.exit_code()
+}
+
+/// The daemon hung up mid-request: it exited, usually on revocation.
+fn daemon_gone(paths: &Paths, report: Report) -> anyhow::Result<i32> {
+    match Persisted::load(&paths.state_file) {
+        Some(p) if p.revoked => Ok(report_terminal(&p, ConnState::Revoked, report)),
+        Some(p) if p.replaced => Ok(report_terminal(&p, ConnState::Replaced, report)),
+        _ => bail!("daemon exited unexpectedly; see {}", paths.log_file.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UnixListener;
 
     #[test]
     fn login_urls_come_from_the_preview_host() {
@@ -551,5 +635,53 @@ mod tests {
         cmd.env(ENV_TOKEN, "foreign-credential");
         set_daemon_token(&mut cmd, Some(&token));
         assert!(cmd.get_envs().any(|(name, value)| name == ENV_TOKEN && value == Some(token.as_ref())));
+    }
+
+    /// A daemon that answers every request with a status listing `features`.
+    async fn fake_daemon(features: Vec<String>) -> Paths {
+        let dir = std::env::temp_dir().join(format!("tunnel-cmd-test-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let paths = Paths {
+            socket: dir.join("daemon.sock"),
+            state_file: dir.join("state.json"),
+            log_file: dir.join("daemon.log"),
+            lock_file: dir.join("daemon.lock"),
+            dir,
+        };
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let features = features.clone();
+                tokio::spawn(async move {
+                    let (rd, mut wr) = stream.into_split();
+                    let mut rd = BufReader::new(rd);
+                    let mut buf = String::new();
+                    while let Ok(Some(_)) = read_json_line::<_, Request>(&mut rd, &mut buf).await {
+                        let status = Status { features: features.clone(), ..Status::stopped() };
+                        let _ = write_json_line(&mut wr, &Response::Status { status }).await;
+                    }
+                });
+            }
+        });
+        paths
+    }
+
+    #[tokio::test]
+    async fn targeted_expose_refuses_a_daemon_without_target_support() {
+        let paths = fake_daemon(Vec::new()).await;
+        let mut stream = UnixStream::connect(&paths.socket).await.unwrap();
+        let err = require_target_support(&mut stream).await.unwrap_err().to_string();
+        assert!(err.contains("does not support --target"), "{err}");
+        std::fs::remove_dir_all(&paths.dir).unwrap();
+
+        let paths = fake_daemon(vec!["target".into()]).await;
+        let mut stream = UnixStream::connect(&paths.socket).await.unwrap();
+        require_target_support(&mut stream).await.unwrap();
+        // The request then goes to the same daemon on the same connection,
+        // even if the socket path is replaced in between.
+        std::fs::remove_file(&paths.socket).unwrap();
+        let answer = call(stream, &Request::Status, REQUEST_TIMEOUT).await.unwrap();
+        assert!(matches!(answer, Some(Response::Status { .. })));
+        std::fs::remove_dir_all(&paths.dir).unwrap();
     }
 }

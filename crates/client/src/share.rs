@@ -13,8 +13,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::commands::{Answer, Report, ask};
-use crate::ipc::{Expect, Request, Response, Status, host_for};
+use crate::ipc::{Answer, Expect, Report, Request, Response, Status, ask, daemon_supports, host_for};
 use crate::login::{Api, Login, enroll};
 use crate::paths::{Paths, env_nonempty, terminal_text};
 use crate::state::{Persisted, write_atomic};
@@ -265,7 +264,7 @@ pub async fn share(
     if foreground.as_ref().is_some_and(|f| f.duration_s < MIN_FOR_S) {
         bail!("--for must be at least 1m (the server's shortest tunnel lifetime)");
     }
-    let target = crate::commands::resolve_target(target)?;
+    let target = crate::paths::resolve_target(target)?;
     let login = Login::require()?;
     let api = Api::new(&login)?;
     let paths = Paths::resolve()?;
@@ -870,7 +869,7 @@ fn expect_for(shared: &Shared) -> Expect {
 }
 
 async fn require_expect_support(stream: &mut tokio::net::UnixStream) -> anyhow::Result<()> {
-    if !crate::commands::daemon_supports(stream, "expect").await? {
+    if !daemon_supports(stream, "expect").await? {
         bail!("the running daemon is too old for `unshare`; run `tunnel stop` instead");
     }
     Ok(())
