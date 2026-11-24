@@ -74,17 +74,17 @@ impl TunnelBytes {
 
 #[derive(Default)]
 pub struct Metrics {
-    pub live_streams: AtomicI64,
-    pub gate_denials: AtomicU64,
+    live_streams: AtomicI64,
+    gate_denials: AtomicU64,
     /// Visitor lookups answered 503 because the lookup slots were full.
-    pub lookups_shed: AtomicU64,
+    lookups_shed: AtomicU64,
     /// Proxied exchanges cut in flight because their access was lost.
-    pub access_cuts: AtomicU64,
+    access_cuts: AtomicU64,
     /// Built-in TURN relay gauges.
     pub turn: Arc<crate::turn_relay::MetricsRef>,
-    pub access_redemptions: AtomicU64,
-    pub access_failures: AtomicU64,
-    pub requests: AtomicU64,
+    access_redemptions: AtomicU64,
+    access_failures: AtomicU64,
+    requests: AtomicU64,
     per_tunnel: Mutex<HashMap<String, Arc<TunnelBytes>>>,
 }
 
@@ -116,8 +116,54 @@ impl Metrics {
         self.per_tunnel.lock().expect("metrics lock").retain(|id, b| Arc::strong_count(b) > 1 || keep(id, b));
     }
 
-    pub fn inc(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
+    /// A visitor request reached the edge.
+    pub fn request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The gate refused a visitor.
+    pub fn gate_denied(&self) {
+        self.gate_denials.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A visitor lookup was answered 503 because the lookup slots were full.
+    pub fn lookup_shed(&self) {
+        self.lookups_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A proxied exchange was cut in flight because its access was lost.
+    pub fn access_cut(&self) {
+        self.access_cuts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An access link or password login granted a gate session.
+    pub fn access_redeemed(&self) {
+        self.access_redemptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An access link or password login was refused.
+    pub fn access_failed(&self) {
+        self.access_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A proxied visitor request or WebSocket started.
+    pub fn stream_opened(&self) {
+        self.live_streams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A proxied visitor request or WebSocket ended.
+    pub fn stream_closed(&self) {
+        self.live_streams.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn live_streams(&self) -> i64 {
+        self.live_streams.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn access_cuts(&self) -> u64 {
+        self.access_cuts.load(Ordering::SeqCst)
     }
 
     pub fn render(&self, state: &AppState) -> String {

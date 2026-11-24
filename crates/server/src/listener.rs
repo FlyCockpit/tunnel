@@ -683,7 +683,7 @@ zone = "example.com"
     }
 
     fn live_streams(state: &AppState) -> usize {
-        state.metrics.live_streams.load(Ordering::SeqCst) as usize
+        state.metrics.live_streams() as usize
     }
 
     #[tokio::test]
@@ -1050,7 +1050,7 @@ zone = "example.com"
             state.invalidate_sessions();
             state.registry.rotate_gate_epoch(ID);
             tokio::time::timeout(Duration::from_secs(5), async {
-                while state.metrics.access_cuts.load(Ordering::SeqCst) == 0 {
+                while state.metrics.access_cuts() == 0 {
                     tokio::task::yield_now().await;
                 }
             })

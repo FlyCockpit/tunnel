@@ -174,9 +174,12 @@ impl UserUsage {
         self.settle();
     }
 
-    /// Take the pending bytes for a flush (the cutoff). `total` is untouched.
-    fn take_pending(&self) -> (u64, u64) {
-        (self.pending_in.swap(0, Ordering::SeqCst), self.pending_out.swap(0, Ordering::SeqCst))
+    /// Take the pending bytes for a flush or a reset (the cutoff). `total` is untouched.
+    fn cut_off(&self) -> Cutoff<'_> {
+        Cutoff {
+            user: self,
+            taken: (self.pending_in.swap(0, Ordering::SeqCst), self.pending_out.swap(0, Ordering::SeqCst)),
+        }
     }
 
     /// The flush wrote the taken bytes.
@@ -207,6 +210,43 @@ impl UserUsage {
 
     fn has_pending(&self) -> bool {
         self.pending_in.load(Ordering::SeqCst) != 0 || self.pending_out.load(Ordering::SeqCst) != 0
+    }
+}
+
+/// One user's pending bytes taken at a cutoff: a flush writes them
+/// ([`Self::flushed`]) or gives them back ([`Self::unflush`]); a reset drops
+/// them with the old period ([`Self::restart`]).
+#[must_use]
+struct Cutoff<'a> {
+    user: &'a UserUsage,
+    taken: (u64, u64),
+}
+
+impl Cutoff<'_> {
+    fn is_empty(&self) -> bool {
+        self.taken == (0, 0)
+    }
+
+    /// The flush row: user id, bytes in, bytes out.
+    fn row(&self) -> (String, u64, u64) {
+        (self.user.user_id.clone(), self.taken.0, self.taken.1)
+    }
+
+    fn flushed(self) {
+        self.user.flushed(self.taken);
+    }
+
+    fn unflush(self) {
+        self.user.unflush(self.taken);
+    }
+
+    fn restart(self) {
+        self.user.restart(self.taken);
+    }
+
+    #[cfg(test)]
+    fn taken(&self) -> (u64, u64) {
+        self.taken
     }
 }
 
@@ -286,6 +326,21 @@ impl Traffic {
         self.lock().insert(user_id.to_string(), usage.clone());
         Ok(usage)
     }
+
+    /// The month rollover's in-memory side: count for `current` from now on,
+    /// and every loaded user's stored total starts again.
+    fn start_month(&self, _: &Changes<'_>, current: u32) {
+        self.month.store(current, Ordering::SeqCst);
+        let users: Vec<Arc<UserUsage>> = self.lock().values().cloned().collect();
+        for u in users {
+            u.restart((0, 0));
+        }
+    }
+
+    /// Wait until a user becomes blocked (see [`UserUsage::add`]).
+    async fn new_block(&self) {
+        self.notify.notified().await;
+    }
 }
 
 /// The tunnel's counter, with its owner's usage attached (loaded on first
@@ -364,16 +419,16 @@ pub async fn reset_month(
     tokio::spawn(async move {
         let changes = state.traffic.changes().await;
         let user = state.traffic.usage_locked(&changes, &state.db, &user_id).await?;
-        let taken = user.take_pending();
+        let taken = user.cut_off();
         let reset = state.db.reset_traffic_for(actor.clone(), session, user_id, state.traffic.month()).await;
         match &reset {
             Ok(Ok(username)) => {
-                user.restart(taken);
+                taken.restart();
                 if let Err(e) = state.db.audit(Some(actor), "traffic_reset", Some(username.clone()), ip).await {
                     tracing::warn!(error = %format!("{e:#}"), "audit write failed");
                 }
             }
-            _ => user.unflush(taken),
+            _ => taken.unflush(),
         }
         reset
     })
@@ -405,25 +460,22 @@ async fn flush_locked(state: &AppState, _: &Changes<'_>, month: u32) -> anyhow::
             marks.push((b, now_in, now_out));
         }
     }
-    let users: Vec<Arc<UserUsage>> = state.traffic.lock().values().filter(|u| u.has_pending()).cloned().collect();
-    let taken: Vec<(Arc<UserUsage>, (u64, u64))> = users
-        .into_iter()
-        .map(|u| {
-            let t = u.take_pending();
-            (u, t)
-        })
-        .filter(|(_, (i, o))| *i != 0 || *o != 0)
-        .collect();
-    if !tunnels.is_empty() || !taken.is_empty() {
-        let rows = taken.iter().map(|(u, (i, o))| (u.user_id.clone(), *i, *o)).collect();
-        if let Err(e) = state.db.flush_traffic(month, tunnels, rows).await {
-            for (u, t) in taken {
-                u.unflush(t);
+    // Scoped: the users' references must be gone before the pruning below,
+    // which keeps users that something else still holds.
+    {
+        let users: Vec<Arc<UserUsage>> = state.traffic.lock().values().filter(|u| u.has_pending()).cloned().collect();
+        let taken: Vec<Cutoff<'_>> = users.iter().map(|u| u.cut_off()).filter(|c| !c.is_empty()).collect();
+        if !tunnels.is_empty() || !taken.is_empty() {
+            let rows = taken.iter().map(Cutoff::row).collect();
+            if let Err(e) = state.db.flush_traffic(month, tunnels, rows).await {
+                for c in taken {
+                    c.unflush();
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        for (u, t) in taken {
-            u.flushed(t);
+            for c in taken {
+                c.flushed();
+            }
         }
     }
     for (b, now_in, now_out) in marks {
@@ -456,11 +508,7 @@ pub(crate) async fn flush_or_roll_over(state: &AppState, current: u32) -> anyhow
     let month = state.traffic.month();
     flush_locked(state, &changes, month).await?;
     if current != month {
-        state.traffic.month.store(current, Ordering::SeqCst);
-        let users: Vec<Arc<UserUsage>> = state.traffic.lock().values().cloned().collect();
-        for u in users {
-            u.restart((0, 0));
-        }
+        state.traffic.start_month(&changes, current);
         tracing::info!(month = %month_label(current), "traffic counters start a new month");
     }
     Ok(())
@@ -469,7 +517,7 @@ pub(crate) async fn flush_or_roll_over(state: &AppState, current: u32) -> anyhow
 /// When a user becomes blocked, cut what their tunnels are relaying.
 pub async fn enforce(state: Arc<AppState>) {
     loop {
-        state.traffic.notify.notified().await;
+        state.traffic.new_block().await;
         for (id, b) in state.metrics.snapshot() {
             if b.blocked() {
                 tracing::info!(tunnel = %id, "traffic limit reached; cutting in-flight requests");
@@ -668,16 +716,16 @@ mod tests {
         let (u, _) = usage(100, 0);
         u.add(30, false);
         u.add(20, true);
-        let taken = u.take_pending();
-        assert_eq!(taken, (30, 20));
+        let taken = u.cut_off();
+        assert_eq!(taken.taken(), (30, 20));
         assert_eq!(u.total(), 150, "a flush in progress does not move the total");
         u.add(5, false);
         // A failed flush puts them back; nothing is counted twice.
-        u.unflush(taken);
+        taken.unflush();
         assert_eq!(u.total(), 155);
-        let taken = u.take_pending();
-        assert_eq!(taken, (35, 20));
-        u.flushed(taken);
+        let taken = u.cut_off();
+        assert_eq!(taken.taken(), (35, 20));
+        taken.flushed();
         assert_eq!(u.total(), 155);
         // A new month keeps only what came after the cutoff.
         u.add(7, true);
@@ -685,9 +733,9 @@ mod tests {
         assert_eq!(u.total(), 7);
         assert!(u.has_pending());
         // A reset drops the stored bytes and what it took at its cutoff.
-        let taken = u.take_pending();
+        let taken = u.cut_off();
         u.add(2, false);
-        u.restart(taken);
+        taken.restart();
         assert_eq!(u.total(), 2);
     }
 
@@ -697,18 +745,18 @@ mod tests {
         for month in [false, true] {
             let (u, _) = usage(100, 0);
             u.count_total(20);
-            let taken = u.take_pending();
+            let taken = u.cut_off();
             if month {
-                u.flushed(taken);
+                taken.flushed();
                 u.restart((0, 0));
             } else {
-                u.restart(taken);
+                taken.restart();
             }
             u.count_pending(20, true);
             // The 20 bytes belong to the new period everywhere: in the total
             // and in what the next flush writes.
             assert_eq!(u.total(), 20, "month {month}");
-            assert_eq!(u.take_pending(), (0, 20), "month {month}");
+            assert_eq!(u.cut_off().taken(), (0, 20), "month {month}");
         }
     }
 

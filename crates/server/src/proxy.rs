@@ -58,7 +58,7 @@ enum WsKind {
 /// declares `port`. `cookie` is the visitor's `Cookie` minus gate cookies;
 /// `session_subject` (gate-session hash prefix) is set for gated requests and
 /// enables ICE injection. `authorization` (absent only for the credential-free
-/// CORS preflight) is watched by a task of its own ([`spawn_watch`]) for as
+/// CORS preflight) is watched by a task of its own ([`Exchange::spawn_watch`]) for as
 /// long as any part of the exchange lives. From a gate-epoch rotation until
 /// [`gate::watch`] has a verdict, nothing more is relayed in either direction
 /// (opening the origin connection, waiting for its headers, both bodies and
@@ -97,7 +97,7 @@ pub async fn forward(
     // The watch runs in its own task for as long as any part of the exchange
     // holds an `Alive` (this future, either body, a splice).
     let exchange = Arc::new(Exchange::default());
-    let alive = authorization.map(|grant| spawn_watch(state, &tunnel.id, grant, exchange.clone()));
+    let alive = authorization.map(|grant| exchange.clone().spawn_watch(state, &tunnel.id, grant));
 
     let public_host = state.preview_host(port, &tunnel.id);
     let (parts, body) = req.into_parts();
@@ -278,7 +278,7 @@ pub async fn forward(
             let mut slot = exchange.lock_response();
             // Checked under the slot's lock: a loss either happened before
             // (and is answered here) or takes what is stored now.
-            if exchange.cut.is_cancelled() {
+            if exchange.is_lost() {
                 return pages::unauthorized();
             }
             *slot = Relaying { body: Some(body), _guard: relay_guard };
@@ -299,10 +299,7 @@ async fn guarded<F: std::future::Future>(exchange: &Exchange, inner: F) -> Optio
     let mut output = None;
     std::future::poll_fn(|cx| {
         loop {
-            if exchange.rechecking.poll_idle(Side::Driver, cx).is_pending() {
-                return Poll::Pending;
-            }
-            if exchange.cut.is_cancelled() {
+            if !std::task::ready!(exchange.poll_gate(Side::Driver, cx)) {
                 return Poll::Ready(None);
             }
             if output.is_some() {
@@ -328,10 +325,7 @@ struct Gated<'a, T> {
 
 impl<T: Unpin> Gated<'_, T> {
     fn poll_gate(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.exchange.rechecking.poll_idle(self.side, cx).is_pending() {
-            return Poll::Pending;
-        }
-        if self.exchange.cut.is_cancelled() {
+        if !std::task::ready!(self.exchange.poll_gate(self.side, cx)) {
             return Poll::Ready(Err(std::io::Error::other(ACCESS_ENDED)));
         }
         Poll::Ready(Ok(()))
@@ -581,14 +575,14 @@ impl StreamGuard {
             live.streams.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        state.metrics.live_streams.fetch_add(1, Ordering::Relaxed);
+        state.metrics.stream_opened();
         Some(Self(state.clone(), live.clone()))
     }
 }
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        self.0.metrics.live_streams.fetch_sub(1, Ordering::Relaxed);
+        self.0.metrics.stream_closed();
         self.1.streams.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -660,38 +654,56 @@ impl Exchange {
         }
         self.rechecking.finish_lost();
     }
+
+    /// Whether `side` may go on: pending (with its waker registered, also for
+    /// a later loss) while the watch rechecks, then `false` once access is lost.
+    fn poll_gate(&self, side: Side, cx: &mut Context<'_>) -> Poll<bool> {
+        if self.rechecking.poll_idle(side, cx).is_pending() {
+            return Poll::Pending;
+        }
+        Poll::Ready(!self.cut.is_cancelled())
+    }
+
+    fn is_lost(&self) -> bool {
+        self.cut.is_cancelled()
+    }
+
+    /// Access stands and no recheck is in progress.
+    fn is_settled(&self) -> bool {
+        !self.cut.is_cancelled() && self.rechecking.is_settled()
+    }
+
+    /// Watch `grant` in a task of its own, so enforcement never depends on the
+    /// visitor reading or the origin sending. It lives as long as any part of
+    /// the exchange holds the returned [`Alive`], so a finished response cannot
+    /// leave an upload unwatched, and nothing outlives the exchange.
+    fn spawn_watch(
+        self: Arc<Self>,
+        state: &Arc<AppState>,
+        tunnel_id: &str,
+        grant: crate::gate::Authorization,
+    ) -> Alive {
+        let (alive, mut gone) = tokio::sync::mpsc::channel::<()>(1);
+        // Before the task first runs, so a rotation right now already pauses.
+        self.rechecking.follow(&grant.cancel);
+        let state = state.clone();
+        let tunnel_id = tunnel_id.to_string();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = crate::gate::watch(&state, &tunnel_id, grant, &self.rechecking) => {
+                    self.lose();
+                    state.metrics.access_cut();
+                }
+                // Nothing is ever sent: `None` once every `Alive` is dropped.
+                _ = gone.recv() => {}
+            }
+        });
+        alive
+    }
 }
 
 /// Keeps an exchange's watch task running; it ends once every clone is gone.
 type Alive = tokio::sync::mpsc::Sender<()>;
-
-/// Watch `grant` in a task of its own, so enforcement never depends on the
-/// visitor reading or the origin sending. It lives as long as any part of the
-/// exchange holds the returned [`Alive`], so a finished response cannot leave
-/// an upload unwatched, and nothing outlives the exchange.
-fn spawn_watch(
-    state: &Arc<AppState>,
-    tunnel_id: &str,
-    grant: crate::gate::Authorization,
-    exchange: Arc<Exchange>,
-) -> Alive {
-    let (alive, mut gone) = tokio::sync::mpsc::channel::<()>(1);
-    // Before the task first runs, so a rotation right now already pauses.
-    exchange.rechecking.follow(&grant.cancel);
-    let state = state.clone();
-    let tunnel_id = tunnel_id.to_string();
-    tokio::spawn(async move {
-        tokio::select! {
-            () = crate::gate::watch(&state, &tunnel_id, grant, &exchange.rechecking) => {
-                exchange.lose();
-                crate::metrics::Metrics::inc(&state.metrics.access_cuts);
-            }
-            // Nothing is ever sent: `None` once every `Alive` is dropped.
-            _ = gone.recv() => {}
-        }
-    });
-    alive
-}
 
 /// The visitor's request body: paused while the watch rechecks, failing once
 /// access is lost, which aborts the origin exchange so the sandbox can tell a
@@ -716,10 +728,7 @@ impl HttpBody for Revocable {
             }
             // Registered on every poll, so a loss wakes this side even while
             // it waits on the visitor.
-            if this.exchange.rechecking.poll_idle(Side::ToOrigin, cx).is_pending() {
-                return Poll::Pending;
-            }
-            if this.exchange.cut.is_cancelled() {
+            if !std::task::ready!(this.exchange.poll_gate(Side::ToOrigin, cx)) {
                 this.inner = None;
                 this.held = None;
                 return Poll::Ready(Some(Err(ACCESS_ENDED.into())));
@@ -741,12 +750,7 @@ impl HttpBody for Revocable {
     fn is_end_stream(&self) -> bool {
         match &self.inner {
             None => true,
-            Some(inner) => {
-                self.held.is_none()
-                    && inner.is_end_stream()
-                    && !self.exchange.cut.is_cancelled()
-                    && self.exchange.rechecking.is_settled()
-            }
+            Some(inner) => self.held.is_none() && inner.is_end_stream() && self.exchange.is_settled(),
         }
     }
 
@@ -796,11 +800,8 @@ impl HttpBody for Relayed {
             if this.done {
                 return Poll::Ready(None);
             }
-            if this.exchange.rechecking.poll_idle(Side::ToVisitor, cx).is_pending() {
-                return Poll::Pending;
-            }
             // `lose` cancels `cut` before it empties the slot.
-            if this.exchange.cut.is_cancelled() {
+            if !std::task::ready!(this.exchange.poll_gate(Side::ToVisitor, cx)) {
                 this.done = true;
                 this.held = None;
                 return Poll::Ready(Some(Err(ACCESS_ENDED.into())));
@@ -1293,7 +1294,7 @@ mod tests {
         };
         // Every holder gone: the task ends without a loss.
         let exchange = Arc::new(Exchange::default());
-        let alive = spawn_watch(&state, &tunnel.id, grant(), exchange.clone());
+        let alive = exchange.clone().spawn_watch(&state, &tunnel.id, grant());
         let held = alive.clone();
         drop(alive);
         tokio::task::yield_now().await;
@@ -1310,7 +1311,7 @@ mod tests {
 
         // A loss while held: cut, and the task ends.
         let exchange = Arc::new(Exchange::default());
-        let alive = spawn_watch(&state, &tunnel.id, grant(), exchange.clone());
+        let alive = exchange.clone().spawn_watch(&state, &tunnel.id, grant());
         state.registry.remove(&tunnel.id);
         tokio::time::timeout(Duration::from_secs(5), exchange.cut.cancelled()).await.expect("lost");
         tokio::time::timeout(Duration::from_secs(5), alive.closed()).await.expect("watch task ended at the loss");
