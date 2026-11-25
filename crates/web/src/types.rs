@@ -16,6 +16,9 @@ pub struct User {
     pub totp: bool,
     #[serde(default)]
     pub created_at: i64,
+    /// Confirmed email address (servers that send mail).
+    #[serde(default)]
+    pub email: Option<String>,
     #[serde(default)]
     pub limits: Limits,
 }
@@ -101,6 +104,9 @@ pub struct Server {
     pub same_site: bool,
     #[serde(default)]
     pub abuse_contact: Option<String>,
+    /// The server sends mail (invites, password resets, notices).
+    #[serde(default)]
+    pub mail: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -119,6 +125,9 @@ pub struct SessionInfo {
     pub traffic: Option<Traffic>,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// A new address waiting to be confirmed from its mail.
+    #[serde(default)]
+    pub email_pending: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -221,6 +230,9 @@ pub struct Invite {
     /// `invite` or `account_reset`.
     #[serde(default)]
     pub kind: String,
+    /// Where an emailed invite went.
+    #[serde(default)]
+    pub email: Option<String>,
     pub role: String,
     /// The account an `account_reset` is for.
     #[serde(default)]

@@ -48,9 +48,13 @@ fn hasher() -> Argon2<'static> {
 thread_local! {
     /// Password checks started on this thread (tests run one per thread).
     pub static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Make `hash` on this thread answer as if every slot were busy.
+    pub static HASH_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub async fn hash(password: String) -> anyhow::Result<String> {
+    #[cfg(test)]
+    anyhow::ensure!(!HASH_BUSY.get(), "password hashing is busy; try again");
     let slot = tokio::time::timeout(SLOT_WAIT, SLOTS.acquire())
         .await
         .map_err(|_| anyhow::anyhow!("password hashing is busy; try again"))??;

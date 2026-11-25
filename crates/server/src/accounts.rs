@@ -4,6 +4,7 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::addresses;
 use crate::db::{Db, NewClientError, authorized, client_admissible, expire_owner_tunnels};
 use crate::limits::{Kind, Setting, Settings, SettingsPatch};
 use crate::role::Role;
@@ -18,6 +19,8 @@ pub struct User {
     pub can_public: bool,
     pub totp: bool,
     pub created_at: i64,
+    /// Confirmed email address (mail on only).
+    pub email: Option<String>,
     /// As set; the API shows them with what they resolve to (`limits.rs`).
     #[serde(skip)]
     pub limits: Settings,
@@ -120,6 +123,10 @@ pub enum InviteKind {
     OwnerReset,
     /// A new password for one account other than the owner's.
     AccountReset,
+    /// "Forgot password?": a new password, mailed to the account's address.
+    PasswordReset,
+    /// Confirms a new email address of an account.
+    EmailVerify,
 }
 
 impl InviteKind {
@@ -129,6 +136,8 @@ impl InviteKind {
             Self::OwnerSetup => "owner_setup",
             Self::OwnerReset => "owner_reset",
             Self::AccountReset => "account_reset",
+            Self::PasswordReset => "password_reset",
+            Self::EmailVerify => "email_verify",
         }
     }
     /// `None` for a kind this build does not know: never read as an invite.
@@ -138,6 +147,8 @@ impl InviteKind {
             "owner_setup" => Some(Self::OwnerSetup),
             "owner_reset" => Some(Self::OwnerReset),
             "account_reset" => Some(Self::AccountReset),
+            "password_reset" => Some(Self::PasswordReset),
+            "email_verify" => Some(Self::EmailVerify),
             _ => None,
         }
     }
@@ -158,6 +169,8 @@ pub struct Invite {
     /// That account's role now.
     #[serde(skip)]
     pub user_role: Option<Role>,
+    /// Where an emailed invite went, or the address to confirm.
+    pub email: Option<String>,
 }
 
 /// What redeeming an invite needs: a new account, or a reset.
@@ -285,9 +298,9 @@ pub struct LinkSummary {
 
 const USER_COLUMNS: &str = "u.id, u.username, u.role, u.disabled_at IS NOT NULL, u.can_public, \
      u.totp_secret_sealed IS NOT NULL, u.created_at, u.limit_tunnels, u.limit_clients, u.limit_tunnel_ttl_s, \
-     u.limit_traffic_bytes";
+     u.limit_traffic_bytes, u.email";
 /// Columns `user_from_row` reads; queries add theirs after these.
-const USER_COLS: usize = 11;
+const USER_COLS: usize = 12;
 
 fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
@@ -304,6 +317,7 @@ fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
             tunnel_ttl_s: Setting::from_column(r.get(9)?),
             traffic_bytes: Setting::from_column(r.get(10)?),
         },
+        email: r.get(11)?,
     })
 }
 
@@ -321,6 +335,7 @@ fn invite_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Invite> {
         used_by: r.get(7)?,
         user: r.get(8)?,
         user_role: r.get::<_, Option<String>>(9)?.as_deref().map(Role::parse),
+        email: r.get(10)?,
     })
 }
 
@@ -904,6 +919,7 @@ impl Db {
         created_by: Option<String>,
         session: Option<String>,
         expires_at: i64,
+        email: Option<String>,
     ) -> anyhow::Result<Option<Invite>> {
         self.call(move |c| {
             let t = now();
@@ -933,10 +949,11 @@ impl Db {
             if kind != InviteKind::Invite {
                 tx.execute("DELETE FROM invites WHERE kind IN ('owner_setup', 'owner_reset') AND used_at IS NULL", [])?;
             }
+            let email = email.filter(|_| kind == InviteKind::Invite);
             tx.execute(
-                "INSERT INTO invites (id, token_hash, kind, role, created_by, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![id, token_hash, kind.as_str(), role.as_str(), created_by, t, expires_at],
+                "INSERT INTO invites (id, token_hash, kind, role, created_by, created_at, expires_at, email)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, token_hash, kind.as_str(), role.as_str(), created_by, t, expires_at, email],
             )?;
             tx.commit()?;
             Ok(Some(Invite {
@@ -950,6 +967,7 @@ impl Db {
                 used_by: None,
                 user: None,
                 user_role: None,
+                email,
             }))
         })
         .await
@@ -1024,6 +1042,7 @@ impl Db {
                 used_by: None,
                 user: Some(username),
                 user_role: Some(role),
+                email: None,
             }))
         })
         .await
@@ -1074,14 +1093,14 @@ impl Db {
                     "SELECT i.id, i.kind, i.role, cu.username, i.created_at, i.expires_at, i.used_at, i.used_by,
                             CASE i.kind WHEN 'owner_reset' THEN (SELECT username FROM users WHERE role = 'owner')
                                         ELSE tu.username END,
-                            CASE i.kind WHEN 'owner_reset' THEN 'owner' ELSE tu.role END,
+                            CASE i.kind WHEN 'owner_reset' THEN 'owner' ELSE tu.role END, i.email,
                             i.user_id, i.auth_epoch, i.created_by, i.issuer_epoch
                      FROM invites i LEFT JOIN users cu ON cu.id = i.created_by LEFT JOIN users tu ON tu.id = i.user_id
                      WHERE i.token_hash = ?1 AND i.used_at IS NULL AND i.expires_at > ?2",
                     params![token_hash, now()],
                     |r| {
-                        let issuer: Option<String> = r.get(12)?;
-                        Ok((invite_from_row(r)?, r.get::<_, Option<String>>(10)?, r.get(11)?, issuer, r.get(13)?))
+                        let issuer: Option<String> = r.get(13)?;
+                        Ok((invite_from_row(r)?, r.get::<_, Option<String>>(11)?, r.get(12)?, issuer, r.get(14)?))
                     },
                 )
                 .optional()?;
@@ -1092,7 +1111,13 @@ impl Db {
             if invite.kind == InviteKind::AccountReset {
                 let role = invite.role.as_str();
                 let issuer = issuer.as_deref().map(|i| (i, issuer_epoch));
-                if !target.is_some_and(|t| reset_still_allowed(c, &t, role, epoch, issuer).unwrap_or(false)) {
+                let valid = |t: &str| {
+                    Ok::<_, anyhow::Error>(
+                        reset_still_allowed(c, t, role, epoch, issuer)?
+                            && addresses::still_at_address(c, t, invite.email.as_deref())?,
+                    )
+                };
+                if !target.is_some_and(|t| valid(&t).unwrap_or(false)) {
                     return Ok(None);
                 }
             }
@@ -1105,7 +1130,7 @@ impl Db {
         self.call(|c| {
             let mut stmt = c.prepare(
                 "SELECT i.id, i.kind, i.role, cu.username, i.created_at, i.expires_at, i.used_at, uu.username,
-                        tu.username, tu.role
+                        tu.username, tu.role, i.email
                  FROM invites i LEFT JOIN users cu ON cu.id = i.created_by LEFT JOIN users uu ON uu.id = i.used_by
                  LEFT JOIN users tu ON tu.id = i.user_id
                  WHERE i.kind IN ('invite', 'account_reset') ORDER BY i.created_at DESC LIMIT 200",
@@ -1148,16 +1173,18 @@ impl Db {
         self.call(move |c| {
             let t = now();
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            /// Who made a reset link, and the account and auth epoch it is for.
+            /// Who made a reset link, the account and auth epoch it is for,
+            /// and the address it (or an invite) was mailed to.
             struct Reset {
                 created_by: Option<String>,
                 target: Option<String>,
                 epoch: Option<i64>,
                 issuer_epoch: Option<i64>,
+                email: Option<String>,
             }
             let invite: Option<(String, String, String, Reset)> = tx
                 .query_row(
-                    "SELECT id, kind, role, created_by, user_id, auth_epoch, issuer_epoch FROM invites
+                    "SELECT id, kind, role, created_by, user_id, auth_epoch, issuer_epoch, email FROM invites
                      WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
                     params![token_hash, t],
                     |r| {
@@ -1166,6 +1193,7 @@ impl Db {
                             target: r.get(4)?,
                             epoch: r.get(5)?,
                             issuer_epoch: r.get(6)?,
+                            email: r.get(7)?,
                         };
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?, reset))
                     },
@@ -1202,8 +1230,26 @@ impl Db {
                     if !reset_still_allowed(&tx, &target, &role, reset.epoch, issuer)? {
                         return Ok(Err(AcceptError::Invalid));
                     }
+                    if !addresses::still_at_address(&tx, &target, reset.email.as_deref())? {
+                        return Ok(Err(AcceptError::Invalid));
+                    }
                     reset_sign_in(&tx, &target, &password_hash, revoke_machines, &mut tunnels)?;
                     target
+                }
+                (InviteKind::PasswordReset, Acceptance::Reset { password_hash, revoke_machines }) => {
+                    let found = addresses::redeem_password_reset(
+                        &tx,
+                        reset.target,
+                        reset.epoch,
+                        reset.email,
+                        &password_hash,
+                        revoke_machines,
+                        &mut tunnels,
+                    )?;
+                    match found {
+                        Some(target) => target,
+                        None => return Ok(Err(AcceptError::Invalid)),
+                    }
                 }
                 (InviteKind::OwnerSetup, Acceptance::NewUser(u)) => match owner {
                     Some((_, false)) => return Ok(Err(AcceptError::OwnerState)),
@@ -1234,10 +1280,12 @@ impl Db {
                         Role::Owner => Role::Member,
                         r => r,
                     };
-                    match insert_user(&tx, u, role, t)? {
+                    let id = match insert_user(&tx, u, role, t)? {
                         Some(id) => id,
                         None => return Ok(Err(AcceptError::UsernameTaken)),
-                    }
+                    };
+                    addresses::confirm_invited_address(&tx, &id, reset.email.as_deref(), t)?;
+                    id
                 }
                 _ => return Ok(Err(AcceptError::Invalid)),
             };
@@ -1821,6 +1869,7 @@ impl Db {
                 "DELETE FROM invites WHERE (used_at IS NOT NULL OR expires_at <= ?1) AND created_at <= ?2",
                 params![t, t - 30 * 86_400],
             )?;
+            n += addresses::purge_mailed_links(&tx, t)?;
             n += tx.execute("DELETE FROM audit WHERE at <= ?1", params![t - 90 * 86_400])?;
             tx.commit()?;
             Ok(n)
@@ -1915,14 +1964,7 @@ fn reset_sign_in(
     // Logins approved before the reset (maybe by whoever forced it) are not honoured.
     tx.execute("DELETE FROM device_logins WHERE user_id = ?1", params![user_id])?;
     if revoke_machines {
-        let clients: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM clients WHERE user_id = ?1")?;
-            stmt.query_map(params![user_id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
-        };
-        for client in clients {
-            tunnels.extend(expire_owner_tunnels(tx, client.as_str())?);
-            tx.execute("DELETE FROM clients WHERE id = ?1", params![client])?;
-        }
+        crate::db::revoke_machines(tx, user_id, tunnels)?;
     }
     Ok(())
 }

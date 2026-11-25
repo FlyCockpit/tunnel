@@ -570,9 +570,11 @@ fn the_fresh_schema_stores_limits_in_four_nullable_checked_columns() {
             "limit_clients",
             "limit_tunnel_ttl_s",
             "limit_traffic_bytes",
+            "email",
+            "email_verified_at",
         ]
     );
-    for (name, ty, not_null) in &cols[13..] {
+    for (name, ty, not_null) in &cols[13..17] {
         assert_eq!((ty.as_str(), *not_null), ("INTEGER", false), "{name}");
     }
     c.execute(

@@ -15,7 +15,11 @@
 pub mod install;
 
 pub mod assets;
+mod checks;
+mod email;
 mod handlers;
+
+pub use email::notify_user;
 pub mod totp;
 
 use std::net::{IpAddr, SocketAddr};
@@ -35,7 +39,8 @@ use crate::state::AppState;
 use crate::tokens;
 use crate::util::{Body, full};
 
-pub use handlers::{INVITE_PREFIX, OWNER_LINK_TTL_S};
+pub use checks::INVITE_PREFIX;
+pub use handlers::OWNER_LINK_TTL_S;
 
 pub const CSRF_HEADER: &str = "x-tunnel-csrf";
 /// Sensitive steps (approving a machine) need a password or TOTP check this recent.
@@ -185,6 +190,18 @@ pub fn clear_cookie() -> String {
 
 fn peer_ip(parts: &Parts) -> Option<IpAddr> {
     parts.extensions.get::<PeerAddr>().map(|p| p.0.ip())
+}
+
+/// Just the client address: for endpoints that check their limits before
+/// any database work (`Ctx` looks up the caller's session cookies first).
+pub struct PeerIp(pub Option<IpAddr>);
+
+impl FromRequestParts<Arc<AppState>> for PeerIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+        Ok(Self(peer_ip(parts)))
+    }
 }
 
 /// Request context: client address, user agent, and the session if any.

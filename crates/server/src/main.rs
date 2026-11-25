@@ -1,4 +1,5 @@
 mod accounts;
+mod addresses;
 mod api;
 mod cli;
 mod clients;
@@ -11,6 +12,7 @@ mod ice;
 mod jobs;
 mod limits;
 mod listener;
+mod mail;
 mod metrics;
 mod password;
 mod pool;
@@ -61,6 +63,11 @@ enum Cmd {
     },
     /// Show service, database, and certificate status.
     Status,
+    /// Optional email (SMTP) for invites, password resets and security notices.
+    Mail {
+        #[command(subcommand)]
+        cmd: MailCmd,
+    },
     /// Write a consistent SQLite backup (`VACUUM INTO`).
     Backup { path: PathBuf },
     /// Replace the database with a backup: checks it, stops the service, keeps
@@ -124,6 +131,23 @@ enum ServiceCmd {
     },
     /// Remove a service: its token stops working and its tunnels close.
     Delete { name: String },
+}
+
+#[derive(Subcommand)]
+enum MailCmd {
+    /// Add or change the mail server settings (asks, or takes --smtp-* flags;
+    /// the password from $SMTP_PASS or a prompt), test them, save, restart.
+    Setup {
+        #[command(flatten)]
+        smtp: cli::setup::mail::SmtpArgs,
+        /// Never prompt: use the flags and current values.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Send a test mail now with the saved settings; names the step that fails.
+    Test { address: String },
+    /// Stop sending email (links are handed over by hand again).
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -228,6 +252,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Token { cmd: TokenCmd::Rotate } => cli::token_rotate(&config).await,
         Cmd::HealthToken { cmd } => cli::health_token(&config, matches!(cmd, HealthTokenCmd::Set)).await,
         Cmd::Status => cli::status(&config).await,
+        Cmd::Mail { cmd: MailCmd::Setup { smtp, yes } } => cli::setup::mail::setup_command(&config, &smtp, yes).await,
+        Cmd::Mail { cmd: MailCmd::Test { address } } => cli::setup::mail::test_command(&config, &address).await,
+        Cmd::Mail { cmd: MailCmd::Off } => cli::setup::mail::off_command(&config).await,
         Cmd::Backup { path } => cli::backup(&config, &path).await,
         Cmd::Restore { path } => cli::restore(&config, &path).await,
         Cmd::Cert { cmd: CertCmd::Renew { force } } => cli::cert_renew(&config, force).await,

@@ -914,17 +914,15 @@ fn refuses_a_database_whose_schema_differs_from_this_builds() {
     // As a build before the sign-in reset links left it: same version, no `invites.user_id`.
     {
         let c = Connection::open(&path).unwrap();
-        c.execute_batch("DROP INDEX invites_user; ALTER TABLE invites DROP COLUMN issuer_epoch;").unwrap();
+        c.execute_batch("DROP INDEX invites_user; ALTER TABLE invites DROP COLUMN email;").unwrap();
     }
     let err = format!("{:#}", Db::open(&path).err().expect("refused"));
     assert!(err.contains("schema differs from this build's (invites, invites_user)"), "{err}");
     // Comments and layout do not count: a column added later reads the same.
     {
         let c = Connection::open(&path).unwrap();
-        c.execute_batch(
-            "ALTER TABLE invites ADD COLUMN issuer_epoch INTEGER; CREATE INDEX invites_user ON invites(user_id);",
-        )
-        .unwrap();
+        c.execute_batch("ALTER TABLE invites ADD COLUMN email TEXT; CREATE INDEX invites_user ON invites(user_id);")
+            .unwrap();
     }
     drop(Db::open(&path).unwrap());
     for suffix in ["", "-wal", "-shm"] {

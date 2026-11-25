@@ -20,6 +20,8 @@ allow = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
     "Zlib",
+    # quoted_printable (via lettre, the optional SMTP mail); as in skywrite.
+    "0BSD",
 ]
 
 [bans]

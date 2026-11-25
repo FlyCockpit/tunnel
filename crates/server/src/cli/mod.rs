@@ -34,7 +34,9 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
         )
     })?;
     let state = AppState::new(cfg, db, certs.clone());
+    let _ = state.ui.config_path.set(config_path.to_path_buf());
     tracing::info!(not_after = certs.not_after(), "certificate loaded");
+    tracing::info!("mail: {}", state.config.mail_status());
 
     if state.config.webrtc.enabled {
         match crate::turn_relay::Relay::start(&state.config, &state.metrics).await {
@@ -186,6 +188,7 @@ pub async fn status(config_path: &Path) -> anyhow::Result<()> {
         println!("webrtc:      disabled");
     }
 
+    println!("mail:        {}", cfg.mail_status());
     println!("certificate: {}", cfg.cert_names().join(", "));
     match tls::cert_status(&cfg) {
         CertStatus::Valid { not_after } => println!("  valid until {}", describe_time(not_after)),
@@ -385,6 +388,11 @@ pub async fn client_add(config_path: &Path, name: &str, user: Option<&str>) -> a
         }
     };
     let result = crate::clients::add(&db, &cfg, name, &owner.id, None).await;
+    // With mail on, the account's address hears of it (as for the web UI and the admin API).
+    let contact = match (&result, crate::mail::Mailer::from_config(&cfg)) {
+        (Ok(_), Some(mailer)) => db.contact(owner.id.clone()).await.ok().flatten().map(|c| (mailer, c)),
+        _ => None,
+    };
     drop(db);
     restore_ownership(config_path, &cfg)?;
     match result {
@@ -394,6 +402,15 @@ pub async fn client_add(config_path: &Path, name: &str, user: Option<&str>) -> a
                 crate::clients::ENROLL_TTL_S / 60
             );
             println!("  {}\n", e.login_code);
+            if let Some((mailer, (username, email))) = contact {
+                // Sent now: this process ends here.
+                let notice = crate::mail::Notice::MachineAdded(e.name.clone());
+                let mail = mailer.texts().notice(&notice, &username, crate::tokens::now(), None);
+                match mailer.send_now(&email, mail, &mut |_| {}).await {
+                    Ok(()) => println!("A security notice went to {username}'s email address."),
+                    Err(err) => eprintln!("The security notice to {username} was not sent: {}", err.detail),
+                }
+            }
             Ok(())
         }
         Err(crate::clients::AddError::Invalid(m)) => anyhow::bail!(m),
@@ -445,6 +462,7 @@ pub async fn admin_link(config_path: &Path, first_run: bool) -> anyhow::Result<(
             None,
             None,
             crate::tokens::now() + ttl,
+            None,
         )
         .await;
     if result.is_ok() {
@@ -511,7 +529,16 @@ pub async fn user_invite(config_path: &Path, role: crate::role::Role, hours: u32
     let id = format!("in{}", crate::tokens::random_tunnel_id());
     let expires_at = crate::tokens::now() + i64::from(hours) * 3600;
     let result = db
-        .create_invite(id.clone(), crate::tokens::hash_token(&token), InviteKind::Invite, role, None, None, expires_at)
+        .create_invite(
+            id.clone(),
+            crate::tokens::hash_token(&token),
+            InviteKind::Invite,
+            role,
+            None,
+            None,
+            expires_at,
+            None,
+        )
         .await;
     if result.is_ok() {
         let _ = db.audit(None, "invite_created", Some(format!("{id} {} (server shell)", role.as_str())), None).await;
@@ -837,12 +864,12 @@ fn describe_ago(unix: i64) -> String {
 }
 
 /// Root commands and configs in `/etc` belong to system installs.
-fn install_mode(config_path: &Path) -> Mode {
+pub(crate) fn install_mode(config_path: &Path) -> Mode {
     if mode::uid() == 0 || config_path.starts_with("/etc") { Mode::System } else { Mode::User }
 }
 
 /// Commands that write a root install's files must run as root.
-fn ensure_can_write(config_path: &Path, what: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_can_write(config_path: &Path, what: &str) -> anyhow::Result<()> {
     if install_mode(config_path) == Mode::System {
         anyhow::ensure!(
             mode::uid() == 0,

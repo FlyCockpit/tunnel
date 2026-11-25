@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tunnel_protocol::CloseReason;
 
+use super::checks::{
+    INVITE_PREFIX, audit, bad_credentials, busy, changed_meanwhile, check_password, check_second_factor,
+    invalid_invite, invite_token_hash, keys, require_fresh_auth, too_many, totp_aad,
+};
+use super::email::{self, notify};
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
 use crate::accounts::{
     AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, ResetLinkError, User, UserPatch,
@@ -20,12 +25,12 @@ use crate::api::device::normalize_user_code;
 use crate::api::{self, ApiError, ApiJson, ApiResult, CreateAccessLinkRequest};
 use crate::clients;
 use crate::db::{DeleteOutcome, NewClientError, TunnelRow};
+use crate::mail::Notice;
 use crate::password::{self, Verdict};
 use crate::role::Role;
 use crate::state::AppState;
 use crate::tokens::{self, now};
 
-pub const INVITE_PREFIX: &str = "tninv_";
 const MIN_ACCOUNT_PASSWORD: usize = 10;
 const MAX_USERNAME: usize = 32;
 const RECOVERY_CODES: usize = 10;
@@ -73,41 +78,17 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/ui/api/services", get(list_services))
         .route("/ui/api/audit", get(audit_log))
         .route("/ui/api/status", get(status))
+        .route("/ui/api/password/forgot", post(email::forgot_password))
+        .route("/ui/api/account/email", post(email::set_email))
+        .route("/ui/api/account/email/remove", post(email::remove_email))
+        .route("/ui/api/email/verify", post(email::verify_email))
         .fallback(|| async { ApiError::not_found("route") })
-}
-
-/// The user's sign-in changed (password, two-factor, reset) or this session
-/// ended while the request ran.
-fn changed_meanwhile() -> ApiError {
-    ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "your sign-in changed meanwhile; sign in again")
-}
-
-fn too_many() -> ApiError {
-    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many attempts; wait a minute")
-}
-
-fn busy() -> ApiError {
-    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the server is busy checking passwords; try again")
-}
-
-fn bad_credentials() -> ApiError {
-    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", "wrong username or password")
 }
 
 fn with_cookie(cookie: String, body: Value) -> Response {
     let mut resp = Json(body).into_response();
     resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie is ASCII"));
     resp
-}
-
-fn keys(state: &AppState) -> ApiResult<&crate::seal::Keys> {
-    state.ui.keys.as_ref().ok_or_else(|| ApiError::not_found("route"))
-}
-
-async fn audit(state: &AppState, user: Option<&str>, action: &'static str, target: Option<String>, ctx: &Ctx) {
-    if let Err(e) = state.db.audit(user.map(str::to_string), action, target, ctx.ip_string()).await {
-        tracing::warn!(error = %format!("{e:#}"), action, "audit write failed");
-    }
 }
 
 pub fn validate_username(name: &str) -> ApiResult<String> {
@@ -174,90 +155,6 @@ async fn start_session(
     Ok((session_cookie(&id, max_age), keys(state)?.csrf_token(&id)))
 }
 
-/// Check the current password of `user_id` (rate-limited per user, before Argon2).
-/// Check the current password of `user_id` (rate-limited per user, before
-/// Argon2). Returns the auth epoch it was checked at.
-async fn check_password(state: &AppState, user_id: &str, password: &str) -> ApiResult<i64> {
-    if !state.ui.reauth.check_key(user_id.to_string()) {
-        return Err(too_many());
-    }
-    let creds = state.db.credentials(None, Some(user_id.to_string())).await?.ok_or_else(bad_credentials)?;
-    match password::verify_phc(creds.password_hash, password.to_string()).await {
-        Verdict::Match => Ok(creds.auth_epoch),
-        Verdict::NoMatch => {
-            Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_password", "the current password is wrong"))
-        }
-        Verdict::Busy => Err(busy()),
-    }
-}
-
-/// Check a TOTP code or recovery code for `user_id` (single use either way).
-/// Check a TOTP code or recovery code for `user_id` (single use either
-/// way). `limiter` is the pre-session (sign-in) or in-session one. Wrong
-/// codes count towards a lockout that survives restarts: five in a row lock
-/// the second factor for 15 minutes, doubling up to a day.
-async fn check_second_factor(
-    state: &AppState,
-    limiter: &crate::ratelimit::Limiter<String>,
-    user_id: &str,
-    code: &str,
-) -> ApiResult<()> {
-    if !limiter.check_key(user_id.to_string()) {
-        return Err(too_many());
-    }
-    let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "wrong or already used code");
-    let creds = state.db.credentials(None, Some(user_id.to_string())).await?.ok_or_else(wrong)?;
-    if let Some(until) = creds.factor_locked_until.filter(|u| *u > now()) {
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "locked",
-            format!("too many wrong codes; try again in {} minutes", (until - now()) / 60 + 1),
-        ));
-    }
-    let sealed = creds.totp_sealed.ok_or_else(wrong)?;
-    let normalized: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
-    let ok = if normalized.len() == 6 && normalized.bytes().all(|b| b.is_ascii_digit()) {
-        let secret = keys(state)?.open(&sealed, &totp_aad(user_id)).ok_or_else(|| {
-            ApiError::internal(anyhow::anyhow!("TOTP secret of {user_id} does not open (ui_secret changed?)"))
-        })?;
-        match totp::verify(&secret, &normalized, now(), creds.totp_last_step) {
-            Some(step) => state.db.use_totp_step(user_id.to_string(), step).await?,
-            None => false,
-        }
-    } else if normalized.len() == 10 {
-        state.db.use_recovery_code(user_id.to_string(), tokens::hash_token(&normalized)).await?
-    } else {
-        false
-    };
-    if ok {
-        state.db.factor_ok(user_id.to_string()).await?;
-        Ok(())
-    } else {
-        if state.db.factor_failed(user_id.to_string()).await?.is_some() {
-            tracing::warn!(user = %user_id, "second factor locked after repeated wrong codes");
-        }
-        Err(wrong())
-    }
-}
-
-/// TOTP users confirm sensitive steps with a code when their last password
-/// or code check is older than [`REAUTH_S`].
-async fn require_fresh_auth(state: &AppState, s: &Signed, code: Option<&str>) -> ApiResult<()> {
-    if !s.user().totp || now() - s.session.auth_at <= REAUTH_S {
-        return Ok(());
-    }
-    let code = code.ok_or_else(|| {
-        ApiError::new(StatusCode::UNAUTHORIZED, "code_required", "enter a code from your authenticator app")
-    })?;
-    check_second_factor(state, &state.ui.reauth, &s.user().id, code).await?;
-    state.db.touch_ui_auth(s.session.id_hash.clone()).await?;
-    Ok(())
-}
-
-fn totp_aad(user_id: &str) -> String {
-    format!("totp:{user_id}")
-}
-
 // ------------------------------------------------------------------ session
 
 #[derive(Serialize)]
@@ -269,6 +166,8 @@ struct ServerSummary {
     /// Previews share the UI's registrable domain (see the README).
     same_site: bool,
     abuse_contact: Option<String>,
+    /// The server sends mail (invites, password resets, notices).
+    mail: bool,
 }
 
 fn server_summary(state: &AppState) -> ServerSummary {
@@ -280,6 +179,7 @@ fn server_summary(state: &AppState) -> ServerSummary {
         preview_zone: cfg.preview_zone.clone(),
         same_site: cfg.ui_same_site_as_previews(),
         abuse_contact: cfg.abuse_contact.clone(),
+        mail: state.ui.mail.as_ref().is_some(),
     }
 }
 
@@ -308,6 +208,7 @@ async fn session(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Json
             "owner_exists": owner_exists, "server": server,
             "traffic": state.traffic.view(&state.db, &s.user.id).await?,
             "usage": usage_json(&state, &s.user.id).await?,
+            "email_pending": email::pending(&state, &s.user.id).await?,
         }),
         Some((_, s)) => {
             json!({ "user": null, "pending": true, "pending_user": s.user.username, "csrf": null, "owner_exists": owner_exists, "server": server })
@@ -424,18 +325,6 @@ struct TokenRequest {
     token: String,
 }
 
-fn invite_token_hash(token: &str) -> ApiResult<String> {
-    let token = token.trim();
-    if !token.starts_with(INVITE_PREFIX) || token.len() > 128 {
-        return Err(invalid_invite());
-    }
-    Ok(tokens::hash_token(token))
-}
-
-fn invalid_invite() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "invalid_invite", "this link is invalid, used or expired; ask for a new one")
-}
-
 async fn invite_info(
     State(state): State<Arc<AppState>>,
     ctx: Ctx,
@@ -445,9 +334,21 @@ async fn invite_info(
         return Err(too_many());
     }
     let invite = state.db.invite_by_token(invite_token_hash(&req.token)?).await?.ok_or_else(invalid_invite)?;
+    // A mailed password reset keeps two-factor sign-in: the page asks for a code.
+    let needs_code = match invite.kind {
+        InviteKind::PasswordReset => {
+            let hash = invite_token_hash(&req.token)?;
+            state.db.password_reset_target(hash).await?.ok_or_else(invalid_invite)?.1
+        }
+        _ => false,
+    };
+    // An address confirmation the sign-in has since voided says nothing either.
+    if invite.kind == InviteKind::EmailVerify && !state.db.email_verify_valid(invite_token_hash(&req.token)?).await? {
+        return Err(invalid_invite());
+    }
     Ok(Json(json!({
         "kind": invite.kind, "role": invite.role, "expires_at": invite.expires_at,
-        "invited_by": invite.created_by, "username": invite.user,
+        "invited_by": invite.created_by, "username": invite.user, "email": invite.email, "needs_code": needs_code,
     })))
 }
 
@@ -462,6 +363,9 @@ struct AcceptRequest {
     /// Resets only: also remove the account's machines (their tokens stop working).
     #[serde(default)]
     revoke_machines: bool,
+    /// Mailed password resets of accounts with two-factor sign-in: a TOTP or recovery code.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 async fn invite_accept(
@@ -474,20 +378,40 @@ async fn invite_accept(
     }
     let hash = invite_token_hash(&req.token)?;
     let invite = state.db.invite_by_token(hash.clone()).await?.ok_or_else(invalid_invite)?;
+    if invite.kind == InviteKind::EmailVerify {
+        return Err(invalid_invite());
+    }
     validate_password(&req.password)?;
+    // Hashed first: a busy server must not cost a second factor (a recovery code is single use).
     let password_hash = password::hash(req.password).await.map_err(|_| busy())?;
-    let acceptance = if matches!(invite.kind, InviteKind::OwnerReset | InviteKind::AccountReset) {
-        Acceptance::Reset { password_hash, revoke_machines: req.revoke_machines }
-    } else {
-        let username = validate_username(req.username.as_deref().unwrap_or_default())?;
-        // New users start on the server defaults for their role.
-        Acceptance::NewUser(NewUser {
-            id: format!("us{}", tokens::random_tunnel_id()),
-            username,
-            password_hash,
-            can_public: false,
-        })
-    };
+    if invite.kind == InviteKind::PasswordReset {
+        // An address is never a second factor: with TOTP on, a code is due
+        // (the same lockout as at sign-in), and the reset keeps TOTP on.
+        // Only a link that may still reset the account gets to try codes.
+        let (user_id, totp) = state.db.password_reset_target(hash.clone()).await?.ok_or_else(invalid_invite)?;
+        if totp {
+            let code = req.code.as_deref().filter(|c| !c.trim().is_empty()).ok_or_else(|| {
+                ApiError::new(StatusCode::UNAUTHORIZED, "code_required", "enter a code from your authenticator app")
+            })?;
+            if let Err(e) = check_second_factor(&state, &state.ui.login_factor, &user_id, code).await {
+                audit(&state, Some(&user_id), "login_failed", Some("password reset code".into()), &ctx).await;
+                return Err(e);
+            }
+        }
+    }
+    let acceptance =
+        if matches!(invite.kind, InviteKind::OwnerReset | InviteKind::AccountReset | InviteKind::PasswordReset) {
+            Acceptance::Reset { password_hash, revoke_machines: req.revoke_machines }
+        } else {
+            let username = validate_username(req.username.as_deref().unwrap_or_default())?;
+            // New users start on the server defaults for their role.
+            Acceptance::NewUser(NewUser {
+                id: format!("us{}", tokens::random_tunnel_id()),
+                username,
+                password_hash,
+                can_public: false,
+            })
+        };
     let (user_id, epoch, tunnels) = match state.db.accept_invite(hash, acceptance).await? {
         Ok(found) => found,
         Err(AcceptError::UsernameTaken) => {
@@ -495,16 +419,21 @@ async fn invite_accept(
         }
         Err(AcceptError::Invalid | AcceptError::OwnerState) => return Err(invalid_invite()),
     };
-    let action = match invite.kind {
-        InviteKind::Invite => "user_created",
-        InviteKind::OwnerSetup => "owner_created",
-        InviteKind::OwnerReset => "owner_reset",
-        InviteKind::AccountReset => "account_reset",
+    let (action, notice) = match invite.kind {
+        InviteKind::Invite => ("user_created", None),
+        InviteKind::OwnerSetup => ("owner_created", None),
+        InviteKind::OwnerReset => ("owner_reset", Some(Notice::SignInReset)),
+        InviteKind::AccountReset => ("account_reset", Some(Notice::SignInReset)),
+        InviteKind::PasswordReset => ("password_reset", Some(Notice::PasswordReset)),
+        InviteKind::EmailVerify => ("email_verified", None),
     };
     for t in &tunnels {
         state.delete_tunnel(t, CloseReason::Deleted).await?;
     }
     audit(&state, Some(&user_id), action, Some(invite.id), &ctx).await;
+    if let Some(n) = notice {
+        notify(&state, &user_id, n, &ctx).await;
+    }
     if let Some((old, _)) = &ctx.session {
         state.db.delete_ui_session(tokens::hash_token(old)).await?;
     }
@@ -553,6 +482,7 @@ async fn change_password(
         .await?
         .ok_or_else(changed_meanwhile)?;
     audit(&state, Some(&user_id), "password_changed", None, &s.ctx).await;
+    notify(&state, &user_id, Notice::PasswordChanged, &s.ctx).await;
     let (cookie, csrf) = start_session(&state, &user_id, false, epoch, None, &s.ctx).await?;
     Ok(with_cookie(cookie, json!({ "status": "ok", "csrf": csrf })))
 }
@@ -635,6 +565,7 @@ async fn totp_enable(
         return Err(ApiError::new(StatusCode::CONFLICT, "no_setup", "setup was restarted; scan the new code"));
     }
     audit(&state, Some(&user_id), "totp_enabled", None, &s.ctx).await;
+    notify(&state, &user_id, Notice::TotpEnabled, &s.ctx).await;
     Ok(Json(json!({ "recovery_codes": shown })))
 }
 
@@ -649,6 +580,7 @@ async fn totp_disable(
         return Err(changed_meanwhile());
     }
     audit(&state, Some(&user_id), "totp_disabled", None, &s.ctx).await;
+    notify(&state, &user_id, Notice::TotpDisabled, &s.ctx).await;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -727,6 +659,7 @@ async fn add_machine(
     match clients::add(&state.db, &state.config, &req.name, &user_id, Some(s.session.id_hash.clone())).await {
         Ok(e) => {
             audit(&state, Some(&user_id), "machine_added", Some(e.name.clone()), &s.ctx).await;
+            notify(&state, &user_id, Notice::MachineAdded(e.name.clone()), &s.ctx).await;
             Ok(Json(json!({ "name": e.name, "login_code": e.login_code, "expires_at": e.expires_at })))
         }
         Err(clients::AddError::Invalid(m)) => Err(ApiError::validation(m)),
@@ -1045,6 +978,9 @@ async fn device_decide(
         Ok(name) => {
             let action = if req.approve { "device_approved" } else { "device_denied" };
             audit(&state, Some(&user_id), action, Some(name.clone()), &s.ctx).await;
+            if req.approve {
+                notify(&state, &user_id, Notice::MachineApproved(name.clone()), &s.ctx).await;
+            }
             Ok(Json(json!({ "status": if req.approve { "approved" } else { "denied" }, "client_name": name })))
         }
         Err(DecideError::NotFound) => Err(unknown_code()),
@@ -1181,6 +1117,10 @@ async fn update_user(
         state.delete_tunnel(t, CloseReason::Deleted).await?;
     }
     audit(&state, Some(&actor.id), "user_updated", Some(target.username.clone()), &s.ctx).await;
+    if user.role != target.role {
+        let n = Notice::RoleChanged { from: target.role.as_str().into(), to: user.role.as_str().into() };
+        notify(&state, &user.id, n, &s.ctx).await;
+    }
     if let Some(disabled) = req.disabled {
         let action = if disabled { "user_disabled" } else { "user_enabled" };
         audit(&state, Some(&actor.id), action, Some(target.username.clone()), &s.ctx).await;
@@ -1235,6 +1175,9 @@ struct NewInvite {
     role: Role,
     #[serde(default)]
     ttl_s: Option<i64>,
+    /// Mail the link here too (mail on only); signing up with it confirms the address.
+    #[serde(default)]
+    email: Option<String>,
 }
 
 async fn create_invite(
@@ -1254,6 +1197,20 @@ async fn create_invite(
         return Err(ApiError::validation("ttl_s must be within 3600..=2592000"));
     }
     let ui = state.config.ui_host.clone().ok_or_else(|| ApiError::not_found("route"))?;
+    let email = match req.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        None => None,
+        Some(e) => {
+            email::mailer(&state).map_err(|_| ApiError::validation("this server sends no email; copy the link"))?;
+            let e = crate::config::smtp::parse_address(e).map_err(ApiError::validation)?;
+            if state.db.email_in_use(e.clone()).await? {
+                return Err(ApiError::new(StatusCode::CONFLICT, "email_taken", "an account already has this address"));
+            }
+            if !state.ui.mail_user.check_key(s.user().id.clone()) {
+                return Err(too_many());
+            }
+            Some(e)
+        }
+    };
     let token = tokens::random_token(INVITE_PREFIX);
     let invite = state
         .db
@@ -1265,13 +1222,23 @@ async fn create_invite(
             Some(s.user().id.clone()),
             Some(s.session.id_hash.clone()),
             now() + ttl,
+            email.clone(),
         )
         .await?
         .ok_or_else(changed_meanwhile)?;
-    audit(&state, Some(&s.user().id), "invite_created", Some(format!("{} {}", invite.id, req.role.as_str())), &s.ctx)
-        .await;
+    let url = format!("https://{ui}/invite#{token}");
+    let mailed = match (&email, state.ui.mail.as_ref()) {
+        (Some(to), Some(mailer)) => {
+            let mail = mailer.texts().invite(&url, req.role.as_str(), Some(&s.user().username), ttl);
+            // A full queue drops it: then the admin hands the link over instead.
+            mailer.send_later("invite", to.clone(), mail)
+        }
+        _ => false,
+    };
+    let target = format!("{} {}{}", invite.id, req.role.as_str(), if mailed { " (mailed)" } else { "" });
+    audit(&state, Some(&s.user().id), "invite_created", Some(target), &s.ctx).await;
     // The token goes in the fragment: it never reaches a server log or a Referer.
-    Ok(Json(json!({ "url": format!("https://{ui}/invite#{token}"), "invite": invite })))
+    Ok(Json(json!({ "url": url, "invite": invite, "mailed": mailed })))
 }
 
 #[derive(Deserialize)]
@@ -1282,6 +1249,9 @@ struct NewResetLink {
     /// TOTP or recovery code when the session's last check is stale.
     #[serde(default)]
     code: Option<String>,
+    /// Also mail the link to the account's confirmed address (mail on only).
+    #[serde(default)]
+    send_email: bool,
 }
 
 fn reset_forbidden() -> ApiError {
@@ -1314,6 +1284,26 @@ async fn create_reset_link(
     if target.role == Role::Owner || target.id == s.user().id || !may_manage(&state, s.user(), &target.id).await? {
         return Err(reset_forbidden());
     }
+    let mailer = if req.send_email {
+        let mailer =
+            email::mailer(&state).map_err(|_| ApiError::validation("this server sends no email; copy the link"))?;
+        if target.email.is_none() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "no_email",
+                "this account has no confirmed email address; copy the link",
+            ));
+        }
+        // Per admin, and per account it goes to (no mail bombing through resets).
+        if !state.ui.mail_user.check_key(s.user().id.clone())
+            || !state.ui.mail_user.check_key(format!("reset-to:{}", target.id))
+        {
+            return Err(too_many());
+        }
+        Some(mailer.clone())
+    } else {
+        None
+    };
     require_fresh_auth(&state, &s, req.code.as_deref()).await?;
     let token = tokens::random_token(INVITE_PREFIX);
     let made = state
@@ -1335,9 +1325,24 @@ async fn create_reset_link(
         }
         Err(ResetLinkError::SignedOut) => return Err(changed_meanwhile()),
     };
-    audit(&state, Some(&s.user().id), "reset_link_created", invite.user.clone(), &s.ctx).await;
+    let url = format!("https://{ui}/invite#{token}");
+    // Bound to the address it goes to: it stops working if the account's address changes.
+    let to = match &mailer {
+        Some(_) => state.db.bind_reset_to_address(invite.id.clone()).await?,
+        None => None,
+    };
+    // A full queue drops the mail: then the admin hands the link over instead.
+    let mailed = match (mailer, to) {
+        (Some(mailer), Some(to)) => {
+            let mail = mailer.texts().sign_in_reset(&url, &target.username, &s.user().username, ttl);
+            mailer.send_later("account_reset", to, mail)
+        }
+        _ => false,
+    };
+    let what = invite.user.clone().map(|u| if mailed { format!("{u} (mailed)") } else { u });
+    audit(&state, Some(&s.user().id), "reset_link_created", what, &s.ctx).await;
     // The token goes in the fragment: it never reaches a server log or a Referer.
-    Ok(Json(json!({ "url": format!("https://{ui}/invite#{token}"), "invite": invite })))
+    Ok(Json(json!({ "url": url, "invite": invite, "mailed": mailed })))
 }
 
 async fn delete_invite(
@@ -1405,5 +1410,6 @@ async fn status(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiResul
         },
         "traffic_month": crate::traffic::month_label(state.traffic.month()),
         "abuse_contact": cfg.abuse_contact,
+        "mail": email::status(&state),
     })))
 }

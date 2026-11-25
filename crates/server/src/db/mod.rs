@@ -150,9 +150,15 @@ CREATE TABLE users (
     limit_tunnels       INTEGER CHECK (limit_tunnels >= -1),
     limit_clients       INTEGER CHECK (limit_clients >= -1),
     limit_tunnel_ttl_s  INTEGER CHECK (limit_tunnel_ttl_s >= -1),
-    limit_traffic_bytes INTEGER CHECK (limit_traffic_bytes >= -1)
+    limit_traffic_bytes INTEGER CHECK (limit_traffic_bytes >= -1),
+    -- The account's email address once confirmed (lowercased; mail on only):
+    -- password resets and notices go there. A new address waits in an
+    -- `email_verify` link until it is confirmed.
+    email TEXT,
+    email_verified_at INTEGER
 );
 CREATE UNIQUE INDEX users_one_owner ON users(role) WHERE role = 'owner';
+CREATE UNIQUE INDEX users_email ON users(email) WHERE email IS NOT NULL;
 CREATE TABLE recovery_codes (
     user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     code_hash TEXT NOT NULL,
@@ -164,10 +170,14 @@ CREATE TABLE recovery_codes (
 -- `account_reset` (a new password for `user_id`, made by an admin or `user
 -- reset`; `role` and `auth_epoch` are the account's when it was made,
 -- `issuer_epoch` the maker's).
+-- With mail on: `password_reset` ("Forgot password?", mailed to `email`, the
+-- account's address then) and `email_verify` (confirms `email` as the
+-- address of `user_id`); an emailed `invite` was sent to `email`.
 CREATE TABLE invites (
     id         TEXT PRIMARY KEY,
     token_hash TEXT NOT NULL UNIQUE,
-    kind       TEXT NOT NULL CHECK (kind IN ('invite', 'owner_setup', 'owner_reset', 'account_reset')),
+    kind       TEXT NOT NULL CHECK (kind IN ('invite', 'owner_setup', 'owner_reset', 'account_reset',
+                                             'password_reset', 'email_verify')),
     role       TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     created_by TEXT,
     created_at INTEGER NOT NULL,
@@ -176,7 +186,8 @@ CREATE TABLE invites (
     used_by    TEXT,
     user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
     auth_epoch INTEGER,
-    issuer_epoch INTEGER
+    issuer_epoch INTEGER,
+    email      TEXT
 );
 CREATE INDEX invites_user ON invites(user_id);
 -- Web UI sessions (`__Host-tunnel-ui` cookie; only the hash is stored).
@@ -1839,6 +1850,23 @@ pub(crate) fn client_admissible(
         Some(limit) if have.max(0) as u64 >= limit => Err(NewClientError::Quota { limit, role }),
         _ => Ok(()),
     })
+}
+
+/// Delete every machine of `user_id`, expiring their tunnels (added to `tunnels`, for the caller to close).
+pub(crate) fn revoke_machines(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: &str,
+    tunnels: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let clients: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT id FROM clients WHERE user_id = ?1")?;
+        stmt.query_map(params![user_id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
+    };
+    for client in clients {
+        tunnels.extend(expire_owner_tunnels(tx, client.as_str())?);
+        tx.execute("DELETE FROM clients WHERE id = ?1", params![client])?;
+    }
+    Ok(())
 }
 
 pub(crate) fn expire_owner_tunnels(tx: &rusqlite::Transaction<'_>, owner_id: &str) -> anyhow::Result<Vec<String>> {

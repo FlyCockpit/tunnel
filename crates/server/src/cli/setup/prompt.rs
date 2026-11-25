@@ -7,10 +7,19 @@ use std::process::{Command, Stdio};
 use anyhow::Context;
 
 fn read_line() -> anyhow::Result<String> {
+    Ok(read_raw_line()?.trim().to_string())
+}
+
+/// One line as typed, without its line ending (passwords keep their spaces).
+fn read_raw_line() -> anyhow::Result<String> {
     let mut line = String::new();
     let n = io::stdin().lock().read_line(&mut line).context("reading from stdin")?;
     anyhow::ensure!(n > 0, "stdin closed: setup is interactive, run it from a terminal");
-    Ok(line.trim().to_string())
+    Ok(without_line_end(&line).to_string())
+}
+
+fn without_line_end(line: &str) -> &str {
+    line.strip_suffix('\n').map_or(line, |l| l.strip_suffix('\r').unwrap_or(l))
 }
 
 fn show(prompt: &str) -> anyhow::Result<()> {
@@ -56,16 +65,32 @@ pub fn ask_bool(question: &str, default: bool) -> anyhow::Result<bool> {
 
 /// Hidden input. Enter keeps `existing`; with no existing value an answer is required.
 pub fn ask_secret(question: &str, existing: Option<&str>) -> anyhow::Result<String> {
+    hidden(question, existing, mask, read_line)
+}
+
+/// `ask_secret` for a password: nothing of the current one is shown, and
+/// its spaces are kept as typed.
+pub fn ask_password(question: &str, existing: Option<&str>) -> anyhow::Result<String> {
+    hidden(question, existing, |_| "set".to_string(), read_raw_line)
+}
+
+fn hidden(
+    question: &str,
+    existing: Option<&str>,
+    shown: fn(&str) -> String,
+    read: fn() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
     let existing = existing.filter(|s| !s.is_empty());
     loop {
-        if let Some(current) = existing {
-            show(&format!("{question} [Enter keeps the current one, {}]: ", mask(current)))?;
-        } else {
-            show(&format!("{question}: "))?;
-        }
+        // Echo goes off before the question shows, so nothing typed early is echoed.
         let answer = {
             let _echo = EchoOff::new();
-            read_line()
+            if let Some(current) = existing {
+                show(&format!("{question} [Enter keeps the current one, {}]: ", shown(current)))?;
+            } else {
+                show(&format!("{question}: "))?;
+            }
+            read()
         };
         // The user's Enter was not echoed.
         println!();
@@ -130,5 +155,15 @@ impl Drop for EchoOff {
         if self.active {
             let _ = Command::new("stty").arg("echo").stderr(Stdio::null()).status();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_raw_line_loses_only_its_line_ending() {
+        assert_eq!(super::without_line_end(" two  spaces \r\n"), " two  spaces ");
+        assert_eq!(super::without_line_end(" pass \n"), " pass ");
+        assert_eq!(super::without_line_end("no newline"), "no newline");
     }
 }

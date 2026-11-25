@@ -86,6 +86,22 @@ impl<V: Clone> Cache<V> {
     }
 }
 
+/// "Forgot password?" requests the whole server takes per minute.
+const FORGOT_BUDGET_PER_MIN: u32 = 60;
+
+/// Mailed invites and sign-in resets one admin may send per minute (and
+/// resets per account they go to)…
+const MAIL_USER_PER_MIN: u32 = 10;
+/// …and confirmation links one user may have sent to new addresses (any
+/// address: kept low so the server is no relay).
+const ADDRESS_CHANGES_PER_MIN: u32 = 3;
+/// …and per hour (a sustained budget, shown to the user as "too many")…
+const ADDRESS_CHANGES_PER_HOUR: u32 = 10;
+/// …and confirmation mails any one address gets per hour, whoever asks
+/// (over it the request is answered as usual but nothing is mailed, so
+/// members cannot flood someone else's mailbox, alone or together).
+const CONFIRMATIONS_PER_ADDRESS_PER_HOUR: u32 = 3;
+
 /// Rate limiters and keys of the web UI.
 pub struct UiState {
     pub keys: Option<crate::seal::Keys>,
@@ -101,6 +117,23 @@ pub struct UiState {
     /// Device user-code lookups, per user (they are guessable only by brute force).
     pub device_lookup: Limiter<String>,
     pub device_code_limiter: RateLimiter,
+    /// "Forgot password?" per IP, and per name or address asked for.
+    pub forgot_ip: RateLimiter,
+    pub forgot_login: Limiter<String>,
+    /// "Forgot password?" requests server-wide, counted before any lookup
+    /// (whatever they ask for, so being refused says nothing about accounts).
+    pub forgot_budget: Limiter<()>,
+    /// Mailed invites and resets per admin (and per account a reset goes to).
+    pub mail_user: Limiter<String>,
+    /// Address confirmation mails per user.
+    pub address_change: Limiter<String>,
+    pub address_change_hourly: Limiter<String>,
+    /// Address confirmation mails per recipient address (lowercase).
+    pub confirmations_to: Limiter<String>,
+    /// Outgoing mail for the UI's flows; `None` when mail is off (see `Config::mail_enabled`).
+    pub mail: Option<Arc<crate::mail::Mailer>>,
+    /// The config file `serve` was started with (for the commands the UI shows).
+    pub config_path: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 impl UiState {
@@ -114,6 +147,15 @@ impl UiState {
             reauth: Limiter::new(per_min),
             device_lookup: Limiter::new(per_min),
             device_code_limiter: RateLimiter::new(per_min),
+            forgot_ip: RateLimiter::new(per_min),
+            forgot_login: Limiter::new(per_min),
+            forgot_budget: Limiter::new(FORGOT_BUDGET_PER_MIN),
+            mail_user: Limiter::new(MAIL_USER_PER_MIN),
+            address_change: Limiter::new(ADDRESS_CHANGES_PER_MIN),
+            address_change_hourly: Limiter::per_hour(ADDRESS_CHANGES_PER_HOUR),
+            confirmations_to: Limiter::per_hour(CONFIRMATIONS_PER_ADDRESS_PER_HOUR),
+            mail: crate::mail::Mailer::from_config(config),
+            config_path: std::sync::OnceLock::new(),
         }
     }
 }

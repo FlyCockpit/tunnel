@@ -213,10 +213,14 @@ covering every listed name into the data directory's `certs/`; the server
 reloads replacements within a minute, never issues or renews one itself, and
 warns in its log when the certificate needs replacing. A first setup with the
 web UI ends by printing the one-time link that creates the owner account.
+With a web UI, setup also offers an optional email step (skipped unless you
+say yes; see [Email](#email-optional)); scripted installs pass `--smtp-host`,
+`--smtp-port`, `--smtp-user`, `--smtp-from` and `--smtp-test-to`, with the
+password in `$SMTP_PASS`.
 
 ## Configuration
 
-The server configuration lives in `/etc/tunnel-server/config.toml` (rootless installs: `$XDG_CONFIG_HOME/tunnel-server/config.toml`, default `~/.config/tunnel-server/config.toml`; the data directory is `$XDG_DATA_HOME/tunnel`, default `~/.local/share/tunnel`). It holds the host, the DNS provider token, `frame_ancestors`, the `[webrtc]` section and limits. The admin token is stored hashed. The server needs TCP 443 and 80, and with WebRTC also UDP/TCP 3478 and UDP 49160–49999 by default.
+The server configuration lives in `/etc/tunnel-server/config.toml` (rootless installs: `$XDG_CONFIG_HOME/tunnel-server/config.toml`, default `~/.config/tunnel-server/config.toml`; the data directory is `$XDG_DATA_HOME/tunnel`, default `~/.local/share/tunnel`). It holds the host, the DNS provider token, `frame_ancestors`, the `[webrtc]` section, limits and the optional `[smtp]` mail settings (with the mail server password). The admin token is stored hashed. The server needs TCP 443 and 80, and with WebRTC also UDP/TCP 3478 and UDP 49160–49999 by default.
 
 Every HTTPS response carries `Strict-Transport-Security: max-age=31536000`
 (without `includeSubDomains`, so other subdomains of the domain you use are
@@ -305,8 +309,9 @@ a machine.
 `tunnel-server user list` lists accounts; from the server's shell,
 `user invite [--role member|admin] [--hours N]` prints an invite link (as the
 owner would make one) and `user delete <name>` removes an account other than
-the owner, with its sessions and machines. There is no open sign-up, no email
-and no SSO.
+the owner, with its sessions and machines. There is no open sign-up and no
+SSO; email is optional (see [Email](#email-optional)): without it, every
+link is copied and handed over as above.
 
 **Limits.** Every account has four limits: live tunnels across all its
 machines, machines, the longest tunnel lifetime, and monthly traffic. In the
@@ -374,6 +379,65 @@ letters, digits, `.`, `_` or `-`; not only dots, and not `enroll`.
 **Services** (`tnsvc_`, below) are not accounts: platforms such as a sandbox
 service keep their own quota, and account limits never apply to them.
 
+### Email (optional)
+
+Everything works without email. With an SMTP server the web UI can also mail
+invites, password resets and security notices. Set it up when installing
+(`setup` asks; the default is no) or later on a running server:
+
+```sh
+sudo tunnel-server mail setup            # asks, sends a test mail, saves, restarts
+sudo tunnel-server mail test you@example.com
+sudo tunnel-server mail off
+```
+
+`mail setup` asks for the server, port, user, password (not echoed) and
+sender, then sends a test mail and reports each step. Scripted, e.g. with
+Amazon SES (any provider's SMTP relay works the same way):
+
+```sh
+IFS= read -rs SMTP_PASS && export SMTP_PASS   # the SMTP password, as typed, not echoed or kept in history
+sudo -E tunnel-server mail setup --yes \
+  --smtp-host email-smtp.eu-west-1.amazonaws.com --smtp-port 587 \
+  --smtp-user '<SMTP user name>' --smtp-from 'Tunnel <tunnel@example.com>' \
+  --smtp-test-to you@example.com
+```
+
+The settings land in `config.toml` (`[smtp]`: `host`, `port`, `user`, `pass`,
+`from`), which is root-only or 0600 like the DNS token. The password comes
+from `$SMTP_PASS` or the prompt, never a command-line flag. Port 465 is TLS
+from the start; any other port (587 by default) must offer STARTTLS, and mail
+is never sent unencrypted over the network (a relay on `localhost` or a
+loopback address may be plain). A failed test names the step: DNS lookup,
+connect, TLS, greeting, sign-in, sender, recipient or message. The Status
+page and `tunnel-server status` show whether mail is on.
+
+With mail on:
+
+- **Invites** can be mailed (the link is still shown); signing up with a mailed
+  link confirms that address for the account.
+- **Account → Email**: add or change your address (current password; a fresh
+  code with two-factor sign-in); it changes when you open the confirmation
+  link mailed to it (an hour), and the old address is told.
+- **Forgot password?** on the sign-in page mails a link (30 minutes, single
+  use) to the account's confirmed address. The answer is the same, and as
+  fast, whether or not the account or address exists, and it is limited per
+  address, per account (one mail per two minutes) and server-wide (60
+  requests a minute, counted before anything is looked up). The link
+  stops working when the account's sign-in or address changes. With
+  two-factor sign-in on, the page also asks for a code or recovery code, and
+  the reset keeps two-factor sign-in on: an email address is never a second
+  factor. A lost authenticator still needs an admin's **Reset sign-in**,
+  which can now also be mailed.
+- **Security notices** go to the confirmed address when the password changes
+  or is reset, two-factor sign-in is turned on or off, a machine is added or
+  approved, the role changes, or the address changes.
+
+Links point only to `ui_host`, never to the address a request came from.
+Mails never contain TOTP secrets, recovery codes or machine tokens. Mails go
+out in the background a few at a time, give up after 60 seconds and are not
+retried. Email addresses are personal data: backups contain them.
+
 ### WebRTC
 
 `setup --webrtc true` turns on the built-in STUN/TURN relay (no coturn,
@@ -400,6 +464,7 @@ TURN connections are closed if they do not authenticate promptly.
 
 Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
 `cert renew [--force]`, `admin link`, `user list | invite [--role member|admin] [--hours N] | reset <name> [--hours N] | delete <name>`,
+`mail setup | test <address> | off`,
 `client add <name> [--user <name>] | list | rename <name> <new-name> | delete <name>`, and
 `service add <name> --max-tunnels <n> | list | set <name> --max-tunnels <n> | rotate <name> | delete <name>`
 (root only for a root install).

@@ -3,7 +3,8 @@
 
 use leptos::prelude::*;
 
-use crate::{ctx, navigate};
+use crate::api::ApiError;
+use crate::{ctx, navigate, refresh_session};
 
 /// `<a>` that navigates without a reload.
 #[component]
@@ -253,4 +254,26 @@ pub fn relative(unix: i64) -> String {
         format!("{} d", a / 86_400)
     };
     if d >= 0 { format!("in {span}") } else { format!("{span} ago") }
+}
+
+/// Run `fut`, storing its error message in `error`.
+pub fn run<F>(error: RwSignal<Option<String>>, busy: RwSignal<bool>, fut: F)
+where
+    F: std::future::Future<Output = Result<(), ApiError>> + 'static,
+{
+    busy.set(true);
+    error.set(None);
+    leptos::task::spawn_local(async move {
+        if let Err(e) = fut.await {
+            if e.status == 401 && e.code == "signed_out" {
+                refresh_session().await;
+            }
+            error.set(Some(e.message.clone()));
+        }
+        busy.set(false);
+    });
+}
+
+pub fn value(ev: &leptos::ev::Event) -> String {
+    event_target_value(ev)
 }

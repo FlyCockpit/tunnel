@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod dns;
 pub mod mode;
+pub mod smtp;
 
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/tunnel";
 pub const SERVICE_USER: &str = "tunnel-server";
@@ -70,6 +71,9 @@ pub struct Config {
     pub webrtc: WebrtcConfig,
     #[serde(default)]
     pub limits: Limits,
+    /// Outgoing mail (invites, password resets, notices). Unset: no mail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp: Option<smtp::SmtpConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -272,11 +276,72 @@ fn default_login_rate() -> u32 {
     10
 }
 
+/// Parse a config, with errors that never carry a value from the file: a
+/// TOML error quotes the offending line and serde quotes the value it got,
+/// and either may be a secret (the SMTP password, the TURN secret) that would
+/// end up in the journal. The error names the line, the key on it and what
+/// was expected (text from this program, not from the file).
+fn parse(raw: &str) -> anyhow::Result<Config> {
+    toml::from_str(raw).map_err(|e| {
+        let Some(span) = e.span() else {
+            return anyhow::anyhow!("{}", describe(e.message()));
+        };
+        let before = &raw[..span.start.min(raw.len())];
+        let line = before.matches('\n').count() + 1;
+        let key = raw
+            .lines()
+            .nth(line - 1)
+            .and_then(|l| l.split_once('='))
+            .map(|(k, _)| k.trim())
+            .filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)));
+        match key {
+            Some(key) => anyhow::anyhow!("line {line} ({key}): {}", describe(e.message())),
+            None => anyhow::anyhow!("line {line}: {}", describe(e.message())),
+        }
+    })
+}
+
+/// What went wrong, in words that hold no value from the file: names of
+/// missing or repeated keys, or the type that was expected; otherwise only
+/// "not valid TOML here".
+fn describe(message: &str) -> String {
+    let message = message.trim();
+    let name = |rest: &str| {
+        let rest = rest.trim();
+        rest.strip_prefix('`')
+            .and_then(|r| r.strip_suffix('`'))
+            .filter(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)))
+            .map(str::to_string)
+    };
+    if let Some(field) = message.strip_prefix("missing field").and_then(name) {
+        return format!("missing key `{field}`");
+    }
+    if let Some(field) = message.strip_prefix("duplicate key").and_then(name) {
+        return format!("key `{field}` appears twice");
+    }
+    // serde: "invalid type: <what it got>, expected <a type>"; only the last part is ours.
+    if message.starts_with("invalid type") || message.starts_with("invalid value") {
+        if let Some((_, expected)) = message.rsplit_once(", expected ")
+            && !expected.contains(['"', '\'', '\n'])
+        {
+            return format!("wrong value, expected {expected}");
+        }
+        return "wrong value".into();
+    }
+    "not valid TOML here".into()
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut cfg: Self = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        let mut cfg: Self = parse(&raw).with_context(|| format!("parsing {}", path.display()))?;
         cfg.normalize_frame_ancestors();
+        if let Some(smtp) = &mut cfg.smtp
+            && let Ok(host) = smtp::parse_host(&smtp.host)
+        {
+            // As delivery uses it: trimmed, lowercased, no trailing dot.
+            smtp.host = host;
+        }
         cfg.validate().with_context(|| format!("checking {}", path.display()))?;
         Ok(cfg)
     }
@@ -287,6 +352,9 @@ impl Config {
             self.limits.member_monthly_traffic_gb.is_none_or(|gb| (1..=1_000_000).contains(&gb)),
             "limits.member_monthly_traffic_gb must be within 1..=1000000 (or unset for no cap)"
         );
+        if let Some(smtp) = &self.smtp {
+            smtp.validate().map_err(|e| anyhow::anyhow!("[smtp]: {e}"))?;
+        }
         if let Some(ui) = &self.ui_host {
             let ui = ui.to_ascii_lowercase();
             let zone = self.preview_zone.to_ascii_lowercase();
@@ -320,6 +388,20 @@ impl Config {
             }
         }
         self.frame_ancestors = sources;
+    }
+
+    /// Mail goes out: `[smtp]` is set and there is a web UI for its links.
+    pub fn mail_enabled(&self) -> bool {
+        self.smtp.is_some() && self.ui_host.is_some()
+    }
+
+    /// One line on outgoing mail, for the log and `status`.
+    pub fn mail_status(&self) -> String {
+        match (&self.smtp, &self.ui_host) {
+            (Some(s), Some(_)) => format!("on via {} from {}", s.describe(), s.from),
+            (Some(_), None) => "off: [smtp] is set but there is no web UI (ui_host) for its links".into(),
+            (None, _) => "off (links are handed over by hand; `tunnel-server mail setup` turns it on)".into(),
+        }
     }
 
     pub fn to_toml(&self) -> anyhow::Result<String> {
@@ -455,6 +537,30 @@ api_token = "public-test-placeholder"
 "#;
 
     #[test]
+    fn a_config_error_names_the_place_but_never_a_value() {
+        let secret = "real-secret-pass";
+        for (value, says) in [
+            // A stray word, a number, escaped quotes, a value that looks like serde's words, a bare word.
+            (format!("\"{secret}\" stray"), "not valid TOML here"),
+            ("1234567890".to_string(), "wrong value, expected a string"),
+            (format!("\"a\\\"b{secret}\\\"\" x"), "not valid TOML here"),
+            (format!("[\"{secret}, expected a string\"]"), "wrong value, expected a string"),
+            (secret.to_string(), "not valid TOML here"),
+        ] {
+            let raw =
+                format!("{CURRENT}[smtp]\nhost = \"smtp.example.com\"\npass = {value}\nfrom = \"t@example.com\"\n");
+            let line = raw.lines().position(|l| l.starts_with("pass = ")).unwrap() + 1;
+            let e = format!("{:#}", parse(&raw).unwrap_err());
+            assert!(!e.contains(secret) && !e.contains("1234567890") && !e.contains("stray"), "{value}: {e}");
+            assert_eq!(e, format!("line {line} (pass): {says}"), "{value}");
+        }
+        // Missing keys are named.
+        let raw = format!("{CURRENT}[smtp]\nhost = \"smtp.example.com\"\n");
+        let e = format!("{:#}", parse(&raw).unwrap_err());
+        assert!(e.ends_with("missing key `from`"), "{e}");
+    }
+
+    #[test]
     fn config_round_trip() {
         let cfg: Config = toml::from_str(CURRENT).unwrap();
         let written = cfg.to_toml().unwrap();
@@ -477,6 +583,18 @@ api_token = "public-test-placeholder"
         assert!(!limits.allow_public_for_clients);
         let limits: Limits = toml::from_str("allow_public_for_clients = true").unwrap();
         assert!(limits.allow_public_for_clients);
+    }
+
+    #[test]
+    fn config_load_normalizes_the_mail_host() {
+        let dir =
+            std::env::temp_dir().join(format!("tunnel-config-smtp-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let raw = format!("{CURRENT}\n[smtp]\nhost = \" Mail.Example.COM. \"\nfrom = \"t@example.com\"\n");
+        std::fs::write(&path, raw).unwrap();
+        assert_eq!(Config::load(&path).unwrap().smtp.unwrap().host, "mail.example.com");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

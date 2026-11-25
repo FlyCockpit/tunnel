@@ -19,6 +19,8 @@ pub type RateLimiter = Limiter<IpAddr>;
 
 pub struct Limiter<K> {
     per_min: u32,
+    /// How long one budget lasts (a minute unless made with `per_hour`).
+    window: Duration,
     windows: Mutex<Windows<K>>,
 }
 
@@ -37,7 +39,16 @@ impl RateLimiter {
 impl<K: Hash + Eq> Limiter<K> {
     /// `per_min == 0` disables limiting.
     pub fn new(per_min: u32) -> Self {
-        Self { per_min, windows: Mutex::new(Windows { map: HashMap::new(), last_prune: Instant::now() }) }
+        Self {
+            per_min,
+            window: WINDOW,
+            windows: Mutex::new(Windows { map: HashMap::new(), last_prune: Instant::now() }),
+        }
+    }
+
+    /// At most `per_hour` per key in an hour (sustained budgets, e.g. mail to one address).
+    pub fn per_hour(per_hour: u32) -> Self {
+        Self { window: Duration::from_secs(3600), ..Self::new(per_hour) }
     }
 
     /// Count one attempt for `key`; `false` if it exceeds the per-minute budget.
@@ -49,14 +60,14 @@ impl<K: Hash + Eq> Limiter<K> {
         let mut guard = self.windows.lock().expect("ratelimit lock");
         let w = &mut *guard;
         if w.map.len() > PRUNE_ABOVE && now.duration_since(w.last_prune) >= PRUNE_EVERY {
-            w.map.retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
+            w.map.retain(|_, (start, _)| now.duration_since(*start) < self.window);
             w.last_prune = now;
         }
         if w.map.len() >= MAX_TRACKED && !w.map.contains_key(&key) {
             return false;
         }
         let entry = w.map.entry(key).or_insert((now, 0));
-        if now.duration_since(entry.0) >= WINDOW {
+        if now.duration_since(entry.0) >= self.window {
             *entry = (now, 0);
         }
         if entry.1 >= self.per_min {
@@ -92,6 +103,14 @@ mod tests {
         assert!(rl.check(ip));
         assert!(!rl.check(ip));
         assert!(rl.check("203.0.113.6".parse().unwrap()));
+    }
+
+    #[test]
+    fn an_hourly_budget_outlasts_a_minute() {
+        let rl = Limiter::<&str>::per_hour(1);
+        assert!(rl.check_key("a"));
+        assert!(!rl.check_key("a"));
+        assert_eq!(rl.window, Duration::from_secs(3600));
     }
 
     #[test]

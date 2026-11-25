@@ -4,6 +4,7 @@
 //! binary; it talks only to `/ui/api/*` on its own origin.
 
 mod api;
+mod email;
 mod limits;
 mod pages;
 mod types;

@@ -6,6 +6,8 @@ accepted = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
     "Zlib",
+    # quoted_printable (via lettre, the optional SMTP mail); as in skywrite.
+    "0BSD",
 ]
 targets = [
     "x86_64-unknown-linux-musl",

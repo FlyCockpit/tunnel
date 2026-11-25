@@ -94,15 +94,19 @@ pub(super) async fn create_client(
     }
     .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "no_user", "no such user"))?;
     match clients::add(&state.db, &state.config, &req.name, &user_id, None).await {
-        Ok(e) => Ok((
-            StatusCode::CREATED,
-            Json(CreateClientResponse {
-                name: e.name,
-                login_code: e.login_code,
-                login_command: e.login_command,
-                expires_at: e.expires_at,
-            }),
-        )),
+        Ok(e) => {
+            // The account's owner hears of it, as when it is added in the web UI.
+            crate::ui::notify_user(&state, &user_id, crate::mail::Notice::MachineAdded(e.name.clone()), None).await;
+            Ok((
+                StatusCode::CREATED,
+                Json(CreateClientResponse {
+                    name: e.name,
+                    login_code: e.login_code,
+                    login_command: e.login_command,
+                    expires_at: e.expires_at,
+                }),
+            ))
+        }
         Err(clients::AddError::Invalid(m)) => Err(ApiError::validation(m)),
         Err(clients::AddError::Taken) => {
             Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a client with this name exists; delete it first"))

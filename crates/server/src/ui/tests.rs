@@ -131,6 +131,7 @@ async fn invite_token(state: &Arc<AppState>, kind: InviteKind, role: Role) -> St
             None,
             None,
             now() + 600,
+            None,
         )
         .await
         .unwrap();
@@ -241,6 +242,7 @@ async fn owner_setup_link_is_single_use_and_signs_in() {
             None,
             None,
             now() - 1,
+            None,
         )
         .await
         .unwrap();
@@ -1202,6 +1204,7 @@ async fn admin_changes_are_authorized_inside_the_transaction() {
             Some(olivia.clone()),
             Some(session.clone()),
             now() + 600,
+            None,
         )
         .await
         .unwrap();
@@ -1932,3 +1935,6 @@ mod limit_tests;
 
 #[path = "reset_tests.rs"]
 mod reset_tests;
+
+#[path = "email_tests.rs"]
+mod email_tests;

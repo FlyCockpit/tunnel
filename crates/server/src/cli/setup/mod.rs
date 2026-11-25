@@ -14,6 +14,7 @@
 //! (see `crate::config::mode`).
 
 mod firewall;
+pub mod mail;
 mod os;
 mod prompt;
 mod systemd;
@@ -96,6 +97,8 @@ pub struct SetupArgs {
     /// Skip the HTTPS checks against the running service.
     #[arg(long)]
     pub skip_self_test: bool,
+    #[command(flatten)]
+    pub smtp: mail::SmtpArgs,
 }
 
 const DNS_POLL: Duration = Duration::from_secs(10);
@@ -677,6 +680,10 @@ async fn ask_config(ask: &Ask, existing: Option<&Config>, args: &SetupArgs, mode
     // 5. WebRTC.
     cfg.webrtc.enabled = ask.bool(args.webrtc, "Enable WebRTC (built-in STUN/TURN relay)?", cfg.webrtc.enabled)?;
 
+    // 6. Email (optional; skipped unless asked for).
+    cfg.smtp =
+        mail::ask_smtp(ask.yes, cfg.smtp.as_ref(), &args.smtp, cfg.ui_host.as_deref(), &cfg.acme.email, false).await?;
+
     if !manual_dns {
         check_names(&cfg)?;
     }
@@ -860,6 +867,7 @@ fn layout(cfg: &Config) -> Layout {
         cfg.frame_ancestors.join(", ")
     };
     rows.push(("Iframe parents", parents));
+    rows.push(("Email", if cfg.mail_enabled() { cfg.mail_status() } else { "off".into() }));
     rows
 }
 
@@ -1383,6 +1391,7 @@ fn finish(cfg: &Config, mode: Mode, new_token: Option<&str>) {
     println!("  API             https://{}", cfg.api_host);
     println!("  Sandbox server  TUNNEL_SERVER=wss://{}", cfg.tunnel_host);
     println!("  Previews        https://{{port}}-{{id}}.{}", cfg.preview_zone);
+    println!("  Email           {}", cfg.mail_status());
     println!("  Logs            {}", mode.journal_hint());
     println!();
     match new_token {

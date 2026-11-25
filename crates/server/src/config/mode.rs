@@ -99,6 +99,15 @@ impl Mode {
         self.systemctl().args(args).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
     }
 
+    /// Whether systemd knows `unit` (it is installed), whatever its state.
+    pub fn unit_loaded(self, unit: &str) -> bool {
+        self.systemctl()
+            .args(["show", "--property=LoadState", "--value", unit])
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "loaded")
+    }
+
     /// `systemctl is-active` prints the state even when it exits non-zero.
     pub fn service_state(self, unit: &str) -> String {
         match self.systemctl().args(["is-active", unit]).output() {

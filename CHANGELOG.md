@@ -67,6 +67,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   an hour by default; opening one sets a new password, turns two-factor
   sign-in off and ends the account's sessions. Void after any sign-in or role
   change of the account, or once its maker may no longer reset it; audited.
+- Optional email (`[smtp]`, lettre over rustls): `setup` offers it (flags
+  `--smtp-*`, password from `$SMTP_PASS`), `tunnel-server mail setup | test |
+  off` changes it later; failures name the step. With it: mailed invites
+  (confirming the address), a confirmed address per account (changes confirmed
+  by mail, the old address told), "Forgot password?" (same answer for every
+  input, rate limited, keeps two-factor sign-in and asks for its code), sign-in
+  resets mailed by admins, and security notices. Without it nothing changes.
 - Traffic counters per tunnel and per user and month (request/response bodies
   and WebSocket messages, counted while they flow, kept in memory and flushed
   about once a minute), shown in the web UI and the API (`bytes_in`/`bytes_out`,

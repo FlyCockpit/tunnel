@@ -5,8 +5,9 @@ use leptos::task::spawn_local;
 use serde_json::{Value, json};
 
 use crate::api::{self, ApiError};
+use crate::email::{AddressCard, ConfirmAddress, ForgotPassword, MailStatus};
 use crate::types::*;
-use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, relative, traffic_text, when};
+use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, relative, run, traffic_text, value, when};
 use crate::{ctx, navigate, refresh_session};
 
 pub fn route(path: String) -> AnyView {
@@ -40,28 +41,6 @@ fn err_text(e: &ApiError) -> String {
     e.message.clone()
 }
 
-/// Run `fut`, storing its error message in `error`.
-fn run<F>(error: RwSignal<Option<String>>, busy: RwSignal<bool>, fut: F)
-where
-    F: std::future::Future<Output = Result<(), ApiError>> + 'static,
-{
-    busy.set(true);
-    error.set(None);
-    spawn_local(async move {
-        if let Err(e) = fut.await {
-            if e.status == 401 && e.code == "signed_out" {
-                refresh_session().await;
-            }
-            error.set(Some(err_text(&e)));
-        }
-        busy.set(false);
-    });
-}
-
-fn value(ev: &leptos::ev::Event) -> String {
-    event_target_value(ev)
-}
-
 // ------------------------------------------------------------------ sign in
 
 #[component]
@@ -74,6 +53,8 @@ fn SignIn() -> impl IntoView {
     let busy = RwSignal::new(false);
     let pending = move || c.session.get().is_some_and(|s| s.pending);
     let owner_missing = move || c.session.get().is_some_and(|s| !s.owner_exists);
+    let mail = move || c.session.get().is_some_and(|s| s.server.mail);
+    let forgot = RwSignal::new(false);
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let body = json!({ "username": username.get(), "password": password.get() });
@@ -99,7 +80,9 @@ fn SignIn() -> impl IntoView {
             refresh_session().await;
         });
     };
+    let back = move || forgot.set(false);
     view! {
+        <Show when=move || !forgot.get() fallback=move || view! { <ForgotPassword back=back /> }>
         <div class="narrow">
             <div class="card stack">
                 <h1>"Sign in"</h1>
@@ -124,8 +107,11 @@ fn SignIn() -> impl IntoView {
                                 <input id="password" class="input" type="password" autocomplete="current-password" required
                                     prop:value=move || password.get() on:input=move |ev| password.set(value(&ev)) />
                             </div>
-                            <div class="field">
+                            <div class="field row">
                                 <button class="btn" type="submit" disabled=move || busy.get()>"Sign in"</button>
+                                <Show when=mail>
+                                    <button class="btn btn-ghost" type="button" on:click=move |_| forgot.set(true)>"Forgot password?"</button>
+                                </Show>
                             </div>
                         </form>
                     }
@@ -145,6 +131,7 @@ fn SignIn() -> impl IntoView {
                 </Show>
             </div>
         </div>
+        </Show>
     }
 }
 
@@ -163,6 +150,7 @@ fn InvitePage() -> impl IntoView {
     let password = RwSignal::new(String::new());
     let confirm = RwSignal::new(String::new());
     let revoke = RwSignal::new(false);
+    let code = RwSignal::new(String::new());
     {
         let token = token.clone();
         run(error, busy, async move {
@@ -172,25 +160,33 @@ fn InvitePage() -> impl IntoView {
         });
     }
     let kind = move || info.get().and_then(|v| v["kind"].as_str().map(str::to_string)).unwrap_or_default();
-    let is_reset = move || matches!(kind().as_str(), "owner_reset" | "account_reset");
+    let is_reset = move || matches!(kind().as_str(), "owner_reset" | "account_reset" | "password_reset");
+    let field = move |k: &'static str| info.get().and_then(|v| v[k].as_str().map(str::to_string));
+    let needs_code = move || info.get().is_some_and(|v| v["needs_code"].as_bool() == Some(true));
     let title = move || match kind().as_str() {
         "owner_setup" => "Create the owner account".to_string(),
         "owner_reset" => "Reset the owner's password".to_string(),
-        "account_reset" => "Set a new password".to_string(),
+        "account_reset" | "password_reset" => "Set a new password".to_string(),
+        "email_verify" => "Confirm your email address".to_string(),
         _ => format!(
             "Join as {}",
             info.get().and_then(|v| v["role"].as_str().map(str::to_string)).unwrap_or_else(|| "member".into())
         ),
     };
+    // Stored, so the form's closures stay `Copy` inside nested views.
+    let stored_token = StoredValue::new(token.clone());
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         if password.get() != confirm.get() {
             error.set(Some("The passwords do not match.".into()));
             return;
         }
-        let mut body = json!({ "token": token.clone(), "password": password.get() });
+        let mut body = json!({ "token": stored_token.get_value(), "password": password.get() });
         if is_reset() {
             body["revoke_machines"] = json!(revoke.get());
+            if needs_code() {
+                body["code"] = json!(code.get());
+            }
         } else {
             body["username"] = json!(username.get());
         }
@@ -213,7 +209,10 @@ fn InvitePage() -> impl IntoView {
                 <Show when=move || info.get().is_some() fallback=move || view! {
                     <Show when=move || error.get().is_none()><p class="muted">"Checking the link…"</p></Show>
                 }>
-                    <form on:submit=submit.clone()>
+                    <Show when=move || kind() != "email_verify" fallback=move || view! {
+                        <ConfirmAddress token=stored_token.get_value() info=info.get().unwrap_or_default() />
+                    }>
+                    <form on:submit=submit>
                         <Show when=is_reset fallback=move || view! {
                             <div class="field">
                                 <label for="new-username">"Username"</label>
@@ -221,11 +220,25 @@ fn InvitePage() -> impl IntoView {
                                     prop:value=move || username.get() on:input=move |ev| username.set(value(&ev)) />
                                 <p class="muted small">"Letters, digits, '.', '_' and '-'."</p>
                             </div>
+                            {move || field("email").map(|e| view! {
+                                <p class="muted small">{format!("Signing up confirms {e} as your account's email address.")}</p>
+                            })}
                         }>
                             <p class="muted">
-                                "Signing in as " <strong>{move || info.get().and_then(|v| v["username"].as_str().map(str::to_string)).unwrap_or_default()}</strong>
-                                ". Two-factor sign-in and the recovery codes are turned off and every session of this account ends; turn two-factor sign-in on again afterwards."
+                                "Signing in as " <strong>{move || field("username").unwrap_or_default()}</strong>
+                                {move || if kind() == "password_reset" {
+                                    ". Every session of this account ends. Two-factor sign-in stays as it is."
+                                } else {
+                                    ". Two-factor sign-in and the recovery codes are turned off and every session of this account ends; turn two-factor sign-in on again afterwards."
+                                }}
                             </p>
+                            <Show when=needs_code>
+                                <div class="field">
+                                    <label for="reset-code">"Code from your authenticator app (or a recovery code)"</label>
+                                    <input id="reset-code" class="input code-input" autocomplete="one-time-code" inputmode="text" required
+                                        prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
+                                </div>
+                            </Show>
                             <label class="check">
                                 <input type="checkbox" prop:checked=move || revoke.get() on:change=move |ev| revoke.set(event_target_checked(&ev)) />
                                 {move || if kind() == "owner_reset" {
@@ -248,6 +261,7 @@ fn InvitePage() -> impl IntoView {
                         </div>
                         <div class="field"><button class="btn" type="submit" disabled=move || busy.get()>"Continue"</button></div>
                     </form>
+                    </Show>
                 </Show>
             </div>
         </div>
@@ -1231,6 +1245,7 @@ fn Account() -> impl IntoView {
                     <p class="muted small">"Counts what your tunnels relay in both directions (request and response bodies, WebSocket messages)."</p>
                 </div>
             })}
+            <Show when=move || c.session.get().is_some_and(|s| s.server.mail)><AddressCard /></Show>
             <div class="grid2">
                 <form class="card stack" on:submit=change_password>
                     <h2>"Password"</h2>
@@ -1330,7 +1345,10 @@ fn Users(me: User) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let role = RwSignal::new("member".to_string());
+    let invite_email = RwSignal::new(String::new());
+    let mail = ctx().session.get_untracked().is_some_and(|s| s.server.mail);
     let new_url = RwSignal::new(None::<String>);
+    let mailed_to = RwSignal::new(None::<String>);
     let month = RwSignal::new(String::new());
     // Open reset panels and the links made in them, by user id: kept outside
     // the rows, which every reload renders anew.
@@ -1352,10 +1370,16 @@ fn Users(me: User) -> impl IntoView {
     load();
     let invite = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
-        let body = json!({ "role": role.get() });
+        let to = invite_email.get().trim().to_string();
+        let mut body = json!({ "role": role.get() });
+        if !to.is_empty() {
+            body["email"] = json!(to);
+        }
         run(error, busy, async move {
             let v = api::post::<Value>("/ui/api/invites", &body).await?;
             new_url.set(v["url"].as_str().map(str::to_string));
+            mailed_to.set((v["mailed"].as_bool() == Some(true)).then_some(to));
+            invite_email.set(String::new());
             load();
             Ok(())
         });
@@ -1398,10 +1422,18 @@ fn Users(me: User) -> impl IntoView {
                         <option value="member">"Member"</option>
                         {owner.then(|| view! { <option value="admin">"Admin"</option> })}
                     </select>
+                    {mail.then(|| view! {
+                        <label class="sr-only" for="invite-email">"Email (optional)"</label>
+                        <input id="invite-email" class="input w-auto" type="email" placeholder="Email (optional)" maxlength="254"
+                            prop:value=move || invite_email.get() on:input=move |ev| invite_email.set(value(&ev)) />
+                    })}
                     <button class="btn" type="submit" disabled=move || busy.get()>"Create invite link"</button>
                 </div>
                 {move || new_url.get().map(|u| view! {
-                    <p class="small">"Send this link to the person you invite; it works once, for 7 days."</p>
+                    <p class="small">{match mailed_to.get() {
+                        Some(to) => format!("Mailed to {to}; signing up with it confirms the address. You can also copy the link; it works once, for 7 days."),
+                        None => "Send this link to the person you invite; it works once, for 7 days.".to_string(),
+                    }}</p>
                     <Copy value=Signal::derive(move || u.clone()) label="Invite link" />
                 })}
             </form>
@@ -1421,13 +1453,15 @@ fn Users(me: User) -> impl IntoView {
                         let limited = cap.is_some_and(|c| row.traffic_bytes >= c);
                         let editing = RwSignal::new(false);
                         let (reset_id, reset_name, name2, id7) = (u.id.clone(), u.username.clone(), u.username.clone(), u.id.clone());
+                        let reset_email = u.email.clone().filter(|_| mail);
                         let resetting = Memo::new({ let id = u.id.clone(); move |_| resets.with(|r| r.contains_key(&id)) });
                         let can_public = u.can_public;
                         let disabled = u.disabled;
                         let is_admin = u.role == "admin";
                         let limits = u.limits.clone();
                         view! { <tr>
-                            <td class="cell-main"><span class="name">{u.username.clone()}</span>{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}</td>
+                            <td class="cell-main"><span class="name">{u.username.clone()}</span>{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}
+                                {u.email.clone().map(|e| view! { <div class="muted small break">{e}</div> })}</td>
                             <td data-label="Role">{u.role.clone()}</td>
                             <td data-label="Machines">{used_of(row.clients.max(0) as u64, u.limits.machines.effective)}</td>
                             <td data-label="Tunnels">{used_of(row.tunnels.max(0) as u64, u.limits.tunnels.effective)}
@@ -1478,7 +1512,7 @@ fn Users(me: User) -> impl IntoView {
                         })}
                         {move || resetting.get().then(|| view! {
                             <tr class="panel-row"><td colspan="8" class="links-panel">
-                                <ResetPanel id=reset_id.clone() username=reset_name.clone() resets=resets reload=load />
+                                <ResetPanel id=reset_id.clone() username=reset_name.clone() email=reset_email.clone() resets=resets reload=load />
                             </td></tr>
                         })}
                         }
@@ -1505,7 +1539,7 @@ fn Users(me: User) -> impl IntoView {
                                 format!("sign-in reset for {}", i.user.clone().unwrap_or_default())
                             } else {
                                 format!("{} invite", i.role)
-                            }}</td>
+                            }}{i.email.clone().map(|e| view! { <div class="muted small break">{format!("for {e}")}</div> })}</td>
                             <td data-label="By">{i.created_by.clone().unwrap_or_else(|| "—".into())}</td>
                             <td data-label="Created">{relative(i.created_at)}</td>
                             <td data-label="Status">{status}</td>
@@ -1545,6 +1579,8 @@ fn Users(me: User) -> impl IntoView {
 fn ResetPanel<F>(
     id: String,
     username: String,
+    /// The account's confirmed address, when the server sends mail.
+    email: Option<String>,
     resets: RwSignal<std::collections::HashMap<String, Option<String>>>,
     reload: F,
 ) -> impl IntoView
@@ -1556,6 +1592,9 @@ where
     let needs_code = RwSignal::new(false);
     let code = RwSignal::new(String::new());
     let code_id = format!("reset-code-{id}");
+    let send = RwSignal::new(email.is_some());
+    let mailed = RwSignal::new(None::<String>);
+    let email2 = email.clone();
     let url = Memo::new({
         let id = id.clone();
         move |_| resets.with(|r| r.get(&id).cloned().flatten())
@@ -1574,6 +1613,10 @@ where
         if needs_code.get_untracked() {
             body["code"] = json!(code.get_untracked());
         }
+        let to = email.clone().filter(|_| send.get_untracked());
+        if to.is_some() {
+            body["send_email"] = json!(true);
+        }
         let path = format!("/ui/api/users/{id}/reset");
         let id = id.clone();
         busy.set(true);
@@ -1582,6 +1625,7 @@ where
             match api::post::<Value>(&path, &body).await {
                 Ok(v) => {
                     let made = v["url"].as_str().map(str::to_string);
+                    mailed.set(to.filter(|_| v["mailed"].as_bool() == Some(true)));
                     resets.update(|r| {
                         r.insert(id, made);
                     });
@@ -1604,7 +1648,10 @@ where
             <ErrorBox error=error />
             {move || match url.get() {
                 Some(u) => view! {
-                    <p class="small">{format!("Send this link to {name1}; it works once, within an hour, and is a credential.")}</p>
+                    <p class="small">{match mailed.get() {
+                        Some(to) => format!("Mailed to {to}. You can also hand it over: it works once, within an hour, and is a credential."),
+                        None => format!("Send this link to {name1}; it works once, within an hour, and is a credential."),
+                    }}</p>
                     <Copy value=Signal::derive(move || u.clone()) label="Reset link" />
                     <div><button class="btn btn-outline btn-sm" type="button" on:click={
                         let close = close.clone();
@@ -1618,6 +1665,12 @@ where
                             <p class="small">{format!(
                                 "A single-use link lets {name2} choose a new password. Their two-factor sign-in and recovery codes are turned off and all their sessions end; their machines stay unless they choose otherwise. It works for one hour; hand it over as you would an invite."
                             )}</p>
+                            {email2.clone().map(|e| view! {
+                                <label class="check">
+                                    <input type="checkbox" prop:checked=move || send.get() on:change=move |ev| send.set(event_target_checked(&ev)) />
+                                    {format!("Also mail it to {e}")}
+                                </label>
+                            })}
                             {move || needs_code.get().then(|| {
                                 let code_id = code_id.clone();
                                 view! {
@@ -1709,6 +1762,7 @@ fn Status() -> impl IntoView {
                     </table>
                 </div>
             </div>
+            <MailStatus status=status />
             <div class="card card-tight table-wrap">
                 <h2 class="card-head">"Audit log"</h2>
                 <table class="table table-stack">
