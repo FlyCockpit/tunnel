@@ -1,0 +1,14 @@
+# Existing architectural debt suppressed by `deslop-please --allow`.
+# Fixing an entry here never fails CI; new issues not listed here fail.
+field-leak tunnel_server::state::AppState::access_limiter
+field-leak tunnel_server::state::AppState::certs
+field-leak tunnel_server::state::AppState::config
+field-leak tunnel_server::state::AppState::db
+field-leak tunnel_server::state::AppState::metrics
+field-leak tunnel_server::state::AppState::registry
+field-leak tunnel_server::state::AppState::traffic
+field-leak tunnel_server::state::AppState::ui
+field-leak tunnel_server::turn_relay::StreamConn::closed
+field-leak tunnel_server::turn_relay::StreamConn::reader
+field-leak tunnel_server::turn_relay::StreamConn::writer
+wide-directory crates/server/src/
