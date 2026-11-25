@@ -7,13 +7,15 @@ use std::time::Duration;
 use anyhow::Context;
 use tunnel_protocol::{ADMIN_TOKEN_PREFIX, CloseReason};
 
+use crate::config::mode::{self, Mode};
 use crate::config::{Config, SERVICE_NAME, SERVICE_USER};
 use crate::db::Db;
-use crate::mode::{self, Mode};
 use crate::state::AppState;
 use crate::tls::{self, CertStatus};
 use crate::tokens;
-use crate::{acme, listener, metrics, purge};
+use crate::{jobs::acme, jobs::purge, listener, metrics};
+
+pub mod setup;
 
 const HEALTH_TOKEN_PREFIX: &str = "tnhlt_";
 

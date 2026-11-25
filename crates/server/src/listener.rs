@@ -19,7 +19,7 @@ use tunnel_protocol::CONNECT_PATH;
 use crate::sni::{self, SniPeek};
 use crate::state::AppState;
 use crate::util::{Body, BoxError, empty, request_host, text_response};
-use crate::{api, control, edge, gatehost, pages, tls};
+use crate::{api, control, edge, edge::gatehost, edge::pages, tls};
 
 const SNI_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

@@ -24,11 +24,11 @@ use tunnel_protocol::mux::Stream as StreamHandle;
 use tunnel_protocol::{STREAM_OK, STREAM_REFUSED, encode_preamble};
 
 use crate::db::{HostHeaderMode, TunnelRow};
-use crate::gate::{Rechecking, Side};
-use crate::headers::{self, ResponseCtx};
+use crate::edge::gate::{Rechecking, Side};
+use crate::edge::headers::{self, ResponseCtx};
+use crate::edge::inject::{self, Injector};
+use crate::edge::pages;
 use crate::ice;
-use crate::inject::{self, Injector};
-use crate::pages;
 use crate::pool::OriginConn;
 use crate::registry::LiveTunnel;
 use crate::state::AppState;
@@ -69,7 +69,7 @@ enum WsKind {
 /// The stream slot is released when hyper drops the response body, as for
 /// any slow visitor.
 ///
-/// [`gate::watch`]: crate::gate::watch
+/// [`gate::watch`]: crate::edge::gate::watch
 #[allow(clippy::too_many_arguments)]
 pub async fn forward(
     state: &Arc<AppState>,
@@ -80,7 +80,7 @@ pub async fn forward(
     cookie: Option<HeaderValue>,
     peer: SocketAddr,
     session_subject: Option<String>,
-    authorization: Option<crate::gate::Authorization>,
+    authorization: Option<crate::edge::gate::Authorization>,
     bytes: Arc<TunnelBytes>,
 ) -> Response<Body> {
     let cfg = &state.config;
@@ -681,7 +681,7 @@ impl Exchange {
         self: Arc<Self>,
         state: &Arc<AppState>,
         tunnel_id: &str,
-        grant: crate::gate::Authorization,
+        grant: crate::edge::gate::Authorization,
     ) -> Alive {
         let (alive, mut gone) = tokio::sync::mpsc::channel::<()>(1);
         // Before the task first runs, so a rotation right now already pauses.
@@ -690,7 +690,7 @@ impl Exchange {
         let tunnel_id = tunnel_id.to_string();
         tokio::spawn(async move {
             tokio::select! {
-                () = crate::gate::watch(&state, &tunnel_id, grant, &self.rechecking) => {
+                () = crate::edge::gate::watch(&state, &tunnel_id, grant, &self.rechecking) => {
                     self.lose();
                     state.metrics.access_cut();
                 }
@@ -924,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn public_watch_follows_rotated_epochs_until_access_becomes_protected() {
         use crate::db::{Access, AccessMode, TunnelPatch};
-        use crate::gate::Authorization;
+        use crate::edge::gate::Authorization;
 
         for mode in [AccessMode::Password, AccessMode::Link] {
             let state = crate::listener::tests::test_state(&[]);
@@ -959,7 +959,7 @@ mod tests {
             let rechecking = Rechecking::default();
             let watched = async {
                 tokio::select! {
-                    () = crate::gate::watch(&state, &tunnel.id, grant, &rechecking) => {}
+                    () = crate::edge::gate::watch(&state, &tunnel.id, grant, &rechecking) => {}
                     () = splice => {}
                 }
             };
@@ -1286,7 +1286,7 @@ mod tests {
             pool: Default::default(),
             token_hash: String::new(),
         }));
-        let grant = || crate::gate::Authorization {
+        let grant = || crate::edge::gate::Authorization {
             session_hash: None,
             candidates: Default::default(),
             expires_at: None,

@@ -579,7 +579,7 @@ async fn an_own_certificate_must_cover_every_name_and_is_never_issued() {
     assert!(err.contains("tunnel-ui.example.com"), "{err}");
     write(&["*.tunnel.example.com", "tunnel.example.com", "tunnel-ui.example.com"]);
     ensure_certificate(&cfg).await.unwrap();
-    assert!(crate::acme::issue(&cfg).await.unwrap_err().to_string().contains("own certificate"));
+    assert!(crate::jobs::acme::issue(&cfg).await.unwrap_err().to_string().contains("own certificate"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

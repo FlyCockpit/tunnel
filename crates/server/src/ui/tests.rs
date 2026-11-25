@@ -884,12 +884,12 @@ fn config_refuses_ui_on_the_preview_zone() {
 #[test]
 fn install_script_is_served_on_the_ui_host_only() {
     let state = state();
-    let r = crate::install::response(&state, "/install.sh", &http::Method::GET);
+    let r = crate::ui::install::response(&state, "/install.sh", &http::Method::GET);
     assert_eq!(r.status(), StatusCode::OK);
     let none = state_with(|c| {
         c.ui_host = None;
     });
-    assert_eq!(crate::install::response(&none, "/install.sh", &http::Method::GET).status(), StatusCode::NOT_FOUND);
+    assert_eq!(crate::ui::install::response(&none, "/install.sh", &http::Method::GET).status(), StatusCode::NOT_FOUND);
 }
 
 /// Turn TOTP on for `b` (signed in as `username`); returns its code source.
@@ -1517,7 +1517,7 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     assert_eq!(info.body["limits"]["traffic"]["used_bytes"], 1_000_000);
     let t2 = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
     assert_eq!((t2.status, t2.body["traffic_limited"].clone()), (StatusCode::CREATED, json!(true)));
-    let page = crate::pages::traffic_limit();
+    let page = crate::edge::pages::traffic_limit();
     assert_eq!(page.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
 

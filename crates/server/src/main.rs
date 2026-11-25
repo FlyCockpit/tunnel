@@ -1,35 +1,24 @@
 mod accounts;
-mod acme;
 mod api;
+mod cli;
 mod clients;
-mod commands;
 mod config;
 mod control;
 mod db;
-mod dns;
 mod edge;
 mod files;
-mod gate;
-mod gatehost;
-mod headers;
 mod ice;
-mod inject;
-mod install;
+mod jobs;
 mod limits;
 mod listener;
 mod metrics;
-mod mode;
-mod pages;
 mod password;
 mod pool;
-mod proxy;
-mod purge;
 mod ratelimit;
 mod registry;
 mod role;
 mod seal;
 mod services;
-mod setup;
 mod sni;
 mod state;
 mod tls;
@@ -59,7 +48,7 @@ enum Cmd {
     /// Run the server (used by the systemd unit).
     Serve,
     /// Install or reconfigure (as root: system install; as another user: rootless install).
-    Setup(Box<setup::SetupArgs>),
+    Setup(Box<cli::setup::SetupArgs>),
     /// Admin token management.
     Token {
         #[command(subcommand)]
@@ -222,45 +211,43 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = match cli.config {
         Some(p) => p,
-        None => mode::Mode::current().config_path()?,
+        None => config::mode::Mode::current().config_path()?,
     };
     match cli.cmd {
-        Cmd::Serve => commands::serve(&config).await,
-        Cmd::Setup(args) => setup::run(&config, *args).await,
-        Cmd::Token { cmd: TokenCmd::Rotate } => commands::token_rotate(&config).await,
-        Cmd::HealthToken { cmd } => commands::health_token(&config, matches!(cmd, HealthTokenCmd::Set)).await,
-        Cmd::Status => commands::status(&config).await,
-        Cmd::Backup { path } => commands::backup(&config, &path).await,
-        Cmd::Restore { path } => commands::restore(&config, &path).await,
-        Cmd::Cert { cmd: CertCmd::Renew { force } } => commands::cert_renew(&config, force).await,
-        Cmd::Admin { cmd: AdminCmd::Link } => commands::admin_link(&config, false).await,
-        Cmd::User { cmd: UserCmd::List } => commands::user_list(&config).await,
+        Cmd::Serve => cli::serve(&config).await,
+        Cmd::Setup(args) => cli::setup::run(&config, *args).await,
+        Cmd::Token { cmd: TokenCmd::Rotate } => cli::token_rotate(&config).await,
+        Cmd::HealthToken { cmd } => cli::health_token(&config, matches!(cmd, HealthTokenCmd::Set)).await,
+        Cmd::Status => cli::status(&config).await,
+        Cmd::Backup { path } => cli::backup(&config, &path).await,
+        Cmd::Restore { path } => cli::restore(&config, &path).await,
+        Cmd::Cert { cmd: CertCmd::Renew { force } } => cli::cert_renew(&config, force).await,
+        Cmd::Admin { cmd: AdminCmd::Link } => cli::admin_link(&config, false).await,
+        Cmd::User { cmd: UserCmd::List } => cli::user_list(&config).await,
         Cmd::User { cmd: UserCmd::Invite { role, hours } } => {
             let role = match role {
                 InviteRole::Member => role::Role::Member,
                 InviteRole::Admin => role::Role::Admin,
             };
-            commands::user_invite(&config, role, hours).await
+            cli::user_invite(&config, role, hours).await
         }
-        Cmd::User { cmd: UserCmd::Delete { username } } => commands::user_delete(&config, &username).await,
-        Cmd::Client { cmd: ClientCmd::Add { name, user } } => {
-            commands::client_add(&config, &name, user.as_deref()).await
-        }
-        Cmd::Client { cmd: ClientCmd::List } => commands::client_list(&config).await,
-        Cmd::Client { cmd: ClientCmd::Delete { name } } => commands::client_delete(&config, &name).await,
+        Cmd::User { cmd: UserCmd::Delete { username } } => cli::user_delete(&config, &username).await,
+        Cmd::Client { cmd: ClientCmd::Add { name, user } } => cli::client_add(&config, &name, user.as_deref()).await,
+        Cmd::Client { cmd: ClientCmd::List } => cli::client_list(&config).await,
+        Cmd::Client { cmd: ClientCmd::Delete { name } } => cli::client_delete(&config, &name).await,
         Cmd::Client { cmd: ClientCmd::Rename { name, new_name } } => {
-            commands::client_rename(&config, &name, &new_name).await
+            cli::client_rename(&config, &name, &new_name).await
         }
         Cmd::Service { cmd: ServiceCmd::Add { name, max_tunnels, token_file } } => {
-            commands::service_add(&config, &name, max_tunnels, token_file.as_deref()).await
+            cli::service_add(&config, &name, max_tunnels, token_file.as_deref()).await
         }
-        Cmd::Service { cmd: ServiceCmd::List } => commands::service_list(&config).await,
+        Cmd::Service { cmd: ServiceCmd::List } => cli::service_list(&config).await,
         Cmd::Service { cmd: ServiceCmd::Set { name, max_tunnels } } => {
-            commands::service_set(&config, &name, max_tunnels).await
+            cli::service_set(&config, &name, max_tunnels).await
         }
         Cmd::Service { cmd: ServiceCmd::Rotate { name, token_file } } => {
-            commands::service_rotate(&config, &name, token_file.as_deref()).await
+            cli::service_rotate(&config, &name, token_file.as_deref()).await
         }
-        Cmd::Service { cmd: ServiceCmd::Delete { name } } => commands::service_delete(&config, &name).await,
+        Cmd::Service { cmd: ServiceCmd::Delete { name } } => cli::service_delete(&config, &name).await,
     }
 }

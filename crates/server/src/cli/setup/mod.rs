@@ -11,7 +11,7 @@
 //! with the same answers changes nothing.
 //!
 //! Run as root for a system install; as any other user for a rootless one
-//! (see `crate::mode`).
+//! (see `crate::config::mode`).
 
 mod firewall;
 mod os;
@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use tunnel_protocol::ADMIN_TOKEN_PREFIX;
 
+use crate::config::mode::{self, Mode};
 use crate::config::{Config, DnsConfig, DnsProviderKind, SERVICE_NAME, SERVICE_USER};
-use crate::mode::{self, Mode};
-use crate::{acme, dns, tls, tokens};
+use crate::{config::dns, jobs::acme, tls, tokens};
 
 #[allow(unused_imports)] // part of the module contract; no caller outside setup yet
 #[derive(clap::Args, Debug, Default)]
@@ -137,7 +137,7 @@ pub async fn run(config_path: &Path, args: SetupArgs) -> anyhow::Result<()> {
     finish(&cfg, mode, new_token.as_deref());
     if cfg.ui_host.is_some() {
         // First run with the UI: the one-time link that creates the owner account.
-        if let Err(e) = crate::commands::admin_link(config_path, true).await {
+        if let Err(e) = crate::cli::admin_link(config_path, true).await {
             eprintln!("Could not create the owner sign-up link ({e:#}); run `tunnel-server admin link`.");
         }
     }

@@ -12,6 +12,8 @@
 //! The session cookie is `__Host-tunnel-ui` (host-only, `Secure`, `HttpOnly`,
 //! `SameSite=Strict`), never sent to preview hosts. The bearer API ignores it.
 
+pub mod install;
+
 pub mod assets;
 mod handlers;
 pub mod totp;
@@ -28,7 +30,7 @@ use tower::ServiceExt;
 
 use crate::accounts::{Session, User};
 use crate::api::{self, ApiError, PeerAddr};
-use crate::headers::UI_COOKIE;
+use crate::edge::headers::UI_COOKIE;
 use crate::state::AppState;
 use crate::tokens;
 use crate::util::{Body, full};

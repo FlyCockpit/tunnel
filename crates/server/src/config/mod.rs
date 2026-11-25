@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+pub mod dns;
+pub mod mode;
+
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/tunnel";
 pub const SERVICE_USER: &str = "tunnel-server";
 pub const SERVICE_NAME: &str = "tunnel-server";
