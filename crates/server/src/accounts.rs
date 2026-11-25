@@ -1,41 +1,13 @@
-//! Persistence for web UI accounts: users, sessions, invites, recovery codes,
+//! Accounts: users, sessions, invites, recovery codes,
 //! browser-approved machine logins and the audit log.
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Db, NewClientError, client_admissible, expire_owner_tunnels};
+use crate::db::{Db, NewClientError, authorized, client_admissible, expire_owner_tunnels};
 use crate::limits::{Kind, Setting, Settings, SettingsPatch};
+use crate::role::Role;
 use crate::tokens::now;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Owner,
-    Admin,
-    Member,
-}
-
-impl Role {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Owner => "owner",
-            Self::Admin => "admin",
-            Self::Member => "member",
-        }
-    }
-    /// Unknown values fall back to the least privileged role.
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "owner" => Self::Owner,
-            "admin" => Self::Admin,
-            _ => Self::Member,
-        }
-    }
-    pub fn is_admin(self) -> bool {
-        matches!(self, Self::Owner | Self::Admin)
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
@@ -1733,23 +1705,6 @@ impl Db {
         .await
         .unwrap();
     }
-}
-
-/// Whether `session` is a live, signed-in session of the enabled `user_id`,
-/// and (with `epoch`) the user's credentials are unchanged since then.
-pub(crate) fn authorized(
-    tx: &rusqlite::Transaction<'_>,
-    user_id: &str,
-    epoch: Option<i64>,
-    session: &str,
-) -> anyhow::Result<bool> {
-    Ok(tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM users u JOIN ui_sessions s ON s.user_id = u.id
-                        WHERE u.id = ?1 AND u.disabled_at IS NULL AND (?2 IS NULL OR u.auth_epoch = ?2)
-                          AND s.id_hash = ?3 AND s.pending = 0 AND s.expires_at > ?4)",
-        params![user_id, epoch, session, now()],
-        |r| r.get(0),
-    )?)
 }
 
 /// Insert `u` with `role`; `None` if the username is taken.

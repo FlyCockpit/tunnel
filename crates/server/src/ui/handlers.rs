@@ -12,13 +12,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tunnel_protocol::CloseReason;
 
-use super::store::{AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, Role, User, UserPatch};
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
+use crate::accounts::{AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, User, UserPatch};
+use crate::api::device::normalize_user_code;
 use crate::api::{self, ApiError, ApiJson, ApiResult, CreateAccessLinkRequest};
 use crate::clients;
 use crate::db::{DeleteOutcome, NewClientError, TunnelRow};
-use crate::device::normalize_user_code;
 use crate::password::{self, Verdict};
+use crate::role::Role;
 use crate::state::AppState;
 use crate::tokens::{self, now};
 
@@ -93,7 +94,7 @@ fn with_cookie(cookie: String, body: Value) -> Response {
     resp
 }
 
-fn keys(state: &AppState) -> ApiResult<&super::seal::Keys> {
+fn keys(state: &AppState) -> ApiResult<&crate::seal::Keys> {
     state.ui.keys.as_ref().ok_or_else(|| ApiError::not_found("route"))
 }
 
@@ -163,7 +164,7 @@ async fn start_session(
             "your sign-in changed meanwhile; sign in again",
         ));
     }
-    let max_age = if pending { super::store::PENDING_TTL_S } else { super::store::SESSION_MAX_S };
+    let max_age = if pending { crate::accounts::PENDING_TTL_S } else { crate::accounts::SESSION_MAX_S };
     Ok((session_cookie(&id, max_age), keys(state)?.csrf_token(&id)))
 }
 
@@ -1163,11 +1164,11 @@ async fn update_user(
     };
     let (user, update) = match task.await.map_err(|e| ApiError::internal(e.into()))?? {
         Ok(found) => found,
-        Err(super::store::AdminError::NotFound) => return Err(ApiError::not_found("user")),
-        Err(super::store::AdminError::Forbidden) => {
+        Err(crate::accounts::AdminError::NotFound) => return Err(ApiError::not_found("user")),
+        Err(crate::accounts::AdminError::Forbidden) => {
             return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you may not change this user"));
         }
-        Err(super::store::AdminError::SignedOut) => return Err(changed_meanwhile()),
+        Err(crate::accounts::AdminError::SignedOut) => return Err(changed_meanwhile()),
     };
     for t in &update.closed {
         state.delete_tunnel(t, CloseReason::Deleted).await?;
@@ -1197,11 +1198,11 @@ async fn reset_user_traffic(
     .await?;
     match reset {
         Ok(_) => Ok(Json(json!({ "traffic": crate::traffic::view(&state, &id).await? }))),
-        Err(super::store::AdminError::NotFound) => Err(ApiError::not_found("user")),
-        Err(super::store::AdminError::Forbidden) => {
+        Err(crate::accounts::AdminError::NotFound) => Err(ApiError::not_found("user")),
+        Err(crate::accounts::AdminError::Forbidden) => {
             Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you may not change this user"))
         }
-        Err(super::store::AdminError::SignedOut) => Err(changed_meanwhile()),
+        Err(crate::accounts::AdminError::SignedOut) => Err(changed_meanwhile()),
     }
 }
 

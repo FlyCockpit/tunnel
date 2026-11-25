@@ -14,8 +14,6 @@
 
 pub mod assets;
 mod handlers;
-pub mod seal;
-pub mod store;
 pub mod totp;
 
 use std::net::{IpAddr, SocketAddr};
@@ -28,52 +26,18 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use crate::accounts::{Session, User};
 use crate::api::{self, ApiError, PeerAddr};
-use crate::config::Config;
-use crate::ratelimit::{Limiter, RateLimiter};
+use crate::headers::UI_COOKIE;
 use crate::state::AppState;
 use crate::tokens;
 use crate::util::{Body, full};
-use store::Session;
 
 pub use handlers::{INVITE_PREFIX, OWNER_LINK_TTL_S};
 
-pub const UI_COOKIE: &str = "__Host-tunnel-ui";
 pub const CSRF_HEADER: &str = "x-tunnel-csrf";
 /// Sensitive steps (approving a machine) need a password or TOTP check this recent.
 pub const REAUTH_S: i64 = 10 * 60;
-
-/// Rate limiters and keys of the web UI.
-pub struct UiState {
-    pub keys: Option<seal::Keys>,
-    pub login_ip: RateLimiter,
-    /// Per username, with a larger budget than per IP, so one address alone
-    /// cannot lock a user out.
-    pub login_user: Limiter<String>,
-    /// The TOTP step of sign-in, per user (wrong codes also count towards a
-    /// persisted lockout).
-    pub login_factor: Limiter<String>,
-    /// Password and code re-checks inside a session, per user.
-    pub reauth: Limiter<String>,
-    /// Device user-code lookups, per user (they are guessable only by brute force).
-    pub device_lookup: Limiter<String>,
-    pub device_code_limiter: RateLimiter,
-}
-
-impl UiState {
-    pub fn new(config: &Config) -> Self {
-        let per_min = config.limits.login_rate_per_min;
-        Self {
-            keys: config.ui_secret.as_deref().filter(|_| config.ui_host.is_some()).map(seal::Keys::new),
-            login_ip: RateLimiter::new(per_min),
-            login_user: Limiter::new(per_min.saturating_mul(3)),
-            login_factor: Limiter::new(per_min),
-            reauth: Limiter::new(per_min),
-            device_lookup: Limiter::new(per_min),
-            device_code_limiter: RateLimiter::new(per_min),
-        }
-    }
-}
 
 static ROUTER: LazyLock<Router<Arc<AppState>>> = LazyLock::new(handlers::router);
 
@@ -269,7 +233,7 @@ pub struct Signed {
 }
 
 impl Signed {
-    pub fn user(&self) -> &store::User {
+    pub fn user(&self) -> &User {
         &self.session.user
     }
 }

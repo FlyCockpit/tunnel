@@ -8,7 +8,7 @@ use tunnel_protocol::CloseReason;
 use crate::config::Config;
 use crate::db::{Db, DeleteOutcome, TunnelLookup};
 use crate::metrics::Metrics;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{Limiter, RateLimiter};
 use crate::registry::Registry;
 use crate::tls::CertStore;
 
@@ -85,6 +85,38 @@ impl<V: Clone> Cache<V> {
     }
 }
 
+/// Rate limiters and keys of the web UI.
+pub struct UiState {
+    pub keys: Option<crate::seal::Keys>,
+    pub login_ip: RateLimiter,
+    /// Per username, with a larger budget than per IP, so one address alone
+    /// cannot lock a user out.
+    pub login_user: Limiter<String>,
+    /// The TOTP step of sign-in, per user (wrong codes also count towards a
+    /// persisted lockout).
+    pub login_factor: Limiter<String>,
+    /// Password and code re-checks inside a session, per user.
+    pub reauth: Limiter<String>,
+    /// Device user-code lookups, per user (they are guessable only by brute force).
+    pub device_lookup: Limiter<String>,
+    pub device_code_limiter: RateLimiter,
+}
+
+impl UiState {
+    pub fn new(config: &Config) -> Self {
+        let per_min = config.limits.login_rate_per_min;
+        Self {
+            keys: config.ui_secret.as_deref().filter(|_| config.ui_host.is_some()).map(crate::seal::Keys::new),
+            login_ip: RateLimiter::new(per_min),
+            login_user: Limiter::new(per_min.saturating_mul(3)),
+            login_factor: Limiter::new(per_min),
+            reauth: Limiter::new(per_min),
+            device_lookup: Limiter::new(per_min),
+            device_code_limiter: RateLimiter::new(per_min),
+        }
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub db: Db,
@@ -95,7 +127,7 @@ pub struct AppState {
     /// Per-IP limiter for `/__access/*`.
     pub access_limiter: RateLimiter,
     /// Web UI keys and limiters.
-    pub ui: crate::ui::UiState,
+    pub ui: UiState,
     tunnel_cache: Cache<Arc<TunnelLookup>>,
     session_cache: Cache<Grants>,
     visitor_lookups: tokio::sync::Semaphore,
@@ -112,7 +144,7 @@ impl AppState {
         let access_limiter = RateLimiter::new(config.limits.access_rate_per_min);
         db.set_limit_defaults(crate::limits::Defaults::new(&config.limits));
         Arc::new(Self {
-            ui: crate::ui::UiState::new(&config),
+            ui: UiState::new(&config),
             config,
             db,
             registry: Registry::default(),

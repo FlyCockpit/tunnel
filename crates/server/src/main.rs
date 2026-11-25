@@ -1,3 +1,4 @@
+mod accounts;
 mod acme;
 mod api;
 mod clients;
@@ -5,9 +6,9 @@ mod commands;
 mod config;
 mod control;
 mod db;
-mod device;
 mod dns;
 mod edge;
+mod files;
 mod gate;
 mod gatehost;
 mod headers;
@@ -25,6 +26,8 @@ mod proxy;
 mod purge;
 mod ratelimit;
 mod registry;
+mod role;
+mod seal;
 mod services;
 mod setup;
 mod sni;
@@ -234,8 +237,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::User { cmd: UserCmd::List } => commands::user_list(&config).await,
         Cmd::User { cmd: UserCmd::Invite { role, hours } } => {
             let role = match role {
-                InviteRole::Member => ui::store::Role::Member,
-                InviteRole::Admin => ui::store::Role::Admin,
+                InviteRole::Member => role::Role::Member,
+                InviteRole::Admin => role::Role::Admin,
             };
             commands::user_invite(&config, role, hours).await
         }

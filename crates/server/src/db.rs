@@ -10,6 +10,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
+use crate::role::Role;
 use crate::tokens::now;
 
 pub const SCHEMA_VERSION: i32 = 1;
@@ -352,7 +353,7 @@ pub struct NewTunnel {
 pub enum TunnelQuotaExceeded {
     /// The user's limit across all their machines.
     #[error("live-tunnel limit of the account reached")]
-    Account { limit: u64, role: crate::ui::store::Role },
+    Account { limit: u64, role: Role },
     /// `limits.max_tunnels_per_client`.
     #[error("live-tunnel limit of the machine reached")]
     Machine { limit: u32 },
@@ -398,7 +399,7 @@ pub struct TtlTooLong {
     /// Seconds.
     pub limit: u64,
     /// The machine's user's role; `None` for a service.
-    pub account: Option<crate::ui::store::Role>,
+    pub account: Option<Role>,
 }
 
 /// The current rules for tunnel owner `owner` (a client or service id).
@@ -411,7 +412,7 @@ struct OwnerRules {
     /// A service's own live-tunnel quota.
     service_max: Option<u32>,
     /// A machine's user: role and live-tunnel limit across their machines.
-    account: Option<(crate::ui::store::Role, Option<u64>)>,
+    account: Option<(Role, Option<u64>)>,
 }
 
 impl OwnerRules {
@@ -428,7 +429,6 @@ impl OwnerRules {
 /// `None` if the owner is gone or its user is disabled.
 fn owner_rules(tx: &rusqlite::Transaction<'_>, owner: &str, policy: Policy) -> anyhow::Result<Option<OwnerRules>> {
     use crate::limits::{Kind, Setting};
-    use crate::ui::store::Role;
     let service: Option<u32> =
         tx.query_row("SELECT max_tunnels FROM services WHERE id = ?1", params![owner], |r| r.get(0)).optional()?;
     if let Some(max) = service {
@@ -524,7 +524,7 @@ pub struct ClientAuth {
     pub id: String,
     pub name: String,
     pub user_id: String,
-    pub role: crate::ui::store::Role,
+    pub role: Role,
     pub can_public: bool,
     pub limits: crate::limits::Settings,
 }
@@ -538,7 +538,7 @@ pub enum NewClientError {
     /// The user already has as many machines as their limit allows.
     Quota {
         limit: u64,
-        role: crate::ui::store::Role,
+        role: Role,
     },
 }
 
@@ -1183,7 +1183,7 @@ impl Db {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // From the web UI: only while the requesting session is still valid.
             if let Some(session) = &session
-                && !crate::ui::store::authorized(&tx, &user_id, None, session)?
+                && !authorized(&tx, &user_id, None, session)?
             {
                 return Ok(Err(NewClientError::NoUser));
             }
@@ -1273,7 +1273,7 @@ impl Db {
                             id: r.get(0)?,
                             name: r.get(1)?,
                             user_id: r.get(2)?,
-                            role: crate::ui::store::Role::parse(&r.get::<_, String>(3)?),
+                            role: Role::parse(&r.get::<_, String>(3)?),
                             can_public: r.get(4)?,
                             limits: crate::limits::Settings {
                                 tunnels: Setting::from_column(r.get(5)?),
@@ -1700,7 +1700,7 @@ pub(crate) fn client_admissible(
         )
         .optional()?;
     let Some((role, setting, have)) = user else { return Ok(Err(NewClientError::NoUser)) };
-    let role = crate::ui::store::Role::parse(&role);
+    let role = Role::parse(&role);
     let limit = defaults.resolve(crate::limits::Kind::Machines, role, crate::limits::Setting::from_column(setting));
     Ok(match limit {
         Some(limit) if have.max(0) as u64 >= limit => Err(NewClientError::Quota { limit, role }),
@@ -1744,6 +1744,23 @@ pub(crate) fn tunnel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelR
         user_id: r.get(15)?,
         name: r.get(16)?,
     })
+}
+
+/// Whether `session` is a live, signed-in session of the enabled `user_id`,
+/// and (with `epoch`) the user's credentials are unchanged since then.
+pub(crate) fn authorized(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: &str,
+    epoch: Option<i64>,
+    session: &str,
+) -> anyhow::Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM users u JOIN ui_sessions s ON s.user_id = u.id
+                        WHERE u.id = ?1 AND u.disabled_at IS NULL AND (?2 IS NULL OR u.auth_epoch = ?2)
+                          AND s.id_hash = ?3 AND s.pending = 0 AND s.expires_at > ?4)",
+        params![user_id, epoch, session, now()],
+        |r| r.get(0),
+    )?)
 }
 
 #[cfg(test)]

@@ -115,14 +115,14 @@ pub fn write_cert_files(cert_dir: &Path, fullchain_pem: &str, key_pem: &str, nam
     std::fs::create_dir_all(cert_dir).with_context(|| format!("creating {}", cert_dir.display()))?;
     let dir = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(crate::util::O_DIRECTORY | crate::util::O_NOFOLLOW | crate::util::O_CLOEXEC)
+        .custom_flags(crate::files::O_DIRECTORY | crate::files::O_NOFOLLOW | crate::files::O_CLOEXEC)
         .open(cert_dir)
         .with_context(|| format!("opening certificate directory {} without following symlinks", cert_dir.display()))?;
     dir.set_permissions(std::fs::Permissions::from_mode(0o750))?;
-    crate::util::write_atomic_in_dir(&dir, PRIVKEY, key_pem.as_bytes(), 0o640)?;
-    crate::util::write_atomic_in_dir(&dir, FULLCHAIN, fullchain_pem.as_bytes(), 0o640)?;
+    crate::files::write_atomic_in_dir(&dir, PRIVKEY, key_pem.as_bytes(), 0o640)?;
+    crate::files::write_atomic_in_dir(&dir, FULLCHAIN, fullchain_pem.as_bytes(), 0o640)?;
     let names_json = serde_json::to_vec_pretty(names)?;
-    crate::util::write_atomic_in_dir(&dir, NAMES, &names_json, 0o640)?;
+    crate::files::write_atomic_in_dir(&dir, NAMES, &names_json, 0o640)?;
     Ok(())
 }
 

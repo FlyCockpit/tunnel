@@ -31,13 +31,14 @@ use crate::db::{
 };
 use crate::ice;
 use crate::password;
+use crate::role::Role;
 use crate::services;
 use crate::state::AppState;
 use crate::tokens::{self, now};
-use crate::ui::store::Role;
 use crate::util::{Body, full, json_response};
 
-pub(crate) const MIN_TUNNEL_TTL_S: u64 = 60;
+pub mod device;
+
 const MIN_LINK_TTL_S: u64 = 30;
 const MIN_ICE_TTL_S: u64 = 60;
 const MAX_LABEL_LEN: usize = 200;
@@ -84,8 +85,8 @@ fn build_router() -> Router<Arc<AppState>> {
         .route("/v1/tunnels/{id}/turn-credentials", post(turn_credentials))
         .route("/v1/clients", post(create_client).get(list_clients))
         .route("/v1/clients/enroll", post(enroll_client))
-        .route("/v1/device/code", post(crate::device::device_code))
-        .route("/v1/device/token", post(crate::device::device_token))
+        .route("/v1/device/code", post(device::device_code))
+        .route("/v1/device/token", post(device::device_token))
         .route("/v1/server", get(server_info))
         .route("/v1/clients/{name}", axum::routing::delete(delete_client).patch(rename_client))
         .route("/v1/services", post(create_service).get(list_services))
@@ -271,8 +272,11 @@ impl Caller {
             },
             (Some(ttl), false) => {
                 let max = limit.unwrap_or(crate::limits::MAX_TTL_S);
-                if ttl < MIN_TUNNEL_TTL_S || (limit.is_none() && ttl > max) {
-                    return Err(ApiError::validation(format!("ttl_s must be within {MIN_TUNNEL_TTL_S}..={max}")));
+                if ttl < crate::limits::MIN_TUNNEL_TTL_S || (limit.is_none() && ttl > max) {
+                    return Err(ApiError::validation(format!(
+                        "ttl_s must be within {}..={max}",
+                        crate::limits::MIN_TUNNEL_TTL_S
+                    )));
                 }
                 if ttl > max {
                     return Err(ttl_refused(max, self.account_role(), false));
@@ -642,8 +646,8 @@ pub struct TurnCredentialsResponse {
         rotate_service_token,
         delete_service,
         server_info,
-        crate::device::device_code,
-        crate::device::device_token,
+        device::device_code,
+        device::device_token,
     ),
     components(schemas(
         Health,
@@ -683,9 +687,9 @@ pub struct TurnCredentialsResponse {
         AccountLimits,
         LimitUse,
         crate::traffic::TrafficView,
-        crate::device::DeviceCodeRequest,
-        crate::device::DeviceCodeResponse,
-        crate::device::DeviceTokenRequest,
+        device::DeviceCodeRequest,
+        device::DeviceCodeResponse,
+        device::DeviceTokenRequest,
     )),
     modifiers(&BearerAuth),
     security(("admin" = []))
@@ -1695,7 +1699,7 @@ async fn rename_client(
     clients::validate_new_name(&req.name).map_err(ApiError::validation)?;
     match state.db.rename_client(name.clone(), req.name.clone(), None).await? {
         Ok(()) => {}
-        Err(crate::ui::store::RenameError::Taken) => {
+        Err(crate::accounts::RenameError::Taken) => {
             return Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a client with this name exists"));
         }
         Err(_) => return Err(ApiError::not_found("client")),
@@ -2371,6 +2375,9 @@ mod tests {
             ("/v1/device/token", vec!["post"]),
         ];
         assert_eq!(doc["paths"].as_object().unwrap().len(), expected.len());
+        for path in ["/v1/device/code", "/v1/device/token"] {
+            assert_eq!(doc["paths"][path]["post"]["tags"], serde_json::json!(["crate::device"]), "{path}");
+        }
         for (path, methods) in expected {
             for method in methods {
                 assert!(doc["paths"][path][method].is_object(), "missing {method} {path}");

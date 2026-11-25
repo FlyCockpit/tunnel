@@ -26,7 +26,7 @@ pub enum AddError {
     /// The owning user already has as many machines as their limit allows.
     Quota {
         limit: u64,
-        role: crate::ui::store::Role,
+        role: crate::role::Role,
     },
     /// The owning user is unknown or disabled.
     NoUser,

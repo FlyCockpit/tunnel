@@ -27,7 +27,7 @@ use tunnel_protocol::ADMIN_TOKEN_PREFIX;
 
 use crate::config::{Config, DnsConfig, DnsProviderKind, SERVICE_NAME, SERVICE_USER};
 use crate::mode::{self, Mode};
-use crate::{acme, dns, tls, tokens, util};
+use crate::{acme, dns, tls, tokens};
 
 #[allow(unused_imports)] // part of the module contract; no caller outside setup yet
 #[derive(clap::Args, Debug, Default)]
@@ -156,9 +156,9 @@ async fn configure(
     if mode == Mode::System {
         system_preflight(config_path, &mode.unit_dir()?.join(format!("{SERVICE_NAME}.service")))?;
     }
-    util::check_data_dir(&cfg.data_dir, mode == Mode::System)?;
+    mode::check_data_dir(&cfg.data_dir, mode == Mode::System)?;
     if mode == Mode::System {
-        util::check_system_config_dir(config_path)?;
+        mode::check_system_config_dir(config_path)?;
     }
     if cfg.webrtc.enabled {
         check_stun_port(cfg.webrtc.stun_port, mode.systemctl_ok(&["is-active", "--quiet", SERVICE_NAME]))?;
@@ -194,7 +194,7 @@ async fn configure(
     let token = generate_secrets(cfg);
     let config_changed = cfg.save(config_path)?;
     if mode == Mode::System {
-        util::secure_system_config(config_path)?;
+        mode::secure_system_config(config_path)?;
     }
     *new_token = token;
     println!("{} {}", if config_changed { "Wrote" } else { "Unchanged:" }, config_path.display());
@@ -210,7 +210,7 @@ async fn configure(
     step("Certificate");
     ensure_certificate(cfg).await?;
     if mode == Mode::System {
-        util::chown_recursive(&cfg.data_dir, SERVICE_USER)?;
+        mode::chown_recursive(&cfg.data_dir, SERVICE_USER)?;
     }
 
     step("Firewall");
@@ -1075,9 +1075,9 @@ fn is_dedicated_config_dir(dir: &Path) -> bool {
 
 fn ensure_dirs(cfg: &Config, config_path: &Path, mode: Mode) -> anyhow::Result<()> {
     let data = &cfg.data_dir;
-    util::check_data_dir(data, mode == Mode::System)?;
+    mode::check_data_dir(data, mode == Mode::System)?;
     if mode == Mode::System {
-        util::check_system_config_dir(config_path)?;
+        mode::check_system_config_dir(config_path)?;
     }
     std::fs::create_dir_all(data).with_context(|| format!("creating {}", data.display()))?;
     let etc = config_path.parent().context("config path has no parent directory")?;
@@ -1085,14 +1085,14 @@ fn ensure_dirs(cfg: &Config, config_path: &Path, mode: Mode) -> anyhow::Result<(
     let dedicated = is_dedicated_config_dir(etc);
 
     if mode.is_user() {
-        crate::config::set_mode(data, 0o700)?;
+        crate::files::set_mode(data, 0o700)?;
         if dedicated {
-            crate::config::set_mode(etc, 0o700)?;
+            crate::files::set_mode(etc, 0o700)?;
         }
         return Ok(());
     }
-    crate::config::set_mode(data, 0o750)?;
-    util::chown_recursive(data, SERVICE_USER)?;
+    crate::files::set_mode(data, 0o750)?;
+    mode::chown_recursive(data, SERVICE_USER)?;
     anyhow::ensure!(dedicated, "root config must be in a dedicated tunnel directory");
     for component in etc.ancestors() {
         let meta = std::fs::symlink_metadata(component)?;
@@ -1100,7 +1100,7 @@ fn ensure_dirs(cfg: &Config, config_path: &Path, mode: Mode) -> anyhow::Result<(
     }
     // Do not give the service write permission to the directory or its config.
     os::run("chown", &["--no-dereference", &format!("root:{SERVICE_USER}"), "--", &etc.to_string_lossy()])?;
-    crate::config::set_mode(etc, 0o750)?;
+    crate::files::set_mode(etc, 0o750)?;
     Ok(())
 }
 

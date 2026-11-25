@@ -6,6 +6,10 @@ use tunnel_protocol::GATE_COOKIE;
 use crate::tokens::is_valid_tunnel_id;
 use crate::util::header_str;
 
+/// The web UI's session cookie. It is host-only on the UI host, so browsers
+/// never send it to a preview; the edge still never forwards one to an origin.
+pub const UI_COOKIE: &str = "__Host-tunnel-ui";
+
 /// Connection-specific headers (RFC 9110 §7.6.1 plus legacy ones). HTTP/2
 /// responses must not carry any of them (hyper rejects them).
 const HOP_BY_HOP: &[&str] = &[

@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use tunnel_protocol::CLIENT_TOKEN_PREFIX;
 use utoipa::ToSchema;
 
+use crate::accounts::Poll;
 use crate::api::{ApiError, ApiJson, ApiResult, ErrorBody, PeerAddr};
 use crate::clients::validate_new_name;
 use crate::db::NewClientError;
 use crate::state::AppState;
 use crate::tokens::{self, now};
-use crate::ui::store::Poll;
 
 pub const DEVICE_CODE_PREFIX: &str = "tndev_";
 pub const DEVICE_TTL_S: i64 = 15 * 60;
@@ -110,6 +110,7 @@ fn oauth_error(code: &'static str) -> ApiError {
 #[utoipa::path(
     post,
     path = "/v1/device/code",
+    tag = "crate::device",
     security(()),
     request_body = DeviceCodeRequest,
     responses((status = 200, body = DeviceCodeResponse), (status = 404, body = ErrorBody), (status = 422, body = ErrorBody), (status = 429, body = ErrorBody))
@@ -163,6 +164,7 @@ pub async fn device_code(
 #[utoipa::path(
     post,
     path = "/v1/device/token",
+    tag = "crate::device",
     security(()),
     request_body = DeviceTokenRequest,
     responses(
