@@ -856,7 +856,7 @@ async fn server_info(State(state): State<Arc<AppState>>, caller: Caller) -> ApiR
                 traffic_bytes: effective.traffic_bytes,
                 raised_by: (user.role != Role::Owner).then(|| crate::limits::raiser(user.role).to_string()),
             };
-            (Some(crate::traffic::view(&state, &user.id).await?), Some(account))
+            (Some(state.traffic.view(&state.db, &user.id).await?), Some(account))
         }
         _ => (None, None),
     };
@@ -2040,7 +2040,7 @@ async fn active_tunnel(state: &AppState, caller: &Caller, id: &str) -> ApiResult
 
 pub(crate) fn tunnel_view(state: &AppState, row: &TunnelRow) -> TunnelView {
     let live = state.registry.get(&row.id);
-    let unflushed = crate::traffic::unflushed(state, &row.id);
+    let unflushed = state.traffic.unflushed(&row.id);
     let ports = live
         .as_ref()
         .map(|l| {

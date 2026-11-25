@@ -46,15 +46,24 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     tokio::spawn(tls::watch(certs));
     tokio::spawn(acme::renew_loop(state.clone()));
     tokio::spawn(purge::run(state.clone()));
-    if let Err(e) = crate::traffic::preload(&state).await {
+    if let Err(e) = state.traffic.preload(&state.db).await {
         tracing::warn!(error = %format!("{e:#}"), "loading users over their traffic cap failed");
     }
-    tokio::spawn(crate::traffic::run(state.clone()));
-    tokio::spawn(crate::traffic::enforce(state.clone()));
+    {
+        let state = state.clone();
+        tokio::spawn(async move { state.traffic.run(&state.db, &state.registry).await });
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move { state.traffic.enforce(&state.registry).await });
+    }
     {
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = metrics::serve(state).await {
+            let listen = state.config.metrics_listen;
+            let render =
+                move || state.metrics.render(state.registry.len(), state.certs.not_after(), &state.traffic.snapshot());
+            if let Err(e) = metrics::serve(listen, render).await {
                 // Metrics are loopback-only diagnostics; serving previews matters more.
                 tracing::error!(error = %format!("{e:#}"), "metrics listener failed");
             }
@@ -72,7 +81,7 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
             }
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             // Keep the last minute of traffic counts.
-            match tokio::time::timeout(Duration::from_secs(5), crate::traffic::flush(&state)).await {
+            match tokio::time::timeout(Duration::from_secs(5), state.traffic.flush(&state.db, &state.registry)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "final traffic flush failed"),
                 Err(_) => tracing::warn!("final traffic flush timed out"),

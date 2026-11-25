@@ -28,11 +28,11 @@ use crate::gate::{Rechecking, Side};
 use crate::headers::{self, ResponseCtx};
 use crate::ice;
 use crate::inject::{self, Injector};
-use crate::metrics::TunnelBytes;
 use crate::pages;
 use crate::pool::OriginConn;
 use crate::registry::LiveTunnel;
 use crate::state::AppState;
+use crate::traffic::TunnelBytes;
 use crate::util::{Body, BoxError, empty, header_str, incoming, text_response};
 
 /// Upper bound for opening a stream and reading the client's status byte.

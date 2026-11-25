@@ -1415,7 +1415,7 @@ async fn a_flush_forgets_a_user_nothing_holds_once_their_bytes_are_written() {
     drop(usage);
     // The flush writes the pending bytes and, in the same pass, forgets the
     // unblocked user that no counter holds any more.
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap(), (None, 10));
     assert!(state.traffic.loaded(&ann_id).is_none());
 }
@@ -1438,20 +1438,20 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     assert_eq!(row.user_id.as_deref(), Some(ann_id.as_str()));
 
     // Counting: per tunnel and for the user (memory first, then the flush).
-    let bytes = crate::traffic::counter(&state, &row).await.unwrap();
+    let bytes = state.traffic.counter(&state.db, &row).await.unwrap();
     bytes.count(300, false);
     bytes.count(200, true);
     let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &token, None).await;
     assert_eq!((view.body["bytes_in"].clone(), view.body["bytes_out"].clone()), (json!(300), json!(200)));
     let users = owner.call(&state, "GET", "/ui/api/users", None).await;
     assert_eq!(listed(&users.body, "ann")["traffic_bytes"], 500);
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     let stored = state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap();
     assert_eq!(stored, (None, 500));
     let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
     assert_eq!((row.bytes_in, row.bytes_out), (300, 200));
     // Nothing new: the next flush writes nothing (and the figures stay).
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap(), (None, 500));
     let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &token, None).await;
     assert_eq!(view.body["bytes_in"], 300);
@@ -1507,9 +1507,9 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
 
     // Crossing the cap blocks at once (`gate::reauthorize` refuses blocked
     // tunnels, which cuts what is in flight once the enforcer rotates the epoch).
-    assert!(!crate::traffic::tunnel_blocked(&state, &id));
+    assert!(!state.traffic.tunnel_blocked(&id));
     bytes.count(999_500, true);
-    assert!(bytes.blocked() && crate::traffic::tunnel_blocked(&state, &id));
+    assert!(bytes.blocked() && state.traffic.tunnel_blocked(&id));
     let view = bearer(&state, "GET", &format!("/v1/tunnels/{id}"), &token, None).await;
     assert_eq!(view.body["traffic_limited"], true);
     let info = bearer(&state, "GET", "/v1/server", &token, None).await;
@@ -1545,7 +1545,7 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
         .await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(bytes.blocked());
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.users_over_cap(state.traffic.month()).await.unwrap(), vec![ann_id.clone()]);
 
     // A reset starts the month again (stored and in memory); the tunnel's own
@@ -1555,7 +1555,7 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert_eq!(r.body["traffic"]["used_bytes"], 0);
     assert!(!bytes.blocked());
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.user_traffic(ann_id.clone(), state.traffic.month()).await.unwrap(), (Some(1_000_000), 0));
     assert!(state.db.users_over_cap(state.traffic.month()).await.unwrap().is_empty());
     let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
@@ -1568,9 +1568,9 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
     assert!(bytes.blocked());
     let next = if state.traffic.month() % 100 == 12 { state.traffic.month() + 89 } else { state.traffic.month() + 1 };
     let old = state.traffic.month();
-    crate::traffic::flush_or_roll_over(&state, next).await.unwrap();
+    state.traffic.flush_or_roll_over(&state.db, &state.registry, next).await.unwrap();
     assert!(!bytes.blocked());
-    assert_eq!(crate::traffic::view(&state, &ann_id).await.unwrap().used_bytes, 0);
+    assert_eq!(state.traffic.view(&state.db, &ann_id).await.unwrap().used_bytes, 0);
     // The rollover's flush closed the old month with everything counted before it.
     assert_eq!(state.db.user_traffic(ann_id.clone(), old).await.unwrap(), (Some(1_000_000), 1_000_000));
 
@@ -1580,7 +1580,7 @@ async fn traffic_is_counted_capped_cut_reset_and_flushed() {
         bearer(&state, "DELETE", &format!("/v1/tunnels/{id}"), &token, None).await.status,
         StatusCode::NO_CONTENT
     );
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.user_traffic(ann_id.clone(), next).await.unwrap(), (Some(1_000_000), 42));
 
     let log = owner.call(&state, "GET", "/ui/api/audit", None).await;
@@ -1620,12 +1620,12 @@ async fn services_and_the_owner_are_counted_but_never_capped() {
     let owner_token = approve_machine(&state, &mut owner, "server").await;
     let t = create_tunnel(&state, &owner_token, json!({ "mode": "link" })).await;
     let row = state.db.get_tunnel(t.body["id"].as_str().unwrap().to_string()).await.unwrap().unwrap();
-    let bytes = crate::traffic::counter(&state, &row).await.unwrap();
+    let bytes = state.traffic.counter(&state.db, &row).await.unwrap();
     bytes.count(5_000_000_000, true);
     assert!(!bytes.blocked());
     assert_eq!(bytes.owner().unwrap().cap(), None);
     // The owner's month is stored like anyone's and reloads with its total.
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     let owner_id = row.user_id.clone().unwrap();
     assert_eq!(state.db.user_traffic(owner_id, state.traffic.month()).await.unwrap(), (None, 5_000_000_000));
     let svc =
@@ -1635,10 +1635,10 @@ async fn services_and_the_owner_are_counted_but_never_capped() {
     let t = create_tunnel(&state, &svc_token, json!({ "mode": "link" })).await;
     let row = state.db.get_tunnel(t.body["id"].as_str().unwrap().to_string()).await.unwrap().unwrap();
     assert!(row.user_id.is_none());
-    let bytes = crate::traffic::counter(&state, &row).await.unwrap();
+    let bytes = state.traffic.counter(&state.db, &row).await.unwrap();
     bytes.count(10, false);
     assert!(bytes.owner().is_none() && !bytes.blocked());
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     let row = state.db.get_tunnel(row.id).await.unwrap().unwrap();
     assert_eq!(row.bytes_in, 10, "services' tunnels are counted per tunnel");
 }
@@ -1668,21 +1668,21 @@ async fn a_deleted_tunnels_counter_in_use_keeps_reaching_the_month() {
     let row = state.db.get_tunnel(id.clone()).await.unwrap().unwrap();
     let ann_id = row.user_id.clone().unwrap();
     // An exchange in flight holds the counter while the tunnel is deleted.
-    let held = crate::traffic::counter(&state, &row).await.unwrap();
+    let held = state.traffic.counter(&state.db, &row).await.unwrap();
     assert_eq!(
         bearer(&state, "DELETE", &format!("/v1/tunnels/{id}"), &token, None).await.status,
         StatusCode::NO_CONTENT
     );
     let month = state.traffic.month();
     held.count(10, true);
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.user_traffic(ann_id.clone(), month).await.unwrap().1, 10);
     held.count(5, false);
-    crate::traffic::flush(&state).await.unwrap();
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
     assert_eq!(state.db.user_traffic(ann_id.clone(), month).await.unwrap().1, 15, "counted while still in use");
     drop(held);
-    crate::traffic::flush(&state).await.unwrap();
-    assert!(state.metrics.get(&id).is_none(), "a deleted tunnel's counter is gone");
+    state.traffic.flush(&state.db, &state.registry).await.unwrap();
+    assert!(state.traffic.get(&id).is_none(), "a deleted tunnel's counter is gone");
 }
 
 /// The Tunnels page's Open button mints a one-time, one-minute link through

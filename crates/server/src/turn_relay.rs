@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use stun::integrity::MessageIntegrity;
 use stun::message::{Message, Setter};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -48,7 +49,8 @@ use turn::server::config::{ConnConfig, ServerConfig};
 use webrtc_util::Conn;
 
 use crate::config::Config;
-use crate::metrics::Metrics;
+use crate::db::TunnelLookup;
+use crate::metrics::{Metrics, TurnMetrics};
 
 /// Relays (allocations) open at once, server-wide.
 pub const MAX_ALLOCATIONS: usize = 1200;
@@ -91,6 +93,14 @@ const HUB_QUEUE: usize = 256;
 /// A packet from another relay on this server, with its relay address.
 type HubPacket = (Vec<u8>, SocketAddr);
 
+/// Where the relay reads tunnel lifecycle: the app state in the server.
+pub trait TunnelLookups: Send + Sync {
+    /// Through the app's short-lived lifecycle cache.
+    fn cached<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Arc<TunnelLookup>>>;
+    /// Straight from the database.
+    fn fresh<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<Arc<TunnelLookup>>>;
+}
+
 pub struct Relay {
     shared: Arc<Shared>,
     streams: Arc<Semaphore>,
@@ -106,11 +116,11 @@ struct Shared {
     /// Inboxes of live relays by port, for relay-to-relay delivery.
     hub: Mutex<HashMap<u16, mpsc::Sender<HubPacket>>>,
     allocations: AtomicUsize,
-    metrics: Arc<MetricsRef>,
+    metrics: Arc<TurnMetrics>,
     /// Peers that tests may relay to despite being non-public (loopback).
     allow_private_peers: bool,
     max_credential_ttl: i64,
-    state: OnceLock<Weak<crate::state::AppState>>,
+    state: OnceLock<Weak<dyn TunnelLookups>>,
     servers: Mutex<Vec<Weak<RelayServer>>>,
     security: Mutex<Security>,
     revocation_epoch: AtomicU64,
@@ -137,12 +147,6 @@ impl std::ops::Deref for RelayServer {
     fn deref(&self) -> &Server {
         &self.server
     }
-}
-
-/// The relay only needs the allocation gauge; keeps `Metrics` borrowing simple.
-#[derive(Default)]
-pub struct MetricsRef {
-    pub allocations: std::sync::atomic::AtomicI64,
 }
 
 impl Relay {
@@ -239,7 +243,7 @@ impl Relay {
     }
 
     /// Install the lifecycle validator before making the relay available to callers.
-    pub fn install_state(&self, state: Weak<crate::state::AppState>) {
+    pub fn install_state(&self, state: Weak<dyn TunnelLookups>) {
         let _ = self.shared.state.set(state);
     }
 
@@ -348,7 +352,7 @@ impl Relay {
             max_port,
             hub: Mutex::new(HashMap::new()),
             allocations: AtomicUsize::new(0),
-            metrics: Arc::new(MetricsRef { allocations: Default::default() }),
+            metrics: Arc::new(TurnMetrics::default()),
             allow_private_peers: true,
             max_credential_ttl: 86_400,
             state: OnceLock::new(),
@@ -586,11 +590,11 @@ impl Shared {
             let Some(weak) = self.state.get() else { return self.allow_private_peers };
             let Some(state) = weak.upgrade() else { return false };
             let found = if attempt == 0 {
-                state.tunnel_for_turn(tunnel).await
+                state.cached(tunnel).await
             } else {
                 // A fenced read must reach the database even if it managed to
                 // populate AppState's cache before the invalidation arrived.
-                state.db.lookup_tunnel(tunnel.to_owned()).await.map(Arc::new)
+                state.fresh(tunnel).await
             };
             let valid_until = match found {
                 Ok(found) => match found.as_ref() {
@@ -1187,7 +1191,7 @@ impl RelayAddressGenerator for RelayGen {
         };
         let (tx, rx) = mpsc::channel(HUB_QUEUE);
         s.hub.lock().unwrap_or_else(|e| e.into_inner()).insert(port, tx);
-        s.metrics.allocations.fetch_add(1, Ordering::Relaxed);
+        s.metrics.allocation_opened();
         let (expiry, tunnel) = credential_parts(&identity.username).unwrap();
         self.activity.open();
         let conn = RelayConn {
@@ -1284,7 +1288,7 @@ impl RelayConn {
         self.quota.lock().unwrap().take();
         self.activity.close();
         self.shared.allocations.fetch_sub(1, Ordering::SeqCst);
-        self.shared.metrics.allocations.fetch_sub(1, Ordering::Relaxed);
+        self.shared.metrics.allocation_closed();
     }
 }
 
@@ -1798,7 +1802,7 @@ mod tests {
         let relay = Arc::new(Relay::for_test(PUBLIC, 53500, 53599, SECRET));
         state.install_turn(relay.clone());
         assert!(relay.shared.validate(&creds(600).0).await);
-        let bytes = state.metrics.tunnel_bytes("abcdefghij");
+        let bytes = state.traffic.tunnel_bytes("abcdefghij");
         let (transport, _peer) = tokio::io::duplex(64);
         let session = tunnel_protocol::mux::Session::new_server(transport);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
@@ -1827,7 +1831,7 @@ mod tests {
         blocker.await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if !Arc::ptr_eq(&bytes, &state.metrics.tunnel_bytes("abcdefghij")) {
+                if !Arc::ptr_eq(&bytes, &state.traffic.tunnel_bytes("abcdefghij")) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2344,7 +2348,7 @@ mod tests {
         drop(conn);
         assert!(relay.shared.security.lock().unwrap().tunnels.is_empty());
         assert_eq!(relay.shared.allocations.load(Ordering::SeqCst), 0);
-        assert_eq!(relay.shared.metrics.allocations.load(Ordering::Relaxed), 0);
+        assert_eq!(relay.shared.metrics.allocations(), 0);
     }
 
     #[tokio::test]

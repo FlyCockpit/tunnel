@@ -1,7 +1,7 @@
 //! Traffic counters per tunnel and per user, and monthly per-user caps.
 //!
 //! Proxied body bytes and WebSocket bytes are counted in memory: per tunnel
-//! (`metrics::TunnelBytes`, lifetime totals) and, for tunnels of a user's
+//! ([`TunnelBytes`], lifetime totals) and, for tunnels of a user's
 //! machine, into that user's [`UserUsage`] for the current calendar month
 //! (UTC). A flush about once a minute writes both to the database in one
 //! transaction (nothing when idle). A user's pending bytes are taken with
@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::{OptionalExtension, params};
@@ -28,9 +28,8 @@ use utoipa::ToSchema;
 
 use crate::accounts::AdminError;
 use crate::db::{Db, TunnelRow};
-use crate::metrics::TunnelBytes;
+use crate::registry::Registry;
 use crate::role::Role;
-use crate::state::AppState;
 
 /// How often counters are written to the database.
 pub const FLUSH_EVERY: Duration = Duration::from_secs(60);
@@ -56,6 +55,99 @@ pub fn month_label(month: u32) -> String {
 
 fn now_month() -> u32 {
     month_of(crate::tokens::now())
+}
+
+/// One tunnel's byte counters (lifetime totals), counted into its owner's
+/// usage too.
+#[derive(Default)]
+pub struct TunnelBytes {
+    /// Visitor → origin.
+    pub bytes_in: AtomicU64,
+    /// Origin → visitor.
+    pub bytes_out: AtomicU64,
+    /// What the last traffic flush stored.
+    flushed_in: AtomicU64,
+    flushed_out: AtomicU64,
+    /// The owning user's usage once resolved; `Some(None)`: no user (a
+    /// service or the admin token).
+    user: OnceLock<Option<Arc<UserUsage>>>,
+}
+
+impl TunnelBytes {
+    /// Count `n` proxied bytes (`outbound`: origin → visitor), also for the owner.
+    pub fn count(&self, n: u64, outbound: bool) {
+        let counter = if outbound { &self.bytes_out } else { &self.bytes_in };
+        counter.fetch_add(n, Ordering::Relaxed);
+        if let Some(user) = self.owner() {
+            user.add(n, outbound);
+        }
+    }
+
+    /// Whether the owner was looked up ([`Self::resolve_owner`]).
+    fn owner_resolved(&self) -> bool {
+        self.user.get().is_some()
+    }
+
+    /// Attach the owner's usage (`None`: no user); the first one stays.
+    fn resolve_owner(&self, user: Option<Arc<UserUsage>>) {
+        let _ = self.user.set(user);
+    }
+
+    pub fn owner(&self) -> Option<&Arc<UserUsage>> {
+        self.user.get().and_then(Option::as_ref)
+    }
+
+    /// The owner reached their traffic cap.
+    pub fn blocked(&self) -> bool {
+        self.owner().is_some_and(|u| u.blocked())
+    }
+
+    pub fn totals(&self) -> (u64, u64) {
+        (self.bytes_in.load(Ordering::Relaxed), self.bytes_out.load(Ordering::Relaxed))
+    }
+
+    /// Counted since the last flush (in, out).
+    pub fn unflushed(&self) -> (u64, u64) {
+        let (i, o) = self.totals();
+        self.pending_at(i, o)
+    }
+
+    /// What totals read as (`at_in`, `at_out`) add since the last flush.
+    fn pending_at(&self, at_in: u64, at_out: u64) -> (u64, u64) {
+        (
+            at_in.saturating_sub(self.flushed_in.load(Ordering::Relaxed)),
+            at_out.saturating_sub(self.flushed_out.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// The totals, read once, and what they add since the last flush; `None`
+    /// when they add nothing.
+    fn cut(&self) -> Option<TunnelCut> {
+        let (now_in, now_out) = self.totals();
+        let delta = self.pending_at(now_in, now_out);
+        (delta != (0, 0)).then_some(TunnelCut { at: (now_in, now_out), delta })
+    }
+
+    /// A flush stored `cut`: what it read is the new baseline.
+    fn flushed(&self, cut: TunnelCut) {
+        self.flushed_in.store(cut.at.0, Ordering::Relaxed);
+        self.flushed_out.store(cut.at.1, Ordering::Relaxed);
+    }
+}
+
+/// What a flush takes from one tunnel's counter (see [`TunnelBytes::cut`]).
+struct TunnelCut {
+    /// The totals read (in, out).
+    at: (u64, u64),
+    /// What they add since the last flush (in, out).
+    delta: (u64, u64),
+}
+
+impl TunnelCut {
+    /// The flush row for `tunnel_id`.
+    fn row(&self, tunnel_id: String) -> TunnelDelta {
+        TunnelDelta { tunnel_id, bytes_in: self.delta.0, bytes_out: self.delta.1 }
+    }
 }
 
 /// One user's traffic this month, kept current on the hot path.
@@ -247,9 +339,11 @@ impl Cutoff<'_> {
     }
 }
 
-/// The in-memory side: loaded users and the month they count for.
+/// The in-memory side: loaded users, every tunnel's counter, and the month they count for.
 pub struct Traffic {
     users: Mutex<HashMap<String, Arc<UserUsage>>>,
+    /// Every tunnel's counter, by tunnel id.
+    tunnels: Mutex<HashMap<String, Arc<TunnelBytes>>>,
     month: AtomicU32,
     notify: Arc<Notify>,
     /// Written for every change besides counting: flushes, the month
@@ -263,6 +357,7 @@ impl Default for Traffic {
     fn default() -> Self {
         Self {
             users: Mutex::default(),
+            tunnels: Mutex::default(),
             month: AtomicU32::new(now_month()),
             notify: Arc::new(Notify::new()),
             changes: tokio::sync::RwLock::new(()),
@@ -340,31 +435,6 @@ impl Traffic {
     }
 }
 
-/// The tunnel's counter, with its owner's usage attached (loaded on first
-/// use). An error when the owner's usage cannot be loaded: the request must
-/// not be relayed uncounted.
-pub async fn counter(state: &AppState, tunnel: &TunnelRow) -> anyhow::Result<Arc<TunnelBytes>> {
-    let bytes = state.metrics.tunnel_bytes(&tunnel.id);
-    if bytes.user.get().is_none() {
-        let user = match &tunnel.user_id {
-            Some(id) => Some(state.traffic.usage(&state.db, id).await?),
-            None => None,
-        };
-        let _ = bytes.user.set(user);
-    }
-    Ok(bytes)
-}
-
-/// Whether the tunnel's owner has reached their cap (no database access).
-pub fn tunnel_blocked(state: &AppState, tunnel_id: &str) -> bool {
-    state.metrics.get(tunnel_id).is_some_and(|b| b.blocked())
-}
-
-/// Bytes counted for the tunnel since the last flush (in, out).
-pub fn unflushed(state: &AppState, tunnel_id: &str) -> (u64, u64) {
-    state.metrics.get(tunnel_id).map(|b| b.unflushed()).unwrap_or_default()
-}
-
 /// A user's traffic this month, for the API and the UI.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, ToSchema)]
 pub struct TrafficView {
@@ -377,61 +447,6 @@ pub struct TrafficView {
     pub limited: bool,
 }
 
-pub async fn view(state: &AppState, user_id: &str) -> anyhow::Result<TrafficView> {
-    let u = state.traffic.usage(&state.db, user_id).await?;
-    Ok(TrafficView {
-        month: month_label(state.traffic.month()),
-        used_bytes: u.total(),
-        cap_bytes: u.cap(),
-        limited: u.blocked(),
-    })
-}
-
-/// This month's bytes for a user in a listing: memory if loaded (it includes
-/// what is not flushed yet), else the stored figure.
-pub fn used_or(state: &AppState, user_id: &str, stored: u64) -> u64 {
-    state.traffic.loaded(user_id).map_or(stored, |u| u.total())
-}
-
-/// Apply a cap an admin just committed (call with [`Traffic::changes`] held
-/// across the commit and this, so two changes apply in commit order).
-pub async fn set_cap(state: &AppState, changes: &Changes<'_>, user_id: &str, cap: Option<u64>) -> anyhow::Result<()> {
-    state.traffic.usage_locked(changes, &state.db, user_id).await?.set_cap(cap);
-    Ok(())
-}
-
-/// An admin's "reset this month" (`actor` with `session`, authorized in the
-/// same transaction as the delete, audited in it too). The user's pending
-/// bytes are the cutoff: taken first, dropped once the delete commits (put
-/// back if it fails); what is counted after belongs to the new start. Tunnel
-/// totals are not touched. Runs as its own task, so a cancelled request
-/// cannot stop it halfway. Returns the username.
-pub async fn reset_month(
-    state: Arc<AppState>,
-    user_id: String,
-    actor: String,
-    session: String,
-    ip: Option<String>,
-) -> anyhow::Result<Result<String, AdminError>> {
-    tokio::spawn(async move {
-        let changes = state.traffic.changes().await;
-        let user = state.traffic.usage_locked(&changes, &state.db, &user_id).await?;
-        let taken = user.cut_off();
-        let reset = state.db.reset_traffic_for(actor.clone(), session, user_id, state.traffic.month()).await;
-        match &reset {
-            Ok(Ok(username)) => {
-                taken.restart();
-                if let Err(e) = state.db.audit(Some(actor), "traffic_reset", Some(username.clone()), ip).await {
-                    tracing::warn!(error = %format!("{e:#}"), "audit write failed");
-                }
-            }
-            _ => taken.unflush(),
-        }
-        reset
-    })
-    .await?
-}
-
 /// One tunnel's bytes for a flush.
 pub struct TunnelDelta {
     pub tunnel_id: String,
@@ -439,99 +454,214 @@ pub struct TunnelDelta {
     pub bytes_out: u64,
 }
 
-/// Write pending bytes (one transaction; none when idle).
-pub async fn flush(state: &AppState) -> anyhow::Result<()> {
-    let changes = state.traffic.changes().await;
-    flush_locked(state, &changes, state.traffic.month()).await
-}
-
-async fn flush_locked(state: &AppState, _: &Changes<'_>, month: u32) -> anyhow::Result<()> {
-    let mut tunnels = Vec::new();
-    let mut marks = Vec::new();
-    for (id, b) in state.metrics.snapshot() {
-        // One read: the delta written and the baseline stored come from it.
-        let (now_in, now_out) = b.totals();
-        let (d_in, d_out) = b.pending_at(now_in, now_out);
-        if d_in != 0 || d_out != 0 {
-            tunnels.push(TunnelDelta { tunnel_id: id, bytes_in: d_in, bytes_out: d_out });
-            marks.push((b, now_in, now_out));
+/// What [`Traffic`] does for the rest of the server: counting, views, admin
+/// changes, and the flush and enforcement jobs. It needs the database for
+/// loads and writes, and the registry for live tunnels.
+impl Traffic {
+    /// The tunnel's counter, created on first use.
+    pub fn tunnel_bytes(&self, tunnel_id: &str) -> Arc<TunnelBytes> {
+        let mut map = self.tunnels.lock().expect("metrics lock");
+        if let Some(b) = map.get(tunnel_id) {
+            return b.clone();
         }
+        map.entry(tunnel_id.to_string()).or_default().clone()
     }
-    // Scoped: the users' references must be gone before the pruning below,
-    // which keeps users that something else still holds.
-    {
-        let users: Vec<Arc<UserUsage>> = state.traffic.lock().values().filter(|u| u.has_pending()).cloned().collect();
-        let taken: Vec<Cutoff<'_>> = users.iter().map(|u| u.cut_off()).filter(|c| !c.is_empty()).collect();
-        if !tunnels.is_empty() || !taken.is_empty() {
-            let rows = taken.iter().map(Cutoff::row).collect();
-            if let Err(e) = state.db.flush_traffic(month, tunnels, rows).await {
-                for c in taken {
-                    c.unflush();
+
+    pub fn get(&self, tunnel_id: &str) -> Option<Arc<TunnelBytes>> {
+        self.tunnels.lock().expect("metrics lock").get(tunnel_id).cloned()
+    }
+
+    /// A deleted tunnel: its series ends (its row is gone, so its own total
+    /// has nowhere to go; its owner's bytes are in the owner's usage).
+    pub fn forget_tunnel(&self, tunnel_id: &str) {
+        self.tunnels.lock().expect("metrics lock").remove(tunnel_id);
+    }
+
+    /// Every tunnel's counter, for metrics and flushes.
+    pub fn snapshot(&self) -> Vec<(String, Arc<TunnelBytes>)> {
+        self.tunnels.lock().expect("metrics lock").iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// Drop counters that only this map holds and `keep` does not want.
+    fn prune(&self, keep: impl Fn(&str, &Arc<TunnelBytes>) -> bool) {
+        self.tunnels.lock().expect("metrics lock").retain(|id, b| Arc::strong_count(b) > 1 || keep(id, b));
+    }
+
+    /// The tunnel's counter, with its owner's usage attached (loaded on first
+    /// use). An error when the owner's usage cannot be loaded: the request must
+    /// not be relayed uncounted.
+    pub async fn counter(&self, db: &Db, tunnel: &TunnelRow) -> anyhow::Result<Arc<TunnelBytes>> {
+        let bytes = self.tunnel_bytes(&tunnel.id);
+        if !bytes.owner_resolved() {
+            let user = match &tunnel.user_id {
+                Some(id) => Some(self.usage(db, id).await?),
+                None => None,
+            };
+            bytes.resolve_owner(user);
+        }
+        Ok(bytes)
+    }
+
+    /// Whether the tunnel's owner has reached their cap (no database access).
+    pub fn tunnel_blocked(&self, tunnel_id: &str) -> bool {
+        self.get(tunnel_id).is_some_and(|b| b.blocked())
+    }
+
+    /// Bytes counted for the tunnel since the last flush (in, out).
+    pub fn unflushed(&self, tunnel_id: &str) -> (u64, u64) {
+        self.get(tunnel_id).map(|b| b.unflushed()).unwrap_or_default()
+    }
+
+    pub async fn view(&self, db: &Db, user_id: &str) -> anyhow::Result<TrafficView> {
+        let u = self.usage(db, user_id).await?;
+        Ok(TrafficView {
+            month: month_label(self.month()),
+            used_bytes: u.total(),
+            cap_bytes: u.cap(),
+            limited: u.blocked(),
+        })
+    }
+
+    /// This month's bytes for a user in a listing: memory if loaded (it includes
+    /// what is not flushed yet), else the stored figure.
+    pub fn used_or(&self, user_id: &str, stored: u64) -> u64 {
+        self.loaded(user_id).map_or(stored, |u| u.total())
+    }
+
+    /// Apply a cap an admin just committed (call with [`Traffic::changes`] held
+    /// across the commit and this, so two changes apply in commit order).
+    pub async fn set_cap(&self, changes: &Changes<'_>, db: &Db, user_id: &str, cap: Option<u64>) -> anyhow::Result<()> {
+        self.usage_locked(changes, db, user_id).await?.set_cap(cap);
+        Ok(())
+    }
+
+    /// An admin's "reset this month" (`actor` with `session`, authorized in the
+    /// same transaction as the delete, audited in it too). The user's pending
+    /// bytes are the cutoff: taken first, dropped once the delete commits (put
+    /// back if it fails); what is counted after belongs to the new start. Tunnel
+    /// totals are not touched. Runs as its own task, so a cancelled request
+    /// cannot stop it halfway. Returns the username.
+    pub async fn reset_month(
+        self: &Arc<Self>,
+        db: &Db,
+        user_id: String,
+        actor: String,
+        session: String,
+        ip: Option<String>,
+    ) -> anyhow::Result<Result<String, AdminError>> {
+        let traffic = self.clone();
+        let db = db.clone();
+        tokio::spawn(async move {
+            let changes = traffic.changes().await;
+            let user = traffic.usage_locked(&changes, &db, &user_id).await?;
+            let taken = user.cut_off();
+            let reset = db.reset_traffic_for(actor.clone(), session, user_id, traffic.month()).await;
+            match &reset {
+                Ok(Ok(username)) => {
+                    taken.restart();
+                    if let Err(e) = db.audit(Some(actor), "traffic_reset", Some(username.clone()), ip).await {
+                        tracing::warn!(error = %format!("{e:#}"), "audit write failed");
+                    }
                 }
-                return Err(e);
+                _ => taken.unflush(),
             }
-            for c in taken {
-                c.flushed();
+            reset
+        })
+        .await?
+    }
+
+    /// Write pending bytes (one transaction; none when idle).
+    pub async fn flush(&self, db: &Db, registry: &Registry) -> anyhow::Result<()> {
+        let changes = self.changes().await;
+        self.flush_locked(&changes, db, registry, self.month()).await
+    }
+
+    async fn flush_locked(&self, _: &Changes<'_>, db: &Db, registry: &Registry, month: u32) -> anyhow::Result<()> {
+        let mut tunnels = Vec::new();
+        let mut marks = Vec::new();
+        for (id, b) in self.snapshot() {
+            // One read: the delta written and the baseline stored come from it.
+            if let Some(cut) = b.cut() {
+                tunnels.push(cut.row(id));
+                marks.push((b, cut));
             }
         }
+        // Scoped: the users' references must be gone before the pruning below,
+        // which keeps users that something else still holds.
+        {
+            let users: Vec<Arc<UserUsage>> = self.lock().values().filter(|u| u.has_pending()).cloned().collect();
+            let taken: Vec<Cutoff<'_>> = users.iter().map(|u| u.cut_off()).filter(|c| !c.is_empty()).collect();
+            if !tunnels.is_empty() || !taken.is_empty() {
+                let rows = taken.iter().map(Cutoff::row).collect();
+                if let Err(e) = db.flush_traffic(month, tunnels, rows).await {
+                    for c in taken {
+                        c.unflush();
+                    }
+                    return Err(e);
+                }
+                for c in taken {
+                    c.flushed();
+                }
+            }
+        }
+        for (b, cut) in marks {
+            b.flushed(cut);
+        }
+        // Forget counters nobody uses any more, and users without counters or
+        // pending bytes (blocked users stay, so their block is known without a lookup).
+        self.prune(|id, b| b.unflushed() != (0, 0) || registry.get(id).is_some());
+        self.lock().retain(|_, u| Arc::strong_count(u) > 1 || u.blocked() || u.has_pending());
+        Ok(())
     }
-    for (b, now_in, now_out) in marks {
-        b.mark_flushed_at(now_in, now_out);
-    }
-    // Forget counters nobody uses any more, and users without counters or
-    // pending bytes (blocked users stay, so their block is known without a lookup).
-    state.metrics.prune(|id, b| b.unflushed() != (0, 0) || state.registry.get(id).is_some());
-    state.traffic.lock().retain(|_, u| Arc::strong_count(u) > 1 || u.blocked() || u.has_pending());
-    Ok(())
-}
 
-/// Flush every minute; at a new month, close the old one first.
-pub async fn run(state: Arc<AppState>) {
-    let mut tick = tokio::time::interval(FLUSH_EVERY);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick.tick().await;
-    loop {
+    /// Flush every minute; at a new month, close the old one first.
+    pub async fn run(&self, db: &Db, registry: &Registry) {
+        let mut tick = tokio::time::interval(FLUSH_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
-        if let Err(e) = flush_or_roll_over(&state, now_month()).await {
-            tracing::warn!(error = %format!("{e:#}"), "traffic flush failed; retrying in a minute");
-        }
-    }
-}
-
-/// Flush; if `current` is a new month, that flush closes the old month (its
-/// swaps are the cutoff) and every user's stored total starts again.
-pub(crate) async fn flush_or_roll_over(state: &AppState, current: u32) -> anyhow::Result<()> {
-    let changes = state.traffic.changes().await;
-    let month = state.traffic.month();
-    flush_locked(state, &changes, month).await?;
-    if current != month {
-        state.traffic.start_month(&changes, current);
-        tracing::info!(month = %month_label(current), "traffic counters start a new month");
-    }
-    Ok(())
-}
-
-/// When a user becomes blocked, cut what their tunnels are relaying.
-pub async fn enforce(state: Arc<AppState>) {
-    loop {
-        state.traffic.new_block().await;
-        for (id, b) in state.metrics.snapshot() {
-            if b.blocked() {
-                tracing::info!(tunnel = %id, "traffic limit reached; cutting in-flight requests");
-                state.registry.rotate_gate_epoch(&id);
+        loop {
+            tick.tick().await;
+            if let Err(e) = self.flush_or_roll_over(db, registry, now_month()).await {
+                tracing::warn!(error = %format!("{e:#}"), "traffic flush failed; retrying in a minute");
             }
         }
     }
-}
 
-/// At startup: load users already over their cap this month, so their
-/// tunnels are refused from the first request.
-pub async fn preload(state: &AppState) -> anyhow::Result<()> {
-    let changes = state.traffic.changes().await;
-    for user_id in state.db.users_over_cap(state.traffic.month()).await? {
-        state.traffic.usage_locked(&changes, &state.db, &user_id).await?;
+    /// Flush; if `current` is a new month, that flush closes the old month (its
+    /// swaps are the cutoff) and every user's stored total starts again.
+    pub(crate) async fn flush_or_roll_over(&self, db: &Db, registry: &Registry, current: u32) -> anyhow::Result<()> {
+        let changes = self.changes().await;
+        let month = self.month();
+        self.flush_locked(&changes, db, registry, month).await?;
+        if current != month {
+            self.start_month(&changes, current);
+            tracing::info!(month = %month_label(current), "traffic counters start a new month");
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// When a user becomes blocked, cut what their tunnels are relaying.
+    pub async fn enforce(&self, registry: &Registry) {
+        loop {
+            self.new_block().await;
+            for (id, b) in self.snapshot() {
+                if b.blocked() {
+                    tracing::info!(tunnel = %id, "traffic limit reached; cutting in-flight requests");
+                    registry.rotate_gate_epoch(&id);
+                }
+            }
+        }
+    }
+
+    /// At startup: load users already over their cap this month, so their
+    /// tunnels are refused from the first request.
+    pub async fn preload(&self, db: &Db) -> anyhow::Result<()> {
+        let changes = self.changes().await;
+        for user_id in db.users_over_cap(self.month()).await? {
+            self.usage_locked(&changes, db, &user_id).await?;
+        }
+        Ok(())
+    }
 }
 
 impl Db {
