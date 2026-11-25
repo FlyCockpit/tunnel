@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use tunnel_protocol::CloseReason;
 
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
-use crate::accounts::{AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, User, UserPatch};
+use crate::accounts::{
+    AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, ResetLinkError, User, UserPatch,
+};
 use crate::api::device::normalize_user_code;
 use crate::api::{self, ApiError, ApiJson, ApiResult, CreateAccessLinkRequest};
 use crate::clients;
@@ -30,6 +32,9 @@ const RECOVERY_CODES: usize = 10;
 /// Invites last this long unless the admin picks another lifetime (1 h ..= 30 d).
 const INVITE_TTL_S: i64 = 7 * 86_400;
 pub const OWNER_LINK_TTL_S: i64 = 15 * 60;
+/// Sign-in reset links last this long unless another lifetime is picked (15 min ..= 24 h).
+pub const RESET_LINK_TTL_S: i64 = 3600;
+pub const RESET_LINK_TTL_RANGE: std::ops::RangeInclusive<i64> = 15 * 60..=86_400;
 /// Argon2id PHC of a public fixture password, checked when a username is
 /// unknown so that answers take as long as for a wrong password.
 const DUMMY_PHC: &str =
@@ -62,6 +67,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/ui/api/users", get(list_users))
         .route("/ui/api/users/{id}", patch(update_user))
         .route("/ui/api/users/{id}/traffic/reset", post(reset_user_traffic))
+        .route("/ui/api/users/{id}/reset", post(create_reset_link))
         .route("/ui/api/invites", get(list_invites).post(create_invite))
         .route("/ui/api/invites/{id}", delete(delete_invite))
         .route("/ui/api/services", get(list_services))
@@ -438,10 +444,10 @@ async fn invite_info(
     if ctx.ip.is_some_and(|ip| !state.ui.login_ip.check(ip)) {
         return Err(too_many());
     }
-    let (invite, owner) = state.db.invite_by_token(invite_token_hash(&req.token)?).await?.ok_or_else(invalid_invite)?;
+    let invite = state.db.invite_by_token(invite_token_hash(&req.token)?).await?.ok_or_else(invalid_invite)?;
     Ok(Json(json!({
         "kind": invite.kind, "role": invite.role, "expires_at": invite.expires_at,
-        "invited_by": invite.created_by, "username": owner,
+        "invited_by": invite.created_by, "username": invite.user,
     })))
 }
 
@@ -449,11 +455,11 @@ async fn invite_info(
 #[serde(deny_unknown_fields)]
 struct AcceptRequest {
     token: String,
-    /// Ignored for an owner reset (the owner keeps their name).
+    /// Ignored for a reset (the account keeps its name).
     #[serde(default)]
     username: Option<String>,
     password: String,
-    /// Owner reset only: also remove the owner's machines (their tokens stop working).
+    /// Resets only: also remove the account's machines (their tokens stop working).
     #[serde(default)]
     revoke_machines: bool,
 }
@@ -467,11 +473,11 @@ async fn invite_accept(
         return Err(too_many());
     }
     let hash = invite_token_hash(&req.token)?;
-    let (invite, _) = state.db.invite_by_token(hash.clone()).await?.ok_or_else(invalid_invite)?;
+    let invite = state.db.invite_by_token(hash.clone()).await?.ok_or_else(invalid_invite)?;
     validate_password(&req.password)?;
     let password_hash = password::hash(req.password).await.map_err(|_| busy())?;
-    let acceptance = if invite.kind == InviteKind::OwnerReset {
-        Acceptance::OwnerReset { password_hash, revoke_machines: req.revoke_machines }
+    let acceptance = if matches!(invite.kind, InviteKind::OwnerReset | InviteKind::AccountReset) {
+        Acceptance::Reset { password_hash, revoke_machines: req.revoke_machines }
     } else {
         let username = validate_username(req.username.as_deref().unwrap_or_default())?;
         // New users start on the server defaults for their role.
@@ -493,6 +499,7 @@ async fn invite_accept(
         InviteKind::Invite => "user_created",
         InviteKind::OwnerSetup => "owner_created",
         InviteKind::OwnerReset => "owner_reset",
+        InviteKind::AccountReset => "account_reset",
     };
     for t in &tunnels {
         state.delete_tunnel(t, CloseReason::Deleted).await?;
@@ -1202,8 +1209,24 @@ async fn reset_user_traffic(
     }
 }
 
-async fn list_invites(State(state): State<Arc<AppState>>, _a: AdminSigned) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({ "invites": state.db.list_invites().await? })))
+/// Invites and sign-in reset links; `revocable` says whether this admin may
+/// revoke each (as `Db::delete_invite` decides: resets for members only,
+/// unless the owner asks).
+async fn list_invites(State(state): State<Arc<AppState>>, AdminSigned(s): AdminSigned) -> ApiResult<Json<Value>> {
+    let owner = s.user().role == Role::Owner;
+    let invites: Vec<Value> = state
+        .db
+        .list_invites()
+        .await?
+        .into_iter()
+        .map(|i| {
+            let revocable = i.kind != InviteKind::AccountReset || owner || i.user_role == Some(Role::Member);
+            let mut v = serde_json::to_value(&i).unwrap_or_default();
+            v["revocable"] = json!(revocable);
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "invites": invites })))
 }
 
 #[derive(Deserialize)]
@@ -1247,6 +1270,72 @@ async fn create_invite(
         .ok_or_else(changed_meanwhile)?;
     audit(&state, Some(&s.user().id), "invite_created", Some(format!("{} {}", invite.id, req.role.as_str())), &s.ctx)
         .await;
+    // The token goes in the fragment: it never reaches a server log or a Referer.
+    Ok(Json(json!({ "url": format!("https://{ui}/invite#{token}"), "invite": invite })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewResetLink {
+    #[serde(default)]
+    ttl_s: Option<i64>,
+    /// TOTP or recovery code when the session's last check is stale.
+    #[serde(default)]
+    code: Option<String>,
+}
+
+fn reset_forbidden() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "admins reset members and the owner resets admins; the owner uses `tunnel-server admin link`",
+    )
+}
+
+/// A single-use link that sets a new password for another account and turns
+/// its two-factor sign-in off (for someone locked out); the admin hands it over.
+async fn create_reset_link(
+    State(state): State<Arc<AppState>>,
+    AdminSigned(s): AdminSigned,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<NewResetLink>,
+) -> ApiResult<Json<Value>> {
+    let ttl = req.ttl_s.unwrap_or(RESET_LINK_TTL_S);
+    if !RESET_LINK_TTL_RANGE.contains(&ttl) {
+        return Err(ApiError::validation(format!(
+            "ttl_s must be within {}..={}",
+            RESET_LINK_TTL_RANGE.start(),
+            RESET_LINK_TTL_RANGE.end()
+        )));
+    }
+    let ui = state.config.ui_host.clone().ok_or_else(|| ApiError::not_found("route"))?;
+    // A clear refusal before a code is asked for; the transaction below is the authority.
+    let target = state.db.credentials(None, Some(id.clone())).await?.ok_or_else(|| ApiError::not_found("user"))?.user;
+    if target.role == Role::Owner || target.id == s.user().id || !may_manage(&state, s.user(), &target.id).await? {
+        return Err(reset_forbidden());
+    }
+    require_fresh_auth(&state, &s, req.code.as_deref()).await?;
+    let token = tokens::random_token(INVITE_PREFIX);
+    let made = state
+        .db
+        .create_reset_link(
+            format!("in{}", tokens::random_tunnel_id()),
+            tokens::hash_token(&token),
+            id,
+            Some((s.user().id.clone(), s.session.id_hash.clone())),
+            now() + ttl,
+        )
+        .await?;
+    let invite = match made {
+        Ok(invite) => invite,
+        Err(ResetLinkError::NotFound) => return Err(ApiError::not_found("user")),
+        Err(ResetLinkError::Forbidden) => return Err(reset_forbidden()),
+        Err(ResetLinkError::Disabled) => {
+            return Err(ApiError::new(StatusCode::CONFLICT, "disabled", "this account is disabled; enable it first"));
+        }
+        Err(ResetLinkError::SignedOut) => return Err(changed_meanwhile()),
+    };
+    audit(&state, Some(&s.user().id), "reset_link_created", invite.user.clone(), &s.ctx).await;
     // The token goes in the fragment: it never reaches a server log or a Referer.
     Ok(Json(json!({ "url": format!("https://{ui}/invite#{token}"), "invite": invite })))
 }

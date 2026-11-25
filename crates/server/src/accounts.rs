@@ -118,6 +118,8 @@ pub enum InviteKind {
     Invite,
     OwnerSetup,
     OwnerReset,
+    /// A new password for one account other than the owner's.
+    AccountReset,
 }
 
 impl InviteKind {
@@ -126,13 +128,17 @@ impl InviteKind {
             Self::Invite => "invite",
             Self::OwnerSetup => "owner_setup",
             Self::OwnerReset => "owner_reset",
+            Self::AccountReset => "account_reset",
         }
     }
-    fn parse(s: &str) -> Self {
+    /// `None` for a kind this build does not know: never read as an invite.
+    fn parse(s: &str) -> Option<Self> {
         match s {
-            "owner_setup" => Self::OwnerSetup,
-            "owner_reset" => Self::OwnerReset,
-            _ => Self::Invite,
+            "invite" => Some(Self::Invite),
+            "owner_setup" => Some(Self::OwnerSetup),
+            "owner_reset" => Some(Self::OwnerReset),
+            "account_reset" => Some(Self::AccountReset),
+            _ => None,
         }
     }
 }
@@ -147,17 +153,34 @@ pub struct Invite {
     pub expires_at: i64,
     pub used_at: Option<i64>,
     pub used_by: Option<String>,
+    /// The account an `owner_reset` or `account_reset` is for.
+    pub user: Option<String>,
+    /// That account's role now.
+    #[serde(skip)]
+    pub user_role: Option<Role>,
 }
 
-/// What redeeming an invite needs: a new account, or the owner's reset.
+/// What redeeming an invite needs: a new account, or a reset.
 pub enum Acceptance {
     NewUser(NewUser),
-    /// Owner reset: new password; TOTP, recovery codes and sessions are
-    /// cleared, and with `revoke_machines` the owner's machines too.
-    OwnerReset {
+    /// Owner or account reset: new password; TOTP, recovery codes, sessions
+    /// and pending machine logins are cleared, and with `revoke_machines` the
+    /// account's machines too.
+    Reset {
         password_hash: String,
         revoke_machines: bool,
     },
+}
+
+/// Why a sign-in reset link was not made.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResetLinkError {
+    NotFound,
+    /// The owner (use `admin link`), oneself, or an admin for an admin.
+    Forbidden,
+    Disabled,
+    /// The actor's session ended meanwhile.
+    SignedOut,
 }
 
 /// Why a machine rename was refused.
@@ -287,13 +310,17 @@ fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
 fn invite_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Invite> {
     Ok(Invite {
         id: r.get(0)?,
-        kind: InviteKind::parse(&r.get::<_, String>(1)?),
+        kind: InviteKind::parse(&r.get::<_, String>(1)?).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, "unknown link kind".into())
+        })?,
         role: Role::parse(&r.get::<_, String>(2)?),
         created_by: r.get(3)?,
         created_at: r.get(4)?,
         expires_at: r.get(5)?,
         used_at: r.get(6)?,
         used_by: r.get(7)?,
+        user: r.get(8)?,
+        user_role: r.get::<_, Option<String>>(9)?.as_deref().map(Role::parse),
     })
 }
 
@@ -900,9 +927,11 @@ impl Db {
                     return Ok(None);
                 }
             }
+            // Sign-in resets for other accounts are made by `create_reset_link`.
+            anyhow::ensure!(kind != InviteKind::AccountReset, "account resets are made by create_reset_link");
             // A new owner link replaces any earlier unused one.
             if kind != InviteKind::Invite {
-                tx.execute("DELETE FROM invites WHERE kind != 'invite' AND used_at IS NULL", [])?;
+                tx.execute("DELETE FROM invites WHERE kind IN ('owner_setup', 'owner_reset') AND used_at IS NULL", [])?;
             }
             tx.execute(
                 "INSERT INTO invites (id, token_hash, kind, role, created_by, created_at, expires_at)
@@ -910,7 +939,92 @@ impl Db {
                 params![id, token_hash, kind.as_str(), role.as_str(), created_by, t, expires_at],
             )?;
             tx.commit()?;
-            Ok(Some(Invite { id, kind, role, created_by, created_at: t, expires_at, used_at: None, used_by: None }))
+            Ok(Some(Invite {
+                id,
+                kind,
+                role,
+                created_by,
+                created_at: t,
+                expires_at,
+                used_at: None,
+                used_by: None,
+                user: None,
+                user_role: None,
+            }))
+        })
+        .await
+    }
+
+    /// A sign-in reset link for `target` (a user id), replacing its earlier
+    /// unused one. From the web UI, `actor` is `(user id, session)`: still
+    /// signed in, and the owner (for an admin or member) or an admin (for a
+    /// member), checked in the same transaction. `None` is the server shell.
+    /// Nobody resets the owner here (`admin link` does) or themselves.
+    pub async fn create_reset_link(
+        &self,
+        id: String,
+        token_hash: String,
+        target: String,
+        actor: Option<(String, String)>,
+        expires_at: i64,
+    ) -> anyhow::Result<Result<Invite, ResetLinkError>> {
+        self.call(move |c| {
+            let t = now();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let found: Option<(String, String, bool, i64)> = tx
+                .query_row(
+                    "SELECT username, role, disabled_at IS NOT NULL, auth_epoch FROM users WHERE id = ?1",
+                    params![target],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((username, role, disabled, epoch)) = found else {
+                return Ok(Err(ResetLinkError::NotFound));
+            };
+            let role = Role::parse(&role);
+            let mut issuer_epoch = None;
+            if let Some((actor, session)) = &actor {
+                if !authorized(&tx, actor, None, session)? {
+                    return Ok(Err(ResetLinkError::SignedOut));
+                }
+                let (actor_role, actor_epoch): (String, i64) =
+                    tx.query_row("SELECT role, auth_epoch FROM users WHERE id = ?1", params![actor], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                if *actor == target || !may_reset(Role::parse(&actor_role), role) {
+                    return Ok(Err(ResetLinkError::Forbidden));
+                }
+                issuer_epoch = Some(actor_epoch);
+            }
+            if role == Role::Owner {
+                return Ok(Err(ResetLinkError::Forbidden));
+            }
+            if disabled {
+                return Ok(Err(ResetLinkError::Disabled));
+            }
+            tx.execute("DELETE FROM invites WHERE kind = 'account_reset' AND user_id = ?1 AND used_at IS NULL", params![
+                target
+            ])?;
+            let created_by = actor.map(|(a, _)| a);
+            tx.execute(
+                "INSERT INTO invites (id, token_hash, kind, role, created_by, created_at, expires_at, user_id, auth_epoch,
+                                      issuer_epoch)
+                 VALUES (?1, ?2, 'account_reset', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![id, token_hash, role.as_str(), created_by, t, expires_at, target, epoch, issuer_epoch],
+            )?;
+            tx.commit()?;
+            Ok(Ok(Invite {
+                id,
+                kind: InviteKind::AccountReset,
+                role,
+                created_by,
+                created_at: t,
+                expires_at,
+                used_at: None,
+                used_by: None,
+                user: Some(username),
+                user_role: Some(role),
+            }))
         })
         .await
     }
@@ -952,27 +1066,37 @@ impl Db {
         .await
     }
 
-    /// An unused, unexpired invite, with the owner's name for a reset.
-    pub async fn invite_by_token(&self, token_hash: String) -> anyhow::Result<Option<(Invite, Option<String>)>> {
+    /// An unused, unexpired invite (with the account's name for a reset).
+    pub async fn invite_by_token(&self, token_hash: String) -> anyhow::Result<Option<Invite>> {
         self.call(move |c| {
             let found = c
                 .query_row(
-                    "SELECT i.id, i.kind, i.role, cu.username, i.created_at, i.expires_at, i.used_at, i.used_by
-                     FROM invites i LEFT JOIN users cu ON cu.id = i.created_by
+                    "SELECT i.id, i.kind, i.role, cu.username, i.created_at, i.expires_at, i.used_at, i.used_by,
+                            CASE i.kind WHEN 'owner_reset' THEN (SELECT username FROM users WHERE role = 'owner')
+                                        ELSE tu.username END,
+                            CASE i.kind WHEN 'owner_reset' THEN 'owner' ELSE tu.role END,
+                            i.user_id, i.auth_epoch, i.created_by, i.issuer_epoch
+                     FROM invites i LEFT JOIN users cu ON cu.id = i.created_by LEFT JOIN users tu ON tu.id = i.user_id
                      WHERE i.token_hash = ?1 AND i.used_at IS NULL AND i.expires_at > ?2",
                     params![token_hash, now()],
-                    invite_from_row,
+                    |r| {
+                        let issuer: Option<String> = r.get(12)?;
+                        Ok((invite_from_row(r)?, r.get::<_, Option<String>>(10)?, r.get(11)?, issuer, r.get(13)?))
+                    },
                 )
                 .optional()?;
-            let Some(invite) = found else {
+            let Some((invite, target, epoch, issuer, issuer_epoch)) = found else {
                 return Ok(None);
             };
-            let owner = if invite.kind == InviteKind::OwnerReset {
-                c.query_row("SELECT username FROM users WHERE role = 'owner'", [], |r| r.get(0)).optional()?
-            } else {
-                None
-            };
-            Ok(Some((invite, owner)))
+            // A reset link that redeeming would refuse says nothing about its account.
+            if invite.kind == InviteKind::AccountReset {
+                let role = invite.role.as_str();
+                let issuer = issuer.as_deref().map(|i| (i, issuer_epoch));
+                if !target.is_some_and(|t| reset_still_allowed(c, &t, role, epoch, issuer).unwrap_or(false)) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(invite))
         })
         .await
     }
@@ -980,29 +1104,34 @@ impl Db {
     pub async fn list_invites(&self) -> anyhow::Result<Vec<Invite>> {
         self.call(|c| {
             let mut stmt = c.prepare(
-                "SELECT i.id, i.kind, i.role, cu.username, i.created_at, i.expires_at, i.used_at, uu.username
+                "SELECT i.id, i.kind, i.role, cu.username, i.created_at, i.expires_at, i.used_at, uu.username,
+                        tu.username, tu.role
                  FROM invites i LEFT JOIN users cu ON cu.id = i.created_by LEFT JOIN users uu ON uu.id = i.used_by
-                 WHERE i.kind = 'invite' ORDER BY i.created_at DESC LIMIT 200",
+                 LEFT JOIN users tu ON tu.id = i.user_id
+                 WHERE i.kind IN ('invite', 'account_reset') ORDER BY i.created_at DESC LIMIT 200",
             )?;
             Ok(stmt.query_map([], invite_from_row)?.collect::<Result<Vec<_>, _>>()?)
         })
         .await
     }
 
-    /// Revoke an unused invite, while `actor` (an admin) is still signed in with `session`.
+    /// Revoke an unused invite, or a sign-in reset link for an account
+    /// `actor` may reset, while `actor` (an admin) is still signed in with `session`.
     pub async fn delete_invite(&self, id: String, actor: String, session: String) -> anyhow::Result<bool> {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let admin: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM users WHERE id = ?1 AND role IN ('owner', 'admin'))",
-                params![actor],
-                |r| r.get(0),
-            )?;
-            if !admin || !authorized(&tx, &actor, None, &session)? {
+            let role: Option<String> =
+                tx.query_row("SELECT role FROM users WHERE id = ?1", params![actor], |r| r.get(0)).optional()?;
+            let role = role.as_deref().map(Role::parse);
+            if !role.is_some_and(Role::is_admin) || !authorized(&tx, &actor, None, &session)? {
                 return Ok(false);
             }
-            let n =
-                tx.execute("DELETE FROM invites WHERE id = ?1 AND kind = 'invite' AND used_at IS NULL", params![id])?;
+            let n = tx.execute(
+                "DELETE FROM invites WHERE id = ?1 AND used_at IS NULL
+                   AND (kind = 'invite' OR (kind = 'account_reset' AND
+                        (?2 = 'owner' OR (SELECT role FROM users WHERE id = invites.user_id) = 'member')))",
+                params![id, role.map(Role::as_str)],
+            )?;
             tx.commit()?;
             Ok(n == 1)
         })
@@ -1019,17 +1148,35 @@ impl Db {
         self.call(move |c| {
             let t = now();
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let invite: Option<(String, String, String)> = tx
+            /// Who made a reset link, and the account and auth epoch it is for.
+            struct Reset {
+                created_by: Option<String>,
+                target: Option<String>,
+                epoch: Option<i64>,
+                issuer_epoch: Option<i64>,
+            }
+            let invite: Option<(String, String, String, Reset)> = tx
                 .query_row(
-                    "SELECT id, kind, role FROM invites WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
+                    "SELECT id, kind, role, created_by, user_id, auth_epoch, issuer_epoch FROM invites
+                     WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
                     params![token_hash, t],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| {
+                        let reset = Reset {
+                            created_by: r.get(3)?,
+                            target: r.get(4)?,
+                            epoch: r.get(5)?,
+                            issuer_epoch: r.get(6)?,
+                        };
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, reset))
+                    },
                 )
                 .optional()?;
-            let Some((invite_id, kind, role)) = invite else {
+            let Some((invite_id, kind, role, reset)) = invite else {
                 return Ok(Err(AcceptError::Invalid));
             };
-            let kind = InviteKind::parse(&kind);
+            let Some(kind) = InviteKind::parse(&kind) else {
+                return Ok(Err(AcceptError::Invalid));
+            };
             // The owner, and whether it still lacks a password (created for
             // machines before anyone signed up).
             let owner: Option<(String, bool)> = tx
@@ -1039,31 +1186,24 @@ impl Db {
                 .optional()?;
             let mut tunnels = Vec::new();
             let user_id = match (kind, acceptance) {
-                (InviteKind::OwnerReset, Acceptance::OwnerReset { password_hash, revoke_machines }) => {
+                (InviteKind::OwnerReset, Acceptance::Reset { password_hash, revoke_machines }) => {
                     let Some((owner, _)) = owner else {
                         return Ok(Err(AcceptError::OwnerState));
                     };
-                    tx.execute(
-                        "UPDATE users SET password_hash = ?2, totp_secret_sealed = NULL, totp_pending_sealed = NULL,
-                                totp_last_step = NULL, disabled_at = NULL, auth_epoch = auth_epoch + 1,
-                                factor_failures = 0, factor_locked_until = NULL WHERE id = ?1",
-                        params![owner, password_hash],
-                    )?;
-                    tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![owner])?;
-                    tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![owner])?;
-                    // Logins approved before the reset (maybe by whoever forced it) are not honoured.
-                    tx.execute("DELETE FROM device_logins WHERE user_id = ?1", params![owner])?;
-                    if revoke_machines {
-                        let clients: Vec<String> = {
-                            let mut stmt = tx.prepare("SELECT id FROM clients WHERE user_id = ?1")?;
-                            stmt.query_map(params![owner], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
-                        };
-                        for client in clients {
-                            tunnels.extend(expire_owner_tunnels(&tx, &client)?);
-                            tx.execute("DELETE FROM clients WHERE id = ?1", params![client])?;
-                        }
-                    }
+                    tx.execute("UPDATE users SET disabled_at = NULL WHERE id = ?1", params![owner])?;
+                    reset_sign_in(&tx, &owner, &password_hash, revoke_machines, &mut tunnels)?;
                     owner
+                }
+                (InviteKind::AccountReset, Acceptance::Reset { password_hash, revoke_machines }) => {
+                    let Some(target) = reset.target else {
+                        return Ok(Err(AcceptError::Invalid));
+                    };
+                    let issuer = reset.created_by.as_deref().map(|id| (id, reset.issuer_epoch));
+                    if !reset_still_allowed(&tx, &target, &role, reset.epoch, issuer)? {
+                        return Ok(Err(AcceptError::Invalid));
+                    }
+                    reset_sign_in(&tx, &target, &password_hash, revoke_machines, &mut tunnels)?;
+                    target
                 }
                 (InviteKind::OwnerSetup, Acceptance::NewUser(u)) => match owner {
                     Some((_, false)) => return Ok(Err(AcceptError::OwnerState)),
@@ -1708,6 +1848,85 @@ impl Db {
 }
 
 /// Insert `u` with `role`; `None` if the username is taken.
+/// Whether an `actor_role` may reset the sign-in of an account with `target_role`.
+fn may_reset(actor_role: Role, target_role: Role) -> bool {
+    match target_role {
+        Role::Member => actor_role.is_admin(),
+        Role::Admin => actor_role == Role::Owner,
+        Role::Owner => false,
+    }
+}
+
+/// An `account_reset` link is honoured only while its account is enabled and
+/// has the role and sign-in (auth epoch) it had when the link was made, and
+/// the admin who made it (none: the server shell) still may reset it with
+/// the sign-in it had then: any change to the maker's sign-in, role or status
+/// since (a recovery from a stolen session, a demotion, even one undone)
+/// voids the links it made.
+fn reset_still_allowed(
+    tx: &rusqlite::Connection,
+    target: &str,
+    role: &str,
+    epoch: Option<i64>,
+    issuer: Option<(&str, Option<i64>)>,
+) -> anyhow::Result<bool> {
+    let current: Option<(String, i64)> = tx
+        .query_row("SELECT role, auth_epoch FROM users WHERE id = ?1 AND disabled_at IS NULL", params![target], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((current_role, current_epoch)) = current else {
+        return Ok(false);
+    };
+    if current_role != role || Some(current_epoch) != epoch || Role::parse(role) == Role::Owner {
+        return Ok(false);
+    }
+    let Some((issuer, issuer_epoch)) = issuer else {
+        return Ok(true);
+    };
+    let found: Option<(String, i64)> = tx
+        .query_row("SELECT role, auth_epoch FROM users WHERE id = ?1 AND disabled_at IS NULL", params![issuer], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    Ok(issuer != target
+        && found.is_some_and(|(r, e)| Some(e) == issuer_epoch && may_reset(Role::parse(&r), Role::parse(role))))
+}
+
+/// A new password for `user_id`; its second factor, recovery codes, factor
+/// lockout, sessions and pending machine logins go, and its auth epoch moves
+/// on (voiding anything issued for the old sign-in). With `revoke_machines`
+/// its machines go too; their tunnels are added to `tunnels`.
+fn reset_sign_in(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: &str,
+    password_hash: &str,
+    revoke_machines: bool,
+    tunnels: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE users SET password_hash = ?2, totp_secret_sealed = NULL, totp_pending_sealed = NULL,
+                totp_last_step = NULL, auth_epoch = auth_epoch + 1,
+                factor_failures = 0, factor_locked_until = NULL WHERE id = ?1",
+        params![user_id, password_hash],
+    )?;
+    tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user_id])?;
+    tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![user_id])?;
+    // Logins approved before the reset (maybe by whoever forced it) are not honoured.
+    tx.execute("DELETE FROM device_logins WHERE user_id = ?1", params![user_id])?;
+    if revoke_machines {
+        let clients: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM clients WHERE user_id = ?1")?;
+            stmt.query_map(params![user_id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
+        };
+        for client in clients {
+            tunnels.extend(expire_owner_tunnels(tx, client.as_str())?);
+            tx.execute("DELETE FROM clients WHERE id = ?1", params![client])?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_user(tx: &rusqlite::Transaction<'_>, u: NewUser, role: Role, t: i64) -> anyhow::Result<Option<String>> {
     let inserted = tx.execute(
         "INSERT INTO users (id, username, password_hash, role, can_public, created_at)

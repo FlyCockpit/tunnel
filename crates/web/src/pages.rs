@@ -172,9 +172,11 @@ fn InvitePage() -> impl IntoView {
         });
     }
     let kind = move || info.get().and_then(|v| v["kind"].as_str().map(str::to_string)).unwrap_or_default();
+    let is_reset = move || matches!(kind().as_str(), "owner_reset" | "account_reset");
     let title = move || match kind().as_str() {
         "owner_setup" => "Create the owner account".to_string(),
         "owner_reset" => "Reset the owner's password".to_string(),
+        "account_reset" => "Set a new password".to_string(),
         _ => format!(
             "Join as {}",
             info.get().and_then(|v| v["role"].as_str().map(str::to_string)).unwrap_or_else(|| "member".into())
@@ -187,7 +189,7 @@ fn InvitePage() -> impl IntoView {
             return;
         }
         let mut body = json!({ "token": token.clone(), "password": password.get() });
-        if kind() == "owner_reset" {
+        if is_reset() {
             body["revoke_machines"] = json!(revoke.get());
         } else {
             body["username"] = json!(username.get());
@@ -212,7 +214,7 @@ fn InvitePage() -> impl IntoView {
                     <Show when=move || error.get().is_none()><p class="muted">"Checking the link…"</p></Show>
                 }>
                     <form on:submit=submit.clone()>
-                        <Show when=move || kind() == "owner_reset" fallback=move || view! {
+                        <Show when=is_reset fallback=move || view! {
                             <div class="field">
                                 <label for="new-username">"Username"</label>
                                 <input id="new-username" class="input" autocomplete="username" required maxlength="32"
@@ -222,11 +224,15 @@ fn InvitePage() -> impl IntoView {
                         }>
                             <p class="muted">
                                 "Signing in as " <strong>{move || info.get().and_then(|v| v["username"].as_str().map(str::to_string)).unwrap_or_default()}</strong>
-                                ". Two-factor sign-in is turned off; turn it on again afterwards."
+                                ". Two-factor sign-in and the recovery codes are turned off and every session of this account ends; turn two-factor sign-in on again afterwards."
                             </p>
                             <label class="check">
                                 <input type="checkbox" prop:checked=move || revoke.get() on:change=move |ev| revoke.set(event_target_checked(&ev)) />
-                                "Also remove all of the owner's machines (their logins stop working)"
+                                {move || if kind() == "owner_reset" {
+                                    "Also remove all of the owner's machines (their logins stop working)"
+                                } else {
+                                    "Also remove all of this account's machines (their logins stop working)"
+                                }}
                             </label>
                         </Show>
                         <div class="field">
@@ -1326,6 +1332,9 @@ fn Users(me: User) -> impl IntoView {
     let role = RwSignal::new("member".to_string());
     let new_url = RwSignal::new(None::<String>);
     let month = RwSignal::new(String::new());
+    // Open reset panels and the links made in them, by user id: kept outside
+    // the rows, which every reload renders anew.
+    let resets = RwSignal::new(std::collections::HashMap::<String, Option<String>>::new());
     // Loading the lists does not disable the invite button (only a submit in flight does).
     let loading = RwSignal::new(false);
     let load = move || {
@@ -1378,7 +1387,7 @@ fn Users(me: User) -> impl IntoView {
         <div class="page">
             <div class="page-head"><div>
                 <h1>"Users"</h1>
-                <p class="muted">"Invite people with a single-use link. Members see only their own machines and tunnels."</p>
+                <p class="muted">"Invite people with a single-use link. Members see only their own machines and tunnels. Reset sign-in makes a link for someone who is locked out."</p>
             </div></div>
             <ErrorBox error=error />
             <form class="card stack" on:submit=invite>
@@ -1401,7 +1410,9 @@ fn Users(me: User) -> impl IntoView {
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
                         <th>{move || format!("Traffic {}", month.get())}</th><th>"Public previews"</th><th>"2FA"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
-                    {move || users.get().into_iter().map(|row| {
+                    // Keyed by the whole row: a reload re-renders only rows that changed, so
+                    // the panels open in the others (and what is typed in them) stay.
+                    <For each=move || users.get() key=|row: &UserRow| (row.user.id.clone(), format!("{row:?}")) children=move |row: UserRow| {
                         let u = row.user.clone();
                         let editable = u.role != "owner" && u.id != me_id && (owner || u.role == "member");
                         let (id1, id2, id3, id4) = (u.id.clone(), u.id.clone(), u.id.clone(), u.id.clone());
@@ -1409,6 +1420,8 @@ fn Users(me: User) -> impl IntoView {
                         let cap = u.limits.traffic_bytes.effective;
                         let limited = cap.is_some_and(|c| row.traffic_bytes >= c);
                         let editing = RwSignal::new(false);
+                        let (reset_id, reset_name, name2, id7) = (u.id.clone(), u.username.clone(), u.username.clone(), u.id.clone());
+                        let resetting = Memo::new({ let id = u.id.clone(); move |_| resets.with(|r| r.contains_key(&id)) });
                         let can_public = u.can_public;
                         let disabled = u.disabled;
                         let is_admin = u.role == "admin";
@@ -1437,6 +1450,15 @@ fn Users(me: User) -> impl IntoView {
                             <td class="actions">{editable.then(|| view! {
                                 <button class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
                                     on:click=move |_| editing.update(|e| *e = !*e)>"Limits"</button>" "
+                                {(!disabled).then(|| view! {
+                                    <button class="btn btn-outline btn-sm" aria-expanded=move || resetting.get().to_string()
+                                        aria-label=format!("Reset sign-in for {name2}")
+                                        on:click=move |_| resets.update(|r| {
+                                            if r.remove(&id7).is_none() {
+                                                r.insert(id7.clone(), None);
+                                            }
+                                        })>"Reset sign-in"</button>" "
+                                })}
                                 {(owner && !disabled).then(|| view! {
                                     <button class="btn btn-outline btn-sm" on:click=move |_| update(id2.clone(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
                                         {if is_admin { "Make member" } else { "Make admin" }}
@@ -1454,30 +1476,40 @@ fn Users(me: User) -> impl IntoView {
                                 <LimitsEditor id=id5.clone() limits=limits.clone() busy=busy error=error update=update />
                             </td></tr>
                         })}
+                        {move || resetting.get().then(|| view! {
+                            <tr class="panel-row"><td colspan="8" class="links-panel">
+                                <ResetPanel id=reset_id.clone() username=reset_name.clone() resets=resets reload=load />
+                            </td></tr>
+                        })}
                         }
-                    }).collect_view()}
+                    } />
                     </tbody>
                 </table>
             </div>
             <div class="card card-tight table-wrap">
                 <h2 class="card-head">"Invites"</h2>
                 <table class="table table-stack">
-                    <thead><tr><th>"Role"</th><th>"By"</th><th>"Created"</th><th>"Status"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
+                    <thead><tr><th>"Link"</th><th>"By"</th><th>"Created"</th><th>"Status"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
                     {move || invites.get().into_iter().map(|i| {
                         let id = i.id.clone();
                         let open = i.used_at.is_none() && i.expires_at > (js_sys::Date::now() / 1000.0) as i64;
+                        let revocable = open && i.revocable;
                         let status = match (&i.used_by, open) {
                             (Some(u), _) => format!("used by {u}"),
                             (None, true) => format!("open, expires {}", relative(i.expires_at)),
                             (None, false) => "expired".into(),
                         };
                         view! { <tr>
-                            <td class="cell-main">{i.role.clone()}</td>
+                            <td class="cell-main">{if i.kind == "account_reset" {
+                                format!("sign-in reset for {}", i.user.clone().unwrap_or_default())
+                            } else {
+                                format!("{} invite", i.role)
+                            }}</td>
                             <td data-label="By">{i.created_by.clone().unwrap_or_else(|| "—".into())}</td>
                             <td data-label="Created">{relative(i.created_at)}</td>
                             <td data-label="Status">{status}</td>
-                            <td class="actions">{open.then(|| view! {
+                            <td class="actions">{revocable.then(|| view! {
                                 <button class="btn btn-outline btn-sm" on:click=move |_| revoke_invite(id.clone())>"Revoke"</button>
                             })}</td>
                         </tr> }
@@ -1502,6 +1534,111 @@ fn Users(me: User) -> impl IntoView {
                     }
                 }}
             </div>
+        </div>
+    }
+}
+
+/// Users: make a sign-in reset link for one account and show it once. Which
+/// panels are open, and their links, live in `resets` (by user id); the rows
+/// are keyed, so other rows' changes leave this panel (and its form) alone.
+#[component]
+fn ResetPanel<F>(
+    id: String,
+    username: String,
+    resets: RwSignal<std::collections::HashMap<String, Option<String>>>,
+    reload: F,
+) -> impl IntoView
+where
+    F: Fn() + Copy + Send + Sync + 'static,
+{
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let needs_code = RwSignal::new(false);
+    let code = RwSignal::new(String::new());
+    let code_id = format!("reset-code-{id}");
+    let url = Memo::new({
+        let id = id.clone();
+        move |_| resets.with(|r| r.get(&id).cloned().flatten())
+    });
+    let close = {
+        let id = id.clone();
+        move || {
+            resets.update(|r| {
+                r.remove(&id);
+            })
+        }
+    };
+    let create = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let mut body = json!({});
+        if needs_code.get_untracked() {
+            body["code"] = json!(code.get_untracked());
+        }
+        let path = format!("/ui/api/users/{id}/reset");
+        let id = id.clone();
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match api::post::<Value>(&path, &body).await {
+                Ok(v) => {
+                    let made = v["url"].as_str().map(str::to_string);
+                    resets.update(|r| {
+                        r.insert(id, made);
+                    });
+                    needs_code.set(false);
+                    code.set(String::new());
+                    reload();
+                }
+                Err(e) if e.code == "code_required" => {
+                    needs_code.set(true);
+                    error.set(Some(e.message));
+                }
+                Err(e) => error.set(Some(e.message)),
+            }
+            busy.set(false);
+        });
+    };
+    let (name1, name2) = (username.clone(), username);
+    view! {
+        <div class="stack">
+            <ErrorBox error=error />
+            {move || match url.get() {
+                Some(u) => view! {
+                    <p class="small">{format!("Send this link to {name1}; it works once, within an hour, and is a credential.")}</p>
+                    <Copy value=Signal::derive(move || u.clone()) label="Reset link" />
+                    <div><button class="btn btn-outline btn-sm" type="button" on:click={
+                        let close = close.clone();
+                        move |_| close()
+                    }>"Done"</button></div>
+                }.into_any(),
+                None => {
+                    let code_id = code_id.clone();
+                    view! {
+                        <form class="stack" on:submit=create.clone()>
+                            <p class="small">{format!(
+                                "A single-use link lets {name2} choose a new password. Their two-factor sign-in and recovery codes are turned off and all their sessions end; their machines stay unless they choose otherwise. It works for one hour; hand it over as you would an invite."
+                            )}</p>
+                            {move || needs_code.get().then(|| {
+                                let code_id = code_id.clone();
+                                view! {
+                                    <div class="field">
+                                        <label for=code_id.clone()>"Code from your authenticator app (or a recovery code)"</label>
+                                        <input id=code_id class="input w-auto" autocomplete="one-time-code" inputmode="text" required
+                                            prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
+                                    </div>
+                                }
+                            })}
+                            <div class="row">
+                                <button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Create reset link"</button>
+                                <button class="btn btn-outline btn-sm" type="button" on:click={
+                                    let close = close.clone();
+                                    move |_| close()
+                                }>"Cancel"</button>
+                            </div>
+                        </form>
+                    }.into_any()
+                }
+            }}
         </div>
     }
 }

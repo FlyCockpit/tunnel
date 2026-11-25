@@ -145,6 +145,15 @@ enum UserCmd {
         #[arg(long, default_value_t = 168, value_parser = clap::value_parser!(u32).range(1..=720))]
         hours: u32,
     },
+    /// Print a one-time link that sets a new password for an account (not the
+    /// owner: `admin link`) and turns its two-factor sign-in off, for someone
+    /// locked out. Its sessions end; its machines stay unless the page is told otherwise.
+    Reset {
+        username: String,
+        /// Hours the link works (1..=24).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=24))]
+        hours: u32,
+    },
     /// Delete an account (not the owner): its sessions end, its machines'
     /// tokens stop working and their tunnels close.
     Delete { username: String },
@@ -231,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
             };
             cli::user_invite(&config, role, hours).await
         }
+        Cmd::User { cmd: UserCmd::Reset { username, hours } } => cli::user_reset(&config, &username, hours).await,
         Cmd::User { cmd: UserCmd::Delete { username } } => cli::user_delete(&config, &username).await,
         Cmd::Client { cmd: ClientCmd::Add { name, user } } => cli::client_add(&config, &name, user.as_deref()).await,
         Cmd::Client { cmd: ClientCmd::List } => cli::client_list(&config).await,

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::role::Role;
 use crate::tokens::now;
 
-pub const SCHEMA_VERSION: i32 = 1;
+/// Moved on whenever the schema does, so that an older build refuses the
+/// database rather than misreading it (2: sign-in reset links).
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// `expires_at` of a tunnel that never expires (9999-12-31T23:59:59Z): every
 /// expiry check (`expires_at > now`, the sweep) keeps working unchanged.
@@ -157,19 +159,26 @@ CREATE TABLE recovery_codes (
     used_at   INTEGER,
     PRIMARY KEY (user_id, code_hash)
 );
--- Single-use sign-up links: `invite` (role admin or member), and the owner's
--- `owner_setup` / `owner_reset` from `tunnel-server admin link`.
+-- Single-use links: `invite` (role admin or member), the owner's
+-- `owner_setup` / `owner_reset` from `tunnel-server admin link`, and
+-- `account_reset` (a new password for `user_id`, made by an admin or `user
+-- reset`; `role` and `auth_epoch` are the account's when it was made,
+-- `issuer_epoch` the maker's).
 CREATE TABLE invites (
     id         TEXT PRIMARY KEY,
     token_hash TEXT NOT NULL UNIQUE,
-    kind       TEXT NOT NULL CHECK (kind IN ('invite', 'owner_setup', 'owner_reset')),
+    kind       TEXT NOT NULL CHECK (kind IN ('invite', 'owner_setup', 'owner_reset', 'account_reset')),
     role       TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     created_by TEXT,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     used_at    INTEGER,
-    used_by    TEXT
+    used_by    TEXT,
+    user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+    auth_epoch INTEGER,
+    issuer_epoch INTEGER
 );
+CREATE INDEX invites_user ON invites(user_id);
 -- Web UI sessions (`__Host-tunnel-ui` cookie; only the hash is stored).
 -- `pending` sessions have passed the password and wait for the TOTP code.
 CREATE TABLE ui_sessions (
@@ -596,6 +605,45 @@ fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
+/// Every table, index and trigger with its SQL, comments and whitespace
+/// dropped (SQLite keeps the text of each `CREATE`, extended by `ALTER TABLE
+/// … ADD COLUMN`).
+fn schema_shape(c: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
+    let mut q = c.prepare(
+        "SELECT type, name, sql FROM sqlite_schema WHERE substr(name, 1, 7) != 'sqlite_' ORDER BY type, name",
+    )?;
+    let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)))?;
+    rows.map(|r| {
+        r.map(|(t, n, sql)| {
+            let sql = sql.unwrap_or_default();
+            let text: String = sql.lines().map(|l| l.split_once("--").map_or(l, |(code, _)| code)).collect();
+            (t, n, text.chars().filter(|c| !c.is_whitespace()).collect())
+        })
+    })
+    .collect()
+}
+
+/// The database has exactly the schema this build creates. The version alone
+/// would let a build open a database made (or left un-upgraded) by another
+/// build with the same version, and read its rows with other meanings.
+pub(crate) fn check_schema(c: &Connection) -> anyhow::Result<()> {
+    let fresh = Connection::open_in_memory()?;
+    fresh.execute_batch(SCHEMA)?;
+    let (want, got) = (schema_shape(&fresh)?, schema_shape(c)?);
+    if want == got {
+        return Ok(());
+    }
+    let mut differ: Vec<&str> = want.iter().filter(|w| !got.contains(w)).map(|w| w.1.as_str()).collect();
+    differ.extend(got.iter().filter(|g| !want.contains(g)).map(|g| g.1.as_str()));
+    differ.sort_unstable();
+    differ.dedup();
+    anyhow::bail!(
+        "the database schema differs from this build's ({}): it was made or left by another build; \
+         restore a backup made by this build, or upgrade the database as the release notes say",
+        differ.join(", ")
+    )
+}
+
 /// SQLite (bundled with URI support) reads a name starting with `file:` as a
 /// URI naming another file than the one this code prepares and checks.
 pub(crate) fn ensure_plain_path(path: &Path) -> anyhow::Result<()> {
@@ -707,6 +755,7 @@ impl Db {
                 version == SCHEMA_VERSION,
                 "unsupported database schema version {version}; this build needs schema version {SCHEMA_VERSION}"
             );
+            check_schema(&tx)?;
         }
         tx.commit()?;
         let defaults = crate::limits::Defaults::new(&crate::config::Limits::default());

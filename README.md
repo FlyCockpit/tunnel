@@ -289,6 +289,19 @@ limited per address (`limits.login_rate_per_min`, default 10) and per username
 is hashed; five wrong codes in a row lock the second factor for 15 minutes,
 doubling up to a day. Users with two-factor sign-in confirm approving or
 adding a machine with a code when their last check is older than ten minutes. The UI keeps an audit log (90 days).
+Someone locked out (a forgotten password, or a lost authenticator and
+recovery codes) gets a sign-in reset link: **Reset sign-in** in the Users
+page (admins for members, the owner for admins) or `tunnel-server user reset
+<name> [--hours N]`. Like an invite it is single-use, hashed at rest, in the
+fragment, and handed over by whoever made it; it lasts an hour by default
+(15 minutes to a day). Opening it sets a new password, turns two-factor
+sign-in off, deletes the recovery codes and ends every session of the
+account (optionally removing its machines too). It stops working once the
+account signs in differently (a new password or second factor), changes role
+or is disabled, or once its maker's own sign-in, role or status changes (so
+recovering from a stolen admin session also voids the links it made); a newer
+link replaces it. Making one is audited, and needs a fresh code like adding
+a machine.
 `tunnel-server user list` lists accounts; from the server's shell,
 `user invite [--role member|admin] [--hours N]` prints an invite link (as the
 owner would make one) and `user delete <name>` removes an account other than
@@ -386,7 +399,7 @@ TURN connections are closed if they do not authenticate promptly.
 ### Administration
 
 Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
-`cert renew [--force]`, `admin link`, `user list | invite [--role member|admin] [--hours N] | delete <name>`,
+`cert renew [--force]`, `admin link`, `user list | invite [--role member|admin] [--hours N] | reset <name> [--hours N] | delete <name>`,
 `client add <name> [--user <name>] | list | rename <name> <new-name> | delete <name>`, and
 `service add <name> --max-tunnels <n> | list | set <name> --max-tunnels <n> | rotate <name> | delete <name>`
 (root only for a root install).
@@ -404,8 +417,10 @@ Backups: `backup <path>` writes a consistent copy of the database (0600; it hold
 token hashes). `restore <path>` checks the copy's integrity, stops the service,
 keeps the current database as `tunnel.db.before-restore-<time>`, swaps the
 copy in, and starts the service again. The config file (`config.toml`) and the
-`certs/` directory are not in the database; back them up separately. `restore`
-accepts only databases with the schema version this build uses.
+`certs/` directory are not in the database; back them up separately. The server
+and `restore` accept only databases with the schema this build creates (its
+version and every table, column and index), so a database made or left by
+another build is refused rather than misread.
 
 ### Tunnels and access
 

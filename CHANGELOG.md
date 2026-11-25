@@ -61,6 +61,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   become one card per row, and 44 px touch targets.
 - `tunnel-server user invite [--role member|admin] [--hours N]` and
   `user delete <name>` for managing accounts from the server's shell.
+- Sign-in reset links for someone locked out: Reset sign-in in the Users page
+  (admins for members, the owner for admins; a fresh code with two-factor
+  sign-in on) or `tunnel-server user reset <name> [--hours N]`. Single-use,
+  an hour by default; opening one sets a new password, turns two-factor
+  sign-in off and ends the account's sessions. Void after any sign-in or role
+  change of the account, or once its maker may no longer reset it; audited.
 - Traffic counters per tunnel and per user and month (request/response bodies
   and WebSocket messages, counted while they flow, kept in memory and flushed
   about once a minute), shown in the web UI and the API (`bytes_in`/`bytes_out`,

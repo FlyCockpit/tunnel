@@ -1929,3 +1929,6 @@ async fn tunnels_carry_a_display_name_that_whoever_manages_them_can_change() {
 
 #[path = "limit_tests.rs"]
 mod limit_tests;
+
+#[path = "reset_tests.rs"]
+mod reset_tests;

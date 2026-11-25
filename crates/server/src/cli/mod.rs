@@ -255,6 +255,7 @@ fn check_backup(path: &Path) -> anyhow::Result<()> {
     );
     let integrity: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).context("integrity check")?;
     anyhow::ensure!(integrity == "ok", "{} failed the integrity check: {integrity}", path.display());
+    crate::db::check_schema(&c).with_context(|| format!("checking {}", path.display()))?;
     for table in REQUIRED_TABLES {
         let n: i64 =
             c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |r| {
@@ -524,6 +525,58 @@ pub async fn user_invite(config_path: &Path, role: crate::role::Role, hours: u32
     );
     println!("  https://{ui}/invite#{token}\n");
     println!("Withdraw it in the web UI (Users) if it is not needed any more.");
+    Ok(())
+}
+
+/// `user reset`: a sign-in reset link for an account other than the owner's.
+pub async fn user_reset(config_path: &Path, username: &str, hours: u32) -> anyhow::Result<()> {
+    use crate::accounts::ResetLinkError;
+    ensure_can_write(config_path, "user reset")?;
+    let cfg = Config::load(config_path)?;
+    let Some(ui) = cfg.ui_host.clone() else {
+        anyhow::bail!("the web UI is off: turn it on with `tunnel-server setup --ui-host <name>`");
+    };
+    check_privileged_data_dir(&cfg)?;
+    let db = Db::open_configured(&cfg)?;
+    let username = username.to_ascii_lowercase();
+    let token = crate::tokens::random_token(crate::ui::INVITE_PREFIX);
+    let result = async {
+        let Some(user) = db.user_by_name(username.clone()).await? else {
+            return Ok(Err(ResetLinkError::NotFound));
+        };
+        let made = db
+            .create_reset_link(
+                format!("in{}", crate::tokens::random_tunnel_id()),
+                crate::tokens::hash_token(&token),
+                user.id,
+                None,
+                crate::tokens::now() + i64::from(hours) * 3600,
+            )
+            .await?;
+        if made.is_ok() {
+            let _ = db.audit(None, "reset_link_created", Some(format!("{username} (server shell)")), None).await;
+        }
+        anyhow::Ok(made)
+    }
+    .await;
+    drop(db);
+    restore_ownership(config_path, &cfg)?;
+    match result? {
+        Ok(_) => {}
+        Err(ResetLinkError::NotFound) => anyhow::bail!("no user {username}; see `tunnel-server user list`"),
+        Err(ResetLinkError::Forbidden | ResetLinkError::SignedOut) => {
+            anyhow::bail!("{username} is the owner: `tunnel-server admin link` resets the owner")
+        }
+        Err(ResetLinkError::Disabled) => {
+            anyhow::bail!("{username} is disabled; enable the account in the web UI (Users) first")
+        }
+    }
+    println!(
+        "Send this link to {username}; it works once, within {hours} hour(s), and is a credential.\n\
+         It sets a new password, turns two-factor sign-in off and ends {username}'s sessions:\n"
+    );
+    println!("  https://{ui}/invite#{token}\n");
+    println!("Withdraw it in the web UI (Users → Invites) if it is not needed any more.");
     Ok(())
 }
 
@@ -961,7 +1014,9 @@ mod tests {
             );
         }
         db.pragma_update(None, "user_version", crate::db::SCHEMA_VERSION).unwrap();
-        check_backup(&path).unwrap();
+        // The right version but not this build's schema.
+        let err = format!("{:#}", check_backup(&path).unwrap_err());
+        assert!(err.contains("schema differs from this build's"), "{err}");
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }

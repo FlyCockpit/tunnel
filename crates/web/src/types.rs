@@ -218,7 +218,16 @@ pub struct UserRow {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Invite {
     pub id: String,
+    /// `invite` or `account_reset`.
+    #[serde(default)]
+    pub kind: String,
     pub role: String,
+    /// The account an `account_reset` is for.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Whether this admin may revoke it (the server decides).
+    #[serde(default)]
+    pub revocable: bool,
     #[serde(default)]
     pub created_by: Option<String>,
     #[serde(default)]
