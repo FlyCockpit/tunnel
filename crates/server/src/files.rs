@@ -116,6 +116,29 @@ pub fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+/// Give the regular file at `path` exactly `mode` without following a symlink
+/// there. `Ok(false)` when nothing is there or it is not a regular file (a
+/// symlink is left alone). The inode is pinned with O_PATH: closing such a
+/// descriptor drops none of this process's POSIX locks on the file (Linux), so
+/// this is safe on a database another connection here has open.
+pub(crate) fn set_mode_nofollow(path: &Path, mode: u32) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let file = match std::fs::OpenOptions::new().read(true).custom_flags(O_PATH | O_NOFOLLOW | O_CLOEXEC).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    if meta.permissions().mode() & 0o7777 != mode {
+        // The /proc link names the pinned inode, not the path, which may have changed since.
+        std::fs::set_permissions(format!("/proc/self/fd/{}", file.as_raw_fd()), std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(true)
+}
+
 pub(crate) fn account_id(owner: &str, flag: &str) -> anyhow::Result<u32> {
     let out = std::process::Command::new("id").args([flag, "--", owner]).output()?;
     anyhow::ensure!(out.status.success(), "could not resolve service account {owner}");
@@ -211,6 +234,28 @@ mod tests {
         let err = std::fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(&link).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(40), "ELOOP expected, got {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_mode_nofollow_changes_regular_files_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("mode-nofollow");
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let file = dir.join("file");
+        let outside = dir.join("outside");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(&outside, b"x").unwrap();
+        for p in [&file, &outside] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        symlink(&outside, dir.join("link")).unwrap();
+        assert!(set_mode_nofollow(&file, 0o600).unwrap());
+        assert_eq!(mode(&file), 0o600);
+        assert!(!set_mode_nofollow(&dir.join("link"), 0o600).unwrap());
+        assert_eq!(mode(&outside), 0o644);
+        assert!(!set_mode_nofollow(&dir.join("missing"), 0o600).unwrap());
+        assert!(!set_mode_nofollow(&dir, 0o600).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

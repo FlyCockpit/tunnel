@@ -596,6 +596,82 @@ fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
+/// SQLite (bundled with URI support) reads a name starting with `file:` as a
+/// URI naming another file than the one this code prepares and checks.
+pub(crate) fn ensure_plain_path(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !path.as_os_str().as_encoded_bytes().starts_with(b"file:"),
+        "database path {} must not be a SQLite URI",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The database must be a regular file at its path, not a symlink: root CLI
+/// commands open it in a data dir the service account owns, and must not be
+/// pointed at, or change the mode of, another file.
+pub(crate) fn ensure_not_symlink(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => anyhow::bail!("database path {} must not be a symlink", path.display()),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+/// The database holds token hashes and session ids: create it 0600 before
+/// SQLite opens it (SQLite would use the umask) and tighten a looser existing
+/// file. SQLite gives new `-wal`/`-shm` files the database's mode, but ones left
+/// from a looser database keep theirs, so tighten those too. A user who does
+/// not own them cannot; the owner (the server, at start) does.
+///
+/// Closing a descriptor of the database drops every POSIX lock this process
+/// holds on it, including another connection's. The only one opened here is
+/// for a file that did not exist (O_EXCL, which also never follows a symlink),
+/// closed before any other `Db::open` in this process can reach SQLite
+/// (`CREATING`); existing files are changed through O_PATH, which drops no
+/// locks, and never through a symlink.
+fn make_private(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    static CREATING: Mutex<()> = Mutex::new(());
+    ensure_not_symlink(path)?;
+    {
+        let _creating = CREATING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+            Ok(file) => file.set_permissions(std::fs::Permissions::from_mode(0o600))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("creating {}", path.display()))),
+        }
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let file = std::path::PathBuf::from(file);
+        match crate::files::set_mode_nofollow(&file, 0o600) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("making {} private", file.display()))),
+        }
+    }
+    Ok(())
+}
+
+/// `path` with its directory resolved, so the only symlink SQLite could meet
+/// opening it is the file itself, which `open_nofollow` refuses.
+fn with_canonical_parent(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let name = path.file_name().with_context(|| format!("database path {} names no file", path.display()))?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = std::fs::canonicalize(parent).with_context(|| format!("resolving {}", parent.display()))?;
+    Ok(parent.join(name))
+}
+
+/// SQLite refuses the database if it is a symlink, so one swapped in after
+/// `make_private` checked the path is refused too.
+fn open_nofollow(path: &Path) -> anyhow::Result<Connection> {
+    let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(path, flags).with_context(|| format!("opening {}", path.display()))
+}
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -605,10 +681,17 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        ensure_plain_path(path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn = if path == Path::new(":memory:") {
+            Connection::open(path)?
+        } else {
+            let path = with_canonical_parent(path)?;
+            make_private(&path)?;
+            open_nofollow(&path)?
+        };
         enable_wal(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -1547,6 +1630,7 @@ impl Db {
     // ----------------------------------------------------------------- admin
 
     pub async fn backup_to(&self, path: std::path::PathBuf) -> anyhow::Result<()> {
+        ensure_plain_path(&path)?;
         self.call(move |c| {
             c.execute("VACUUM INTO ?1", params![path.to_string_lossy()])?;
             Ok(())

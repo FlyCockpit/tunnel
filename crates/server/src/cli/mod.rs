@@ -244,6 +244,7 @@ const REQUIRED_TABLES: &[&str] = &["tunnels", "access_links", "gate_sessions", "
 /// Check that `path` is an intact Tunnel database.
 fn check_backup(path: &Path) -> anyhow::Result<()> {
     use rusqlite::{Connection, OpenFlags};
+    crate::db::ensure_plain_path(path)?;
     let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening {}", path.display()))?;
     let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).context("reading backup schema version")?;
@@ -294,6 +295,17 @@ fn restore_backup_file(backup: &Path, db_path: &Path) -> anyhow::Result<()> {
     result
 }
 
+/// Keep the current database as `<db>.before-restore-<time>`, private even
+/// when an older build created it looser than 0600.
+fn move_aside(db_path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    // Before the rename, so a failure leaves the database where it was.
+    crate::db::ensure_not_symlink(db_path)?;
+    crate::files::set_mode_nofollow(db_path, 0o600).with_context(|| format!("making {} private", db_path.display()))?;
+    let aside = db_path.with_extension(format!("db.before-restore-{}", tokens::now()));
+    std::fs::rename(db_path, &aside).with_context(|| format!("moving {} aside", db_path.display()))?;
+    Ok(aside)
+}
+
 pub async fn restore(config_path: &Path, backup: &Path) -> anyhow::Result<()> {
     ensure_can_write(config_path, "restore")?;
     let mode = install_mode(config_path);
@@ -307,13 +319,7 @@ pub async fn restore(config_path: &Path, backup: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(mode.systemctl_ok(&["stop", SERVICE_NAME]), "stopping {SERVICE_NAME} failed");
     }
     let result = (|| -> anyhow::Result<Option<std::path::PathBuf>> {
-        let kept = if db_path.exists() {
-            let aside = db_path.with_extension(format!("db.before-restore-{}", tokens::now()));
-            std::fs::rename(&db_path, &aside).with_context(|| format!("moving {} aside", db_path.display()))?;
-            Some(aside)
-        } else {
-            None
-        };
+        let kept = if db_path.exists() { Some(move_aside(&db_path)?) } else { None };
         // Stale WAL files belong to the old database and must not be replayed into the new one.
         for ext in ["db-wal", "db-shm"] {
             let _ = std::fs::remove_file(db_path.with_extension(ext));
@@ -911,6 +917,31 @@ mod tests {
     }
 
     #[test]
+    fn database_moved_aside_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("aside");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("tunnel.db");
+        std::fs::write(&db, b"old database").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let aside = move_aside(&db).unwrap();
+        assert!(!db.exists());
+        assert!(aside.file_name().unwrap().to_str().unwrap().starts_with("tunnel.db.before-restore-"));
+        assert_eq!(std::fs::read(&aside).unwrap(), b"old database");
+        assert_eq!(std::fs::metadata(&aside).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // A database symlink is refused and left where it is, its target untouched.
+        let target = dir.join("elsewhere.db");
+        std::fs::write(&target, b"elsewhere").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        assert!(move_aside(&db).unwrap_err().to_string().contains("must not be a symlink"));
+        assert!(std::fs::symlink_metadata(&db).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn restore_requires_current_schema_version() {
         let dir = test_dir("schema");
         std::fs::create_dir_all(&dir).unwrap();
@@ -943,6 +974,12 @@ mod tests {
         let db = Db::open(&dir.join("live.db")).unwrap();
         db.backup_to(dir.join("backup.db")).await.unwrap();
         check_backup(&dir.join("backup.db")).unwrap();
+
+        // A URI would name another file than the one checked, copied or written.
+        let uri = Path::new("file:tunnel-uri-test.db");
+        assert!(check_backup(uri).unwrap_err().to_string().contains("must not be a SQLite URI"));
+        assert!(db.backup_to(uri.to_path_buf()).await.unwrap_err().to_string().contains("must not be a SQLite URI"));
+        assert!(!uri.exists() && !Path::new("tunnel-uri-test.db").exists());
 
         std::fs::write(dir.join("junk.db"), b"not a database").unwrap();
         assert!(check_backup(&dir.join("junk.db")).is_err());

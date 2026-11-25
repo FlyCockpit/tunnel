@@ -723,3 +723,183 @@ fn refuses_a_database_with_another_schema_version_and_adds_nothing() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+/// Runs `name` (a test in this module) alone in a child test process, so the
+/// umask it sets never reaches other tests, even when it panics.
+fn in_child_process(name: &str) -> bool {
+    const CHILD: &str = "TUNNEL_DB_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("db::tests::{name}"), "--test-threads=1", "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
+}
+
+fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+fn file_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn database_files_are_private_under_a_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    unsafe extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+    if in_child_process("database_files_are_private_under_a_permissive_umask") {
+        return;
+    }
+    // SAFETY: only swaps this child process's file-creation mask.
+    unsafe { umask(0o022) };
+
+    // A fresh data dir: the first open creates the database and its WAL files.
+    let dir = TestDir(std::env::temp_dir().join("tunnel-db-tests").join(crate::tokens::random_tunnel_id()));
+    let path = dir.0.join("tunnel.db");
+    let db = Db::open(&path).unwrap();
+    db.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u', 'u', 'x', 'member', 0)",
+            [],
+        )
+        .unwrap();
+    let files = [path.clone(), sidecar(&path, "-wal"), sidecar(&path, "-shm")];
+    for p in &files {
+        assert_eq!(file_mode(p), 0o600, "{}", p.display());
+    }
+
+    // Files an older build left looser are tightened on the next open.
+    for p in &files {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let again = Db::open(&path).unwrap();
+    for p in &files {
+        assert_eq!(file_mode(p), 0o600, "{}", p.display());
+    }
+    // The first connection still works next to the second.
+    assert_eq!(
+        db.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0)).unwrap(),
+        again.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM users", [], |r| r.get::<_, i64>(0)).unwrap()
+    );
+}
+
+#[test]
+fn refuses_uri_paths_before_creating_anything() {
+    let name = std::path::Path::new("file:tunnel-uri-test/x.db?mode=rwc");
+    let err = Db::open(name).err().expect("a URI path must be refused");
+    assert_eq!(err.to_string(), format!("database path {} must not be a SQLite URI", name.display()));
+    assert!(!std::path::Path::new("file:tunnel-uri-test").exists());
+    assert!(!std::path::Path::new("tunnel-uri-test").exists());
+}
+
+/// Root CLI commands open the database in a directory the service account
+/// owns: a symlink planted there is never followed to change a mode, and a
+/// database that is a symlink (existing or dangling target) is refused.
+#[test]
+fn preparing_never_changes_modes_through_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = TestDir(std::env::temp_dir().join("tunnel-db-tests").join(crate::tokens::random_tunnel_id()));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let outside: Vec<_> = (0..3).map(|i| dir.0.join(format!("outside-{i}"))).collect();
+    for p in &outside {
+        std::fs::write(p, b"not a database").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let db = dir.0.join("tunnel.db");
+    std::fs::write(&db, b"").unwrap();
+    symlink(&outside[0], sidecar(&db, "-wal")).unwrap();
+    symlink(&outside[1], sidecar(&db, "-shm")).unwrap();
+    make_private(&db).unwrap();
+    assert_eq!(file_mode(&db), 0o600);
+
+    let link = dir.0.join("link.db");
+    symlink(&outside[2], &link).unwrap();
+    let dangling = dir.0.join("dangling.db");
+    symlink(dir.0.join("missing.db"), &dangling).unwrap();
+    for p in [&link, &dangling] {
+        let err = Db::open(p).err().expect("a symlinked database must be refused");
+        assert!(
+            err.to_string().ends_with(&format!("{} must not be a symlink", p.file_name().unwrap().display())),
+            "{err}"
+        );
+    }
+    assert!(!dir.0.join("missing.db").exists());
+    // A database swapped for a symlink after preparing it is refused by SQLite itself.
+    let swapped = dir.0.join("swapped.db");
+    std::fs::write(&swapped, b"").unwrap();
+    make_private(&swapped).unwrap();
+    std::fs::remove_file(&swapped).unwrap();
+    symlink(&outside[2], &swapped).unwrap();
+    assert!(open_nofollow(&swapped).is_err());
+    for p in &outside {
+        assert_eq!(file_mode(p), 0o644, "{}", p.display());
+        assert_eq!(std::fs::read(p).unwrap(), b"not a database");
+    }
+
+    // A symlinked directory above the database still works.
+    std::fs::create_dir(dir.0.join("real")).unwrap();
+    symlink(dir.0.join("real"), dir.0.join("alias")).unwrap();
+    drop(Db::open(&dir.0.join("alias").join("tunnel.db")).unwrap());
+    assert_eq!(file_mode(&dir.0.join("real").join("tunnel.db")), 0o600);
+}
+
+/// Preparing an open database must not drop this process's POSIX locks on it
+/// (closing a descriptor of the file would): another process still sees the
+/// write lock, for a WAL database (held on `-shm`) and a rollback-journal one
+/// (held on the database file itself).
+#[test]
+fn preparing_an_open_database_keeps_its_locks() {
+    use std::os::unix::fs::PermissionsExt;
+    const PROBE: &str = "TUNNEL_DB_LOCK_PROBE";
+    if let Some(paths) = std::env::var_os(PROBE) {
+        for path in std::env::split_paths(&paths) {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let err = c.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy), "{}: {err}", path.display());
+        }
+        return;
+    }
+    let (db, dir) = isolated_db();
+    let wal = dir.0.join("state.db");
+    let journal = dir.0.join("journal.db");
+    let plain = rusqlite::Connection::open(&journal).unwrap();
+    plain.execute_batch("CREATE TABLE t (x)").unwrap();
+    db.conn.lock().unwrap().execute_batch("BEGIN IMMEDIATE").unwrap();
+    plain.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for p in [&wal, &journal] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        make_private(p).unwrap();
+        assert_eq!(file_mode(p), 0o600);
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "db::tests::preparing_an_open_database_keeps_its_locks", "--test-threads=1"])
+        .env(PROBE, std::env::join_paths([&wal, &journal]).unwrap())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    db.conn.lock().unwrap().execute_batch("ROLLBACK").unwrap();
+    plain.execute_batch("ROLLBACK").unwrap();
+}
