@@ -620,21 +620,27 @@ crates/protocol/           wire messages, constants, mux (rust-yamux driver), We
 crates/server/             tunnel-server (VPS)
   src/main.rs              CLI: serve | setup | token rotate | health-token | status | backup | restore | cert renew | admin | user | client | service
   src/ui/                  web UI host: /ui/api/* (accounts, sessions, TOTP, invites, admin), embedded assets
-  src/device.rs install.rs browser-approved machine login (RFC 8628); the client's /install.sh
+  src/install.rs           the client's /install.sh and /install.ps1 on the UI host
   src/commands.rs          non-interactive subcommands; `serve` wires everything together
   src/listener.rs          :443 (SNI peek → TURN over TLS, else TLS + hyper auto) and :80 redirect
-  src/turn_relay.rs        built-in STUN/TURN relay (UDP/TCP 3478, TLS via 443), peer filter, limits
+  src/turn_relay/          built-in STUN/TURN relay (UDP/TCP 3478, TLS via 443), peer filter, limits; auth.rs: credentials, STUN checks
   src/edge.rs proxy.rs     visitor edge: lifecycle, gate, reserved paths, forwarding, WebSockets
   src/gate.rs gatehost.rs  gate cookie; sign-in (links, password) on the zone host
-  src/headers.rs           hop-by-hop, Origin/Location/Set-Cookie/CSP/iframe rewrites
+  src/headers.rs           hop-by-hop, Origin/Location/Set-Cookie/CSP/iframe rewrites, the UI cookie name
   src/inject.rs            streaming ICE <script> injection + CSP hash
   src/pages.rs ratelimit.rs
-  src/api.rs               management API (axum, utoipa OpenAPI)
+  src/api/                 management API (axum, utoipa OpenAPI); device.rs: browser-approved machine login (RFC 8628)
   src/control.rs           sandbox control plane (/v1/connect → Yamux)
   src/registry.rs state.rs live connections, shared state and caches
-  src/db.rs purge.rs       SQLite and the hourly purge
+  src/db/ purge.rs         SQLite and the hourly purge
+  src/accounts.rs role.rs  users, sessions, invites, devices and audit (SQL); account roles
+  src/limits.rs traffic.rs per-user limits; traffic counters, monthly caps and their flush
+  src/clients.rs services.rs  machine enrollment; service credentials
   src/tls.rs sni.rs acme.rs dns/   certificate store, ClientHello peek, DNS-01 issuance, DNS providers
   src/ice.rs metrics.rs    TURN REST credentials, Prometheus text on 127.0.0.1:9464
+  src/config.rs mode.rs    config file; system vs rootless install layout and its checks
+  src/files.rs util.rs     safe file writes and ownership; HTTP body helpers
+  src/tokens.rs password.rs seal.rs  token formats, password hashing, sealing with the UI secret
   src/setup/               interactive wizard (prompts, firewall, systemd)
 crates/client/             tunnel-client (sandbox); see crates/client/README.md
 crates/web/                web UI (Leptos CSR, wasm32); build.sh writes dist/ for the server's `ui` feature
