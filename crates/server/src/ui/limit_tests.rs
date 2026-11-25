@@ -572,6 +572,7 @@ fn the_fresh_schema_stores_limits_in_four_nullable_checked_columns() {
             "limit_traffic_bytes",
             "email",
             "email_verified_at",
+            "recovery_mail_at",
         ]
     );
     for (name, ty, not_null) in &cols[13..17] {

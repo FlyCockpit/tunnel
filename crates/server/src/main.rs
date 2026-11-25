@@ -6,6 +6,7 @@ mod clients;
 mod config;
 mod control;
 mod db;
+mod device_logins;
 mod edge;
 mod files;
 mod ice;

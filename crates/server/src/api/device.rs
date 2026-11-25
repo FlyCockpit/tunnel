@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use tunnel_protocol::CLIENT_TOKEN_PREFIX;
 use utoipa::ToSchema;
 
-use crate::accounts::Poll;
 use crate::api::{ApiError, ApiJson, ApiResult, ErrorBody, PeerAddr};
 use crate::clients::validate_new_name;
 use crate::db::NewClientError;
+use crate::device_logins::Poll;
 use crate::state::AppState;
 use crate::tokens::{self, now};
 

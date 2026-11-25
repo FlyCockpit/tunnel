@@ -18,13 +18,12 @@ use super::checks::{
 };
 use super::email::{self, notify};
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
-use crate::accounts::{
-    AcceptError, Acceptance, DecideError, InviteKind, NewUser, RenameError, ResetLinkError, User, UserPatch,
-};
+use crate::accounts::{AcceptError, Acceptance, InviteKind, NewUser, RenameError, ResetLinkError, User, UserPatch};
 use crate::api::device::normalize_user_code;
 use crate::api::{self, ApiError, ApiJson, ApiResult, CreateAccessLinkRequest};
 use crate::clients;
 use crate::db::{DeleteOutcome, NewClientError, TunnelRow};
+use crate::device_logins::DecideError;
 use crate::mail::Notice;
 use crate::password::{self, Verdict};
 use crate::role::Role;
@@ -1262,6 +1261,21 @@ fn reset_forbidden() -> ApiError {
     )
 }
 
+fn no_email() -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "no_email", "this account has no confirmed email address; copy the link")
+}
+
+/// One recovery mail per account per `RECOVERY_MAIL_COOLDOWN_S`; the link itself may still be handed over.
+fn mail_cooldown(wait_s: i64) -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "mail_cooldown",
+        format!(
+            "a reset mail was sent to this account recently; try again in {wait_s} s, or make the link without mailing it"
+        ),
+    )
+}
+
 /// A single-use link that sets a new password for another account and turns
 /// its two-factor sign-in off (for someone locked out); the admin hands it over.
 async fn create_reset_link(
@@ -1288,17 +1302,17 @@ async fn create_reset_link(
         let mailer =
             email::mailer(&state).map_err(|_| ApiError::validation("this server sends no email; copy the link"))?;
         if target.email.is_none() {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "no_email",
-                "this account has no confirmed email address; copy the link",
-            ));
+            return Err(no_email());
         }
-        // Per admin, and per account it goes to (no mail bombing through resets).
+        // Per admin, and per account it goes to (no mail bombing through resets),
+        // then the account's recovery-mail cooldown shared with "Forgot password?".
         if !state.ui.mail_user.check_key(s.user().id.clone())
             || !state.ui.mail_user.check_key(format!("reset-to:{}", target.id))
         {
             return Err(too_many());
+        }
+        if let Some(wait) = state.db.recovery_mail_wait(target.id.clone()).await? {
+            return Err(mail_cooldown(wait));
         }
         Some(mailer.clone())
     } else {
@@ -1314,6 +1328,7 @@ async fn create_reset_link(
             id,
             Some((s.user().id.clone(), s.session.id_hash.clone())),
             now() + ttl,
+            mailer.is_some(),
         )
         .await?;
     let invite = match made {
@@ -1324,15 +1339,12 @@ async fn create_reset_link(
             return Err(ApiError::new(StatusCode::CONFLICT, "disabled", "this account is disabled; enable it first"));
         }
         Err(ResetLinkError::SignedOut) => return Err(changed_meanwhile()),
+        Err(ResetLinkError::NoEmail) => return Err(no_email()),
+        Err(ResetLinkError::MailCooldown(wait)) => return Err(mail_cooldown(wait)),
     };
     let url = format!("https://{ui}/invite#{token}");
-    // Bound to the address it goes to: it stops working if the account's address changes.
-    let to = match &mailer {
-        Some(_) => state.db.bind_reset_to_address(invite.id.clone()).await?,
-        None => None,
-    };
     // A full queue drops the mail: then the admin hands the link over instead.
-    let mailed = match (mailer, to) {
+    let mailed = match (mailer, invite.email.clone()) {
         (Some(mailer), Some(to)) => {
             let mail = mailer.texts().sign_in_reset(&url, &target.username, &s.user().username, ttl);
             mailer.send_later("account_reset", to, mail)

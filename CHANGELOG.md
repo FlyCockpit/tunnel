@@ -73,7 +73,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   (confirming the address), a confirmed address per account (changes confirmed
   by mail, the old address told), "Forgot password?" (same answer for every
   input, rate limited, keeps two-factor sign-in and asks for its code), sign-in
-  resets mailed by admins, and security notices. Without it nothing changes.
+  resets mailed by admins (sharing the one-mail-per-two-minutes account limit
+  with "Forgot password?"), and security notices. Without it nothing changes.
 - Traffic counters per tunnel and per user and month (request/response bodies
   and WebSocket messages, counted while they flow, kept in memory and flushed
   about once a minute), shown in the web UI and the API (`bytes_in`/`bytes_out`,

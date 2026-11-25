@@ -155,7 +155,10 @@ CREATE TABLE users (
     -- password resets and notices go there. A new address waits in an
     -- `email_verify` link until it is confirmed.
     email TEXT,
-    email_verified_at INTEGER
+    email_verified_at INTEGER,
+    -- When the last account-recovery mail ("Forgot password?" or an admin's
+    -- mailed sign-in reset) went to the account: one per cooldown.
+    recovery_mail_at INTEGER
 );
 CREATE UNIQUE INDEX users_one_owner ON users(role) WHERE role = 'owner';
 CREATE UNIQUE INDEX users_email ON users(email) WHERE email IS NOT NULL;

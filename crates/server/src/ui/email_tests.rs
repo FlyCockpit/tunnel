@@ -190,7 +190,7 @@ async fn forgot_password_answers_the_same_for_everyone_and_mails_only_confirmed_
     settle(&state).await;
     assert!(last(&server, "ann@example.com").text().contains("was reset"), "a notice follows");
 
-    // Cleanup right after keeps the used link as the cooldown's marker: still no new mail.
+    // The cooldown is kept on the account: cleanup dropping the used link does not end it.
     let n = server.to("ann@example.com").len();
     state.db.purge_accounts().await.unwrap();
     forgot(&state, "ann", 66).await;
@@ -464,6 +464,7 @@ async fn a_revoked_reset_link_cannot_try_codes_or_outlive_the_address() {
     // An admin's reset mailed to ann's address stops working when she changes it.
     let users = owner.call(&state, "GET", "/ui/api/users", None).await;
     let ann_id = user_id(&users.body, "ann");
+    cool_down(&state, &ann_id).await; // after the "Forgot password?" mail above
     let r =
         owner.call(&state, "POST", &format!("/ui/api/users/{ann_id}/reset"), Some(json!({ "send_email": true }))).await;
     assert_eq!(r.body["mailed"], true, "{}", r.body);
@@ -491,6 +492,7 @@ async fn a_revoked_reset_link_cannot_try_codes_or_outlive_the_address() {
     assert_eq!(r.status, StatusCode::NOT_FOUND, "the old mailbox cannot reset ann: {}", r.body);
 
     // Nor does it come back when the same address is confirmed again later.
+    cool_down(&state, &ann_id).await;
     let r =
         owner.call(&state, "POST", &format!("/ui/api/users/{ann_id}/reset"), Some(json!({ "send_email": true }))).await;
     assert_eq!(r.body["mailed"], true, "{}", r.body);
@@ -676,4 +678,123 @@ async fn a_busy_server_does_not_use_up_a_recovery_code() {
     let r = Browser::new(42).call(&state, "POST", "/ui/api/invite/accept", Some(body)).await;
     assert_eq!(r.status, StatusCode::OK, "it works once the server has room: {}", r.body);
     assert_eq!(state.db.recovery_codes_left(ann_id).await.unwrap(), 10);
+}
+
+/// End `user_id`'s recovery-mail cooldown as if `RECOVERY_MAIL_COOLDOWN_S` had passed.
+async fn cool_down(state: &Arc<AppState>, user_id: &str) {
+    let id = user_id.to_string();
+    let wait = crate::addresses::RECOVERY_MAIL_COOLDOWN_S;
+    state
+        .db
+        .call(move |c| {
+            Ok(c.execute(
+                "UPDATE users SET recovery_mail_at = recovery_mail_at - ?2 WHERE id = ?1",
+                rusqlite::params![id, wait],
+            )?)
+        })
+        .await
+        .unwrap();
+}
+
+async fn mail_reset(state: &Arc<AppState>, admin: &mut Browser, user_id: &str, send_email: bool) -> Resp {
+    admin
+        .call(state, "POST", &format!("/ui/api/users/{user_id}/reset"), Some(json!({ "send_email": send_email })))
+        .await
+}
+
+fn assert_cooldown(r: &Resp) {
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::TOO_MANY_REQUESTS, json!("mail_cooldown")));
+    let message = r.body["error"]["message"].as_str().unwrap();
+    let wait = message
+        .strip_prefix("a reset mail was sent to this account recently; try again in ")
+        .and_then(|m| m.split_once(" s")?.0.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("says how long to wait: {message}"));
+    assert!((1..=crate::addresses::RECOVERY_MAIL_COOLDOWN_S).contains(&wait), "{message}");
+}
+
+#[tokio::test]
+async fn admin_reset_mails_and_forgot_password_share_one_cooldown_per_account() {
+    let (state, server) = mail_state().await;
+    let mut owner = owner(&state).await;
+    let _ann = invited(&state, &server, &mut owner, "ann", "ann@example.com", 30).await;
+    let _bea = invited(&state, &server, &mut owner, "bea", "bea@example.com", 31).await;
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    let (ann_id, bea_id) = (user_id(&users.body, "ann"), user_id(&users.body, "bea"));
+    let n = server.to("ann@example.com").len();
+
+    // Admin, then admin again: the second is refused with the wait, and nothing more is mailed.
+    let r = mail_reset(&state, &mut owner, &ann_id, true).await;
+    assert_eq!((r.status, r.body["mailed"].clone()), (StatusCode::OK, json!(true)), "{}", r.body);
+    let first = r.body["url"].as_str().unwrap().to_string();
+    assert_cooldown(&mail_reset(&state, &mut owner, &ann_id, true).await);
+    // Another account is not held up; a link that is only handed over stays unlimited.
+    let r = mail_reset(&state, &mut owner, &bea_id, true).await;
+    assert_eq!(r.body["mailed"], true, "{}", r.body);
+    for _ in 0..3 {
+        let r = mail_reset(&state, &mut owner, &ann_id, false).await;
+        assert_eq!((r.status, r.body["mailed"].clone()), (StatusCode::OK, json!(false)), "{}", r.body);
+        assert_ne!(r.body["url"].as_str().unwrap(), first);
+    }
+    // "Forgot password?" right after: the same answer as ever, but no second mail.
+    let r = forgot(&state, "ann", 40).await;
+    assert_eq!((r.status, r.body.clone()), (StatusCode::OK, json!({ "status": "ok" })));
+    settle(&state).await;
+    assert_eq!(server.to("ann@example.com").len(), n + 1, "one mail within the cooldown");
+
+    // Self-service first: then the admin's mail waits.
+    cool_down(&state, &ann_id).await;
+    forgot(&state, "ann", 41).await;
+    settle(&state).await;
+    assert_eq!(server.to("ann@example.com").len(), n + 2);
+    assert!(last(&server, "ann@example.com").text().contains("account ann"));
+    assert_cooldown(&mail_reset(&state, &mut owner, &ann_id, true).await);
+
+    // Revoking the mailed link does not free the slot.
+    cool_down(&state, &ann_id).await;
+    let r = mail_reset(&state, &mut owner, &ann_id, true).await;
+    assert_eq!(r.body["mailed"], true, "{}", r.body);
+    let invite = r.body["invite"]["id"].as_str().unwrap().to_string();
+    let revoked = owner.call(&state, "DELETE", &format!("/ui/api/invites/{invite}"), None).await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    assert_cooldown(&mail_reset(&state, &mut owner, &ann_id, true).await);
+    settle(&state).await;
+    assert_eq!(server.to("ann@example.com").len(), n + 3);
+}
+
+#[tokio::test]
+async fn the_recovery_mail_cooldown_survives_a_restart() {
+    let path =
+        std::env::temp_dir().join("tunnel-ui-tests").join(format!("recovery-mail-{}.db", tokens::random_tunnel_id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = crate::db::Db::open(&path).unwrap();
+    db.insert_test_user("uann", "ann", Role::Member).await;
+    db.call(|c| {
+        Ok(c.execute("UPDATE users SET email = 'ann@example.com', email_verified_at = 0 WHERE id = 'uann'", [])?)
+    })
+    .await
+    .unwrap();
+    let made = db.create_password_reset("ann".into(), "in1".into(), "h1".into(), now() + 600).await.unwrap();
+    assert!(made.is_some(), "the first recovery mail goes out");
+    drop(db);
+
+    // A new process: no in-memory limiter remembers anything, the database does.
+    let db = crate::db::Db::open(&path).unwrap();
+    let made = db.create_reset_link("in2".into(), "h2".into(), "uann".into(), None, now() + 600, true).await.unwrap();
+    match made {
+        Err(crate::accounts::ResetLinkError::MailCooldown(wait)) => {
+            assert!((1..=crate::addresses::RECOVERY_MAIL_COOLDOWN_S).contains(&wait), "{wait}")
+        }
+        other => panic!("refused within the cooldown: {other:?}"),
+    }
+    let wait = db.recovery_mail_wait("uann".into()).await.unwrap();
+    assert!(wait.is_some_and(|w| w > 0), "{wait:?}");
+    let made = db.create_password_reset("ann".into(), "in3".into(), "h3".into(), now() + 600).await.unwrap();
+    assert!(made.is_none(), "and no self-service mail either");
+    // Unmailed, the link is made as ever.
+    let made = db.create_reset_link("in4".into(), "h4".into(), "uann".into(), None, now() + 600, false).await.unwrap();
+    assert_eq!(made.unwrap().email, None);
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

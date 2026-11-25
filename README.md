@@ -428,7 +428,9 @@ With mail on:
   two-factor sign-in on, the page also asks for a code or recovery code, and
   the reset keeps two-factor sign-in on: an email address is never a second
   factor. A lost authenticator still needs an admin's **Reset sign-in**,
-  which can now also be mailed.
+  which can now also be mailed. Mailed resets of either kind share the
+  per-account limit: an admin asking within two minutes of the last one is
+  told how long to wait, and can still hand the link over instead.
 - **Security notices** go to the confirmed address when the password changes
   or is reset, two-factor sign-in is turned on or off, a machine is added or
   approved, the role changes, or the address changes.

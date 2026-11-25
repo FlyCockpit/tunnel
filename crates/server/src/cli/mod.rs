@@ -578,6 +578,7 @@ pub async fn user_reset(config_path: &Path, username: &str, hours: u32) -> anyho
                 user.id,
                 None,
                 crate::tokens::now() + i64::from(hours) * 3600,
+                false,
             )
             .await?;
         if made.is_ok() {
@@ -597,6 +598,7 @@ pub async fn user_reset(config_path: &Path, username: &str, hours: u32) -> anyho
         Err(ResetLinkError::Disabled) => {
             anyhow::bail!("{username} is disabled; enable the account in the web UI (Users) first")
         }
+        Err(ResetLinkError::NoEmail | ResetLinkError::MailCooldown(_)) => unreachable!("the shell mails nothing"),
     }
     println!(
         "Send this link to {username}; it works once, within {hours} hour(s), and is a credential.\n\

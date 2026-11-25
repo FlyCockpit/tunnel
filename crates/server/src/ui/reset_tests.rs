@@ -151,9 +151,11 @@ async fn admins_reset_members_and_the_owner_resets_admins() {
     assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("disabled")));
     // The shell (`user reset`) may reset anyone but the owner.
     let owner_id = id("olivia");
-    let made = state.db.create_reset_link("inshell".into(), "h1".into(), owner_id, None, now() + 600).await.unwrap();
+    let made =
+        state.db.create_reset_link("inshell".into(), "h1".into(), owner_id, None, now() + 600, false).await.unwrap();
     assert_eq!(made.unwrap_err(), crate::accounts::ResetLinkError::Forbidden);
-    let made = state.db.create_reset_link("inshell2".into(), "h2".into(), id("amy"), None, now() + 600).await.unwrap();
+    let made =
+        state.db.create_reset_link("inshell2".into(), "h2".into(), id("amy"), None, now() + 600, false).await.unwrap();
     assert_eq!(made.unwrap().created_by, None);
     let _ = (&mut p.amy, &mut p.bob);
 }
@@ -232,7 +234,7 @@ async fn a_reset_link_is_void_after_any_change_to_the_account_or_its_maker() {
     let expired = tokens::random_token(super::super::INVITE_PREFIX);
     state
         .db
-        .create_reset_link("inexpired".into(), tokens::hash_token(&expired), bob_id.clone(), None, now() - 1)
+        .create_reset_link("inexpired".into(), tokens::hash_token(&expired), bob_id.clone(), None, now() - 1, false)
         .await
         .unwrap()
         .unwrap();

@@ -905,6 +905,31 @@ fn preparing_an_open_database_keeps_its_locks() {
 }
 
 #[test]
+fn the_recovery_mail_cooldown_column_is_a_live_additive_upgrade() {
+    let path = std::env::temp_dir()
+        .join("tunnel-db-tests")
+        .join(format!("recovery-mail-{}.db", crate::tokens::random_tunnel_id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    drop(Db::open(&path).unwrap());
+    // As the first mail build left it: no `users.recovery_mail_at`.
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("ALTER TABLE users DROP COLUMN recovery_mail_at;").unwrap();
+    }
+    let err = format!("{:#}", Db::open(&path).err().expect("refused"));
+    assert!(err.contains("schema differs from this build's (users)"), "{err}");
+    // The upgrade is one added column.
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("ALTER TABLE users ADD COLUMN recovery_mail_at INTEGER;").unwrap();
+    }
+    drop(Db::open(&path).unwrap());
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn refuses_a_database_whose_schema_differs_from_this_builds() {
     let path = std::env::temp_dir()
         .join("tunnel-db-tests")

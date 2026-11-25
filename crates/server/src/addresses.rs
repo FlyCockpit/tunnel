@@ -51,14 +51,38 @@ pub struct Verified {
     pub new: String,
 }
 
-/// At most one "Forgot password?" link is mailed per account this often
-/// (cleanup keeps a used link at least this long, as the marker).
-pub const PASSWORD_RESET_COOLDOWN_S: i64 = 120;
+/// At most one account-recovery mail ("Forgot password?" or an admin's
+/// mailed sign-in reset) goes to an account this often.
+pub const RECOVERY_MAIL_COOLDOWN_S: i64 = 120;
+
+/// Claim the account's recovery-mail slot at `t` (`users.recovery_mail_at`),
+/// or the seconds left until one was mailed `RECOVERY_MAIL_COOLDOWN_S` ago.
+/// Kept on the account, not on a link, so revoking or replacing a link does
+/// not free it.
+pub(crate) fn claim_recovery_mail(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: &str,
+    t: i64,
+) -> anyhow::Result<Result<(), i64>> {
+    let last: Option<i64> =
+        tx.query_row("SELECT recovery_mail_at FROM users WHERE id = ?1", params![user_id], |r| r.get(0))?;
+    if let Some(wait) = recovery_mail_wait(last, t) {
+        return Ok(Err(wait));
+    }
+    tx.execute("UPDATE users SET recovery_mail_at = ?2 WHERE id = ?1", params![user_id, t])?;
+    Ok(Ok(()))
+}
+
+/// Seconds left (at least 1) until a recovery mail sent at `last` allows the next.
+fn recovery_mail_wait(last: Option<i64>, t: i64) -> Option<i64> {
+    last.map(|at| at + RECOVERY_MAIL_COOLDOWN_S - t).filter(|&wait| wait > 0)
+}
 
 impl Db {
     /// "Forgot password?": a `password_reset` link for the enabled account
     /// whose username or confirmed address is `login`, replacing its earlier
-    /// unused ones, unless one was made less than `PASSWORD_RESET_COOLDOWN_S` ago. `None`:
+    /// unused ones, unless a recovery mail went to it less than
+    /// `RECOVERY_MAIL_COOLDOWN_S` ago (`claim_recovery_mail`). `None`:
     /// no mail to send (no such account, no address, disabled, too soon).
     pub async fn create_password_reset(
         &self,
@@ -81,17 +105,13 @@ impl Db {
             let Some((user_id, username, email, totp)) = found else {
                 return Ok(None);
             };
-            let recent: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM invites WHERE kind = 'password_reset' AND user_id = ?1 AND created_at > ?2)",
-                params![user_id, t - PASSWORD_RESET_COOLDOWN_S],
-                |r| r.get(0),
-            )?;
-            if recent {
+            if claim_recovery_mail(&tx, &user_id, t)?.is_err() {
                 return Ok(None);
             }
-            tx.execute("DELETE FROM invites WHERE kind = 'password_reset' AND user_id = ?1 AND used_at IS NULL", params![
-                user_id
-            ])?;
+            tx.execute(
+                "DELETE FROM invites WHERE kind = 'password_reset' AND user_id = ?1 AND used_at IS NULL",
+                params![user_id],
+            )?;
             tx.execute(
                 "INSERT INTO invites (id, token_hash, kind, role, created_at, expires_at, user_id, auth_epoch, email)
                  SELECT ?1, ?2, 'password_reset', role, ?3, ?4, id, auth_epoch, email FROM users WHERE id = ?5",
@@ -210,20 +230,15 @@ impl Db {
         .await
     }
 
-    /// Bind sign-in reset link `id` to the account's confirmed address, to
-    /// mail it there: it then works only while the account keeps that
-    /// address. Returns the address; `None` if the account has none.
-    pub async fn bind_reset_to_address(&self, id: String) -> anyhow::Result<Option<String>> {
+    /// Seconds left before another recovery mail may go to `user_id`
+    /// (`claim_recovery_mail` is the authority), for a refusal that comes
+    /// before anything else is asked.
+    pub async fn recovery_mail_wait(&self, user_id: String) -> anyhow::Result<Option<i64>> {
         self.call(move |c| {
-            Ok(c.query_row(
-                "UPDATE invites SET email = (SELECT email FROM users WHERE users.id = invites.user_id)
-                 WHERE id = ?1 AND kind = 'account_reset' AND used_at IS NULL
-                   AND EXISTS (SELECT 1 FROM users WHERE users.id = invites.user_id AND users.email IS NOT NULL)
-                 RETURNING email",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?)
+            let last: Option<Option<i64>> = c
+                .query_row("SELECT recovery_mail_at FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
+                .optional()?;
+            Ok(recovery_mail_wait(last.flatten(), now()))
         })
         .await
     }
@@ -392,12 +407,10 @@ fn drop_mailed_links(tx: &rusqlite::Transaction<'_>, user_id: &str) -> anyhow::R
 }
 
 /// Purge: mailed self-service links hold an address, so they go as soon as
-/// they are used or expired (they are not kept for the invite list), but
-/// not within the reset cooldown: a used reset still marks it.
+/// they are used or expired (they are not kept for the invite list).
 pub(crate) fn purge_mailed_links(tx: &rusqlite::Transaction<'_>, t: i64) -> anyhow::Result<usize> {
     Ok(tx.execute(
-        "DELETE FROM invites WHERE kind IN ('password_reset', 'email_verify') AND (used_at IS NOT NULL OR expires_at <= ?1)
-           AND created_at <= ?2",
-        params![t, t - PASSWORD_RESET_COOLDOWN_S],
+        "DELETE FROM invites WHERE kind IN ('password_reset', 'email_verify') AND (used_at IS NOT NULL OR expires_at <= ?1)",
+        params![t],
     )?)
 }
