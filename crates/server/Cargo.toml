@@ -65,7 +65,7 @@ utoipa = "6.0.0"
 x509-parser = "0.18.1"
 stun = "0.17.3"
 ring = "0.17.14"
-qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+qrcode = { version = "0.15.0", default-features = false, features = ["svg"] }
 lettre = { version = "0.11.24", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "ring", "webpki-roots"] }
 
 [dev-dependencies]
