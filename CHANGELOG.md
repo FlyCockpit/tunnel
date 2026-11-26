@@ -8,6 +8,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Row-bound AES-256-GCM wrapping of every account and tunnel Argon2id password
+  hash, using an HKDF-SHA256 key derived from `ui_secret`. A database-only leak
+  no longer permits offline password guessing without the config secret.
+  Setup now generates `ui_secret` even without the UI, and `serve` requires it.
+  Startup converts legacy hashes atomically and refuses unknown keys or damaged
+  seals; restore checks backup keys without modifying the backup.
+- `tunnel-server secret rotate`: retain the old key as `ui_secret_previous`,
+  generate a new server secret, and restart to re-seal passwords and TOTP secrets
+  in one transaction. Existing sessions remain valid; open UI pages need a reload.
+  Back up the config with the database; losing the secret requires password
+  resets and two-factor re-enrollment.
 - First public release of Tunnel, licensed under MIT.
 - A single server binary with TLS termination, DNS-01 certificate issuance and
   Cloudflare, Hetzner, DigitalOcean and Route53 support.

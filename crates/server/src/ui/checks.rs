@@ -67,7 +67,15 @@ pub(super) async fn check_password(state: &AppState, user_id: &str, password: &s
         return Err(too_many());
     }
     let creds = state.db.credentials(None, Some(user_id.to_string())).await?.ok_or_else(bad_credentials)?;
-    match password::verify_phc(creds.password_hash, password.to_string()).await {
+    match password::verify_password(
+        state.pepper.clone(),
+        creds.password_hash,
+        crate::pepper::Purpose::User,
+        user_id.to_string(),
+        password.to_string(),
+    )
+    .await
+    {
         Verdict::Match => Ok(creds.auth_epoch),
         Verdict::NoMatch => {
             Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_password", "the current password is wrong"))
@@ -139,9 +147,7 @@ pub(super) async fn require_fresh_auth(state: &AppState, s: &Signed, code: Optio
     Ok(())
 }
 
-pub(super) fn totp_aad(user_id: &str) -> String {
-    format!("totp:{user_id}")
-}
+pub(super) use crate::seal::totp_aad;
 
 pub(super) fn invite_token_hash(token: &str) -> ApiResult<String> {
     let token = token.trim();

@@ -72,6 +72,214 @@ async fn create_password_tunnel(db: &Db, id: &str) {
 }
 
 #[tokio::test]
+async fn startup_seals_legacy_passwords_and_preserves_absent_passwords() {
+    use crate::pepper::{PepperSet, Purpose};
+    let dir = TestDir(std::env::temp_dir().join("tunnel-db-tests").join(crate::tokens::random_tunnel_id()));
+    let path = dir.0.join("tunnel.db");
+    let db = Db::open(&path).unwrap();
+    let phc = crate::password::hash("legacy password".into()).await.unwrap();
+    let raw = phc.clone();
+    db.call(move |c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at)
+             VALUES ('legacy', 'legacy', ?1, 'member', 0), ('owner', 'owner', '!', 'owner', 0)",
+            params![raw],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    create_password_tunnel(&db, "legacytun").await;
+    create_password_tunnel(&db, "linktunnel").await;
+    db.update_tunnel("legacytun".into(), TunnelPatch { access: Some(password_access(&phc)), ..Default::default() })
+        .await
+        .unwrap();
+    db.update_tunnel("linktunnel".into(), TunnelPatch { access: Some(Access::default()), ..Default::default() })
+        .await
+        .unwrap();
+    let peppers = PepperSet::new("public conversion fixture", None);
+    let keys = || (crate::seal::Keys::new("public conversion fixture"), None);
+    let counts = crate::reseal::seal(&db, peppers.clone(), keys()).await.unwrap();
+    assert_eq!(counts, crate::reseal::Counts { converted: 2, rewrapped: 0 });
+    for file in [&path, &path.with_extension("db-wal")] {
+        match std::fs::read(file) {
+            Ok(bytes) => assert!(!bytes.windows(phc.len()).any(|part| part == phc.as_bytes())),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+    let user = db.credentials(None, Some("legacy".into())).await.unwrap().unwrap();
+    let tunnel = db.get_tunnel("legacytun".into()).await.unwrap().unwrap();
+    for (stored, purpose, id) in [
+        (user.password_hash, Purpose::User, "legacy"),
+        (tunnel.access.password_hash.unwrap(), Purpose::Tunnel, "legacytun"),
+    ] {
+        assert!(stored.starts_with(&format!("pw1:{}:", peppers.current.id())));
+        assert_eq!(
+            crate::password::verify_password(
+                peppers.current.clone(),
+                stored,
+                purpose,
+                id.into(),
+                "legacy password".into()
+            )
+            .await,
+            crate::password::Verdict::Match
+        );
+    }
+    assert_eq!(db.credentials(None, Some("owner".into())).await.unwrap().unwrap().password_hash, "!");
+    assert!(db.get_tunnel("linktunnel".into()).await.unwrap().unwrap().access.password_hash.is_none());
+    assert_eq!(crate::reseal::seal(&db, peppers, keys()).await.unwrap(), crate::reseal::Counts::default());
+}
+
+#[tokio::test]
+async fn sealing_cleans_deleted_legacy_passwords_even_without_conversions() {
+    let dir = TestDir(std::env::temp_dir().join("tunnel-db-tests").join(crate::tokens::random_tunnel_id()));
+    let path = dir.0.join("tunnel.db");
+    let db = Db::open(&path).unwrap();
+    let phc = crate::password::DUMMY_PHC;
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA secure_delete=OFF").unwrap();
+    writer.execute("INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('deleted', 'deleted', ?1, 'member', 0)", [phc]).unwrap();
+    writer.execute("DELETE FROM users WHERE id = 'deleted'", []).unwrap();
+    writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(writer);
+    assert!(std::fs::read(&path).unwrap().windows(phc.len()).any(|bytes| bytes == phc.as_bytes()));
+    let peppers = crate::pepper::PepperSet::new("public cleanup fixture", None);
+    for _ in 0..2 {
+        let keys = (crate::seal::Keys::new("public cleanup fixture"), None);
+        assert_eq!(crate::reseal::seal(&db, peppers.clone(), keys).await.unwrap(), crate::reseal::Counts::default());
+        for file in [&path, &path.with_extension("db-wal")] {
+            match std::fs::read(file) {
+                Ok(bytes) => assert!(!bytes.windows(phc.len()).any(|part| part == phc.as_bytes())),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn totp_only_rotation_checkpoints_and_removes_old_values() {
+    use crate::pepper::PepperSet;
+    use crate::seal::{Keys, totp_aad};
+    let (db, dir) = isolated_db();
+    let old = Keys::new("public old totp fixture");
+    let sealed = old.seal(b"public totp fixture", &totp_aad("u1"));
+    let before = sealed.clone();
+    db.call(move |c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at, totp_secret_sealed, totp_pending_sealed)
+             VALUES ('u1', 'ann', '!', 'owner', 0, ?1, ?1)",
+            [sealed],
+        )?;
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let peppers = PepperSet::new("public current totp fixture", Some("public old totp fixture"));
+    let counts =
+        crate::reseal::seal(&db, peppers.clone(), (Keys::new("public current totp fixture"), Some(old))).await.unwrap();
+    assert_eq!(counts, crate::reseal::Counts { converted: 0, rewrapped: 2 });
+    let path = dir.0.join("state.db");
+    assert_eq!(std::fs::metadata(path.with_extension("db-wal")).unwrap().len(), 0);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!bytes.windows(before.len()).any(|part| part == before.as_bytes()));
+    let current = Keys::new("public current totp fixture");
+    assert_eq!(crate::reseal::check(&path, &peppers, (&current, None)).unwrap(), crate::reseal::Counts::default());
+}
+
+#[tokio::test]
+async fn sealing_refuses_a_busy_checkpoint() {
+    let (db, dir) = isolated_db();
+    db.call(|c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', ?1, 'owner', 0)",
+            [crate::password::DUMMY_PHC],
+        )?;
+        c.busy_timeout(std::time::Duration::from_millis(1))?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let reader = Connection::open(dir.0.join("state.db")).unwrap();
+    reader.execute_batch("BEGIN; SELECT * FROM users;").unwrap();
+    let error = crate::reseal::seal(
+        &db,
+        crate::pepper::PepperSet::new("public checkpoint fixture", None),
+        (crate::seal::Keys::new("public checkpoint fixture"), None),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("checkpoint is busy"));
+    reader.execute_batch("ROLLBACK").unwrap();
+}
+
+#[tokio::test]
+async fn every_open_enables_secure_delete() {
+    let (db, dir) = isolated_db();
+    let second = Db::open(&dir.0.join("state.db")).unwrap();
+    for db in [&db, &second] {
+        let enabled: i32 =
+            db.call(|c| Ok(c.pragma_query_value(None, "secure_delete", |row| row.get(0))?)).await.unwrap();
+        assert_eq!(enabled, 1);
+    }
+}
+
+#[tokio::test]
+async fn invalid_phcs_are_refused_raw_and_under_either_password_key() {
+    use crate::pepper::{PepperSet, Purpose};
+    let peppers = PepperSet::new("public current phc fixture", Some("public previous phc fixture"));
+    for (table, purpose) in [("users", Purpose::User), ("tunnels", Purpose::Tunnel)] {
+        for invalid in [
+            "$argon2id$fixture".to_string(),
+            crate::password::DUMMY_PHC.replace("argon2id", "argon2i"),
+            crate::password::DUMMY_PHC.replace("m=19456", "m=0"),
+            crate::password::DUMMY_PHC.replace("v=19", "v=99"),
+            crate::password::DUMMY_PHC.rsplit_once('$').unwrap().0.to_string() + "$AA",
+        ] {
+            for key in [None, Some(&peppers.current), peppers.previous.as_ref()] {
+                let (db, dir) = isolated_db();
+                let stored = key.map_or_else(|| invalid.clone(), |key| key.wrap(&invalid, purpose, "u1"));
+                let value = stored.clone();
+                if table == "tunnels" {
+                    create_password_tunnel(&db, "u1").await;
+                }
+                db.call(move |c| {
+                    if table == "users" {
+                        c.execute("INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', ?1, 'owner', 0)", [value])?;
+                    } else {
+                        c.execute("UPDATE tunnels SET password_hash = ?1 WHERE id = 'u1'", [value])?;
+                    }
+                    Ok(())
+                }).await.unwrap();
+                let keys = crate::seal::Keys::new("public current phc fixture");
+                let error =
+                    crate::reseal::check(&dir.0.join("state.db"), &peppers, (&keys, None)).unwrap_err().to_string();
+                assert!(error.contains(&format!("{table} row u1")));
+                assert!(error.contains("invalid Argon2id PHC"));
+                assert!(!error.contains(&invalid));
+                assert!(!error.contains(&stored));
+                let error = crate::reseal::seal(&db, peppers.clone(), (keys, None)).await.unwrap_err().to_string();
+                assert!(error.contains(&format!("{table} row u1")));
+                assert!(error.contains("invalid Argon2id PHC"));
+                let actual = db
+                    .call(move |c| {
+                        let query = format!("SELECT password_hash FROM {table} WHERE id = 'u1'");
+                        Ok(c.query_row(&query, [], |row| row.get::<_, String>(0))?)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(actual, stored);
+                let synchronous: i32 =
+                    db.call(|c| Ok(c.pragma_query_value(None, "synchronous", |row| row.get(0))?)).await.unwrap();
+                assert_eq!(synchronous, 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn copied_login_provenance_keeps_longest_expiry_in_either_order() {
     let (db, _dir) = isolated_db();
     create_password_tunnel(&db, "sourceaaaa").await;
@@ -96,6 +304,51 @@ async fn copied_login_provenance_keeps_longest_expiry_in_either_order() {
             .await
             .unwrap();
         assert_eq!(provenance, expected);
+    }
+}
+
+#[tokio::test]
+async fn unknown_or_damaged_password_seals_roll_back_the_whole_conversion() {
+    use crate::pepper::{PepperSet, Purpose};
+    for unknown_key in [false, true] {
+        let (db, _dir) = isolated_db();
+        let peppers = PepperSet::new("public current fixture", None);
+        let other = PepperSet::new("public other fixture", None);
+        let bad = if unknown_key {
+            other.current.wrap(crate::password::DUMMY_PHC, Purpose::Tunnel, "badtunnel")
+        } else {
+            // A known key id does not excuse a value bound to another row.
+            peppers.current.wrap(crate::password::DUMMY_PHC, Purpose::Tunnel, "otherrow")
+        };
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at)
+                VALUES ('legacy', 'legacy', ?1, 'member', 0)",
+                [crate::password::DUMMY_PHC],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        create_password_tunnel(&db, "badtunnel").await;
+        db.update_tunnel("badtunnel".into(), TunnelPatch { access: Some(password_access(&bad)), ..Default::default() })
+            .await
+            .unwrap();
+        let error = crate::reseal::seal(&db, peppers.clone(), (crate::seal::Keys::new("public current fixture"), None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tunnels row badtunnel"));
+        assert!(error.contains(peppers.current.id()));
+        assert!(error.contains(if unknown_key { other.current.id() } else { peppers.current.id() }));
+        assert!(error.contains("the database was sealed with a different ui_secret"));
+        assert!(!error.contains(&bad));
+        assert_eq!(
+            db.credentials(None, Some("legacy".into())).await.unwrap().unwrap().password_hash,
+            crate::password::DUMMY_PHC,
+            "earlier conversions must roll back"
+        );
+        assert_eq!(db.get_tunnel("badtunnel".into()).await.unwrap().unwrap().access.password_hash, Some(bad));
     }
 }
 
@@ -136,6 +389,66 @@ async fn omitted_password_preserves_transaction_hash_and_login_grants() {
 }
 
 #[tokio::test]
+async fn rotation_reseals_passwords_and_both_totp_columns() {
+    use crate::pepper::{PepperSet, Purpose};
+    use crate::seal::{Keys, totp_aad};
+    let (db, _dir) = isolated_db();
+    let peppers = PepperSet::new("public new rotation fixture", Some("public old rotation fixture"));
+    let old = peppers.previous.as_ref().unwrap();
+    let phc = crate::password::hash("rotation password".into()).await.unwrap();
+    let user_hash = old.wrap(&phc, Purpose::User, "rotating");
+    let old_totp = Keys::new("public old rotation fixture");
+    let sealed = old_totp.seal(b"public totp fixture", &totp_aad("rotating"));
+    db.call(move |c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at,
+            totp_secret_sealed, totp_pending_sealed) VALUES ('rotating', 'rotating', ?1, 'owner', 0, ?2, ?2)",
+            params![user_hash, sealed],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    create_password_tunnel(&db, "rotatetun").await;
+    db.update_tunnel(
+        "rotatetun".into(),
+        TunnelPatch {
+            access: Some(password_access(&old.wrap(&phc, Purpose::Tunnel, "rotatetun"))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let counts =
+        crate::reseal::seal(&db, peppers, (Keys::new("public new rotation fixture"), Some(old_totp))).await.unwrap();
+    assert_eq!(counts, crate::reseal::Counts { converted: 0, rewrapped: 4 });
+    let current = PepperSet::new("public new rotation fixture", None);
+    let user = db.credentials(None, Some("rotating".into())).await.unwrap().unwrap();
+    let tunnel = db.get_tunnel("rotatetun".into()).await.unwrap().unwrap();
+    for (stored, purpose, id) in [
+        (user.password_hash, Purpose::User, "rotating"),
+        (tunnel.access.password_hash.unwrap(), Purpose::Tunnel, "rotatetun"),
+    ] {
+        assert_eq!(
+            crate::password::verify_password(
+                current.current.clone(),
+                stored,
+                purpose,
+                id.into(),
+                "rotation password".into()
+            )
+            .await,
+            crate::password::Verdict::Match
+        );
+    }
+    let keys = Keys::new("public new rotation fixture");
+    for sealed in [user.totp_sealed.unwrap(), user.totp_pending_sealed.unwrap()] {
+        assert_eq!(keys.open(&sealed, &totp_aad("rotating")).as_deref(), Some(b"public totp fixture".as_slice()));
+    }
+    assert_eq!(crate::reseal::seal(&db, current, (keys, None)).await.unwrap(), crate::reseal::Counts::default());
+}
+
+#[tokio::test]
 async fn omitted_password_cannot_restore_password_after_mode_change() {
     let (db, _dir) = isolated_db();
     let id = "modechange".to_string();
@@ -158,6 +471,38 @@ async fn omitted_password_cannot_restore_password_after_mode_change() {
     let row = db.get_tunnel(id).await.unwrap().unwrap();
     assert_eq!(row.access, Access::default());
     assert!(row.label.is_none());
+}
+
+#[tokio::test]
+async fn unreadable_totp_rolls_back_password_rotation() {
+    use crate::pepper::{PepperSet, Purpose};
+    let (db, _dir) = isolated_db();
+    let peppers = PepperSet::new("public new fixture", Some("public previous fixture"));
+    let stored = peppers.previous.as_ref().unwrap().wrap(crate::password::DUMMY_PHC, Purpose::User, "u1");
+    let before = stored.clone();
+    db.call(move |c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at, totp_pending_sealed)
+            VALUES ('u1', 'ann', ?1, 'owner', 0, 'invalid')",
+            params![stored],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let error = crate::reseal::seal(
+        &db,
+        peppers,
+        (crate::seal::Keys::new("public new fixture"), Some(crate::seal::Keys::new("public previous fixture"))),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("users row u1"));
+    assert!(error.contains("the database was sealed with a different ui_secret"));
+    let user = db.credentials(None, Some("u1".into())).await.unwrap().unwrap();
+    assert_eq!(user.password_hash, before);
+    assert_eq!(user.totp_pending_sealed.as_deref(), Some("invalid"));
 }
 
 #[tokio::test]

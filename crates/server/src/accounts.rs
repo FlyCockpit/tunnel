@@ -1,5 +1,6 @@
 //! Accounts: users, sessions, invites, recovery codes and the audit log.
 
+use crate::pepper::{Pepper, Purpose};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,7 @@ pub struct User {
 #[derive(Clone)]
 pub struct Credentials {
     pub user: User,
+    /// Row-bound password seal, or `NO_PASSWORD`.
     pub password_hash: String,
     pub totp_sealed: Option<String>,
     pub totp_pending_sealed: Option<String>,
@@ -61,6 +63,7 @@ pub struct UserSummary {
 pub struct NewUser {
     pub id: String,
     pub username: String,
+    /// Raw PHC, wrapped inside the insertion transaction.
     pub password_hash: String,
     pub can_public: bool,
 }
@@ -544,6 +547,7 @@ impl Db {
         password_hash: String,
         epoch: i64,
         session: String,
+        pepper: Pepper,
     ) -> anyhow::Result<Option<i64>> {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -552,7 +556,7 @@ impl Db {
             }
             let epoch: i64 = tx.query_row(
                 "UPDATE users SET password_hash = ?2, auth_epoch = auth_epoch + 1 WHERE id = ?1 RETURNING auth_epoch",
-                params![user_id, password_hash],
+                params![user_id, pepper.wrap(&password_hash, Purpose::User, &user_id)],
                 |r| r.get(0),
             )?;
             tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![user_id])?;
@@ -1156,6 +1160,7 @@ impl Db {
         &self,
         token_hash: String,
         acceptance: Acceptance,
+        pepper: Pepper,
     ) -> anyhow::Result<Result<(String, i64, Vec<String>), AcceptError>> {
         self.call(move |c| {
             let t = now();
@@ -1206,7 +1211,7 @@ impl Db {
                         return Ok(Err(AcceptError::OwnerState));
                     };
                     tx.execute("UPDATE users SET disabled_at = NULL WHERE id = ?1", params![owner])?;
-                    reset_sign_in(&tx, &owner, &password_hash, revoke_machines, &mut tunnels)?;
+                    reset_sign_in(&tx, &owner, &pepper.wrap(&password_hash, Purpose::User, &owner), revoke_machines, &mut tunnels)?;
                     owner
                 }
                 (InviteKind::AccountReset, Acceptance::Reset { password_hash, revoke_machines }) => {
@@ -1220,7 +1225,7 @@ impl Db {
                     if !addresses::still_at_address(&tx, &target, reset.email.as_deref())? {
                         return Ok(Err(AcceptError::Invalid));
                     }
-                    reset_sign_in(&tx, &target, &password_hash, revoke_machines, &mut tunnels)?;
+                    reset_sign_in(&tx, &target, &pepper.wrap(&password_hash, Purpose::User, &target), revoke_machines, &mut tunnels)?;
                     target
                 }
                 (InviteKind::PasswordReset, Acceptance::Reset { password_hash, revoke_machines }) => {
@@ -1230,6 +1235,7 @@ impl Db {
                         reset.epoch,
                         reset.email,
                         &password_hash,
+                        &pepper,
                         revoke_machines,
                         &mut tunnels,
                     )?;
@@ -1252,11 +1258,11 @@ impl Db {
                         }
                         tx.execute(
                             "UPDATE users SET username = ?2, password_hash = ?3, auth_epoch = auth_epoch + 1 WHERE id = ?1",
-                            params![owner, u.username, u.password_hash],
+                            params![owner, u.username, pepper.wrap(&u.password_hash, Purpose::User, &owner)],
                         )?;
                         owner
                     }
-                    None => match insert_user(&tx, u, Role::Owner, t)? {
+                    None => match insert_user(&tx, u, Role::Owner, t, &pepper)? {
                         Some(id) => id,
                         None => return Ok(Err(AcceptError::UsernameTaken)),
                     },
@@ -1267,7 +1273,7 @@ impl Db {
                         Role::Owner => Role::Member,
                         r => r,
                     };
-                    let id = match insert_user(&tx, u, role, t)? {
+                    let id = match insert_user(&tx, u, role, t, &pepper)? {
                         Some(id) => id,
                         None => return Ok(Err(AcceptError::UsernameTaken)),
                     };
@@ -1796,11 +1802,17 @@ fn reset_sign_in(
     Ok(())
 }
 
-fn insert_user(tx: &rusqlite::Transaction<'_>, u: NewUser, role: Role, t: i64) -> anyhow::Result<Option<String>> {
+fn insert_user(
+    tx: &rusqlite::Transaction<'_>,
+    u: NewUser,
+    role: Role,
+    t: i64,
+    pepper: &Pepper,
+) -> anyhow::Result<Option<String>> {
     let inserted = tx.execute(
         "INSERT INTO users (id, username, password_hash, role, can_public, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(username) DO NOTHING",
-        params![u.id, u.username, u.password_hash, role.as_str(), u.can_public, t],
+        params![u.id, u.username, pepper.wrap(&u.password_hash, Purpose::User, &u.id), role.as_str(), u.can_public, t],
     )?;
     Ok((inserted == 1).then_some(u.id))
 }

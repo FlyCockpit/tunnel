@@ -479,7 +479,17 @@ pub async fn login(
     let (Some(user), Some(hash)) = (tunnel.access.password_user.clone(), tunnel.access.password_hash.clone()) else {
         return LoginOutcome::NotPassword;
     };
-    match crate::password::verify(user, hash.clone(), form.username, form.password).await {
+    match crate::password::verify(
+        state.pepper.clone(),
+        hash.clone(),
+        crate::pepper::Purpose::Tunnel,
+        tunnel.id.clone(),
+        user,
+        form.username,
+        form.password,
+    )
+    .await
+    {
         crate::password::Verdict::Match => {}
         crate::password::Verdict::NoMatch => {
             state.metrics.access_failed();
@@ -530,6 +540,7 @@ mod tests {
 
     async fn test_state() -> (std::sync::Arc<AppState>, tunnel_protocol::mux::Session) {
         let config = serde_json::from_value(serde_json::json!({
+            "ui_secret": "public-test-fixture-server-secret-0123456789",
             "preview_zone": "previews.example.com", "api_host": "api.example.com",
             "tunnel_host": "tunnel.example.com", "turn_host": "turn.example.com",
             "admin_token_hash": "test-placeholder",
@@ -579,6 +590,35 @@ mod tests {
             token_hash: String::new(),
         }));
         (state, session)
+    }
+
+    #[tokio::test]
+    async fn legacy_tunnel_password_logs_in_after_startup_conversion() {
+        let (state, _session) = test_state().await;
+        let phc = crate::password::hash("legacy tunnel password".into()).await.unwrap();
+        state
+            .db
+            .call(move |c| {
+                c.execute("UPDATE tunnels SET password_hash = ?1 WHERE id = 'abcdefghij'", [phc])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let peppers = crate::pepper::PepperSet::new(state.config.ui_secret.as_deref().unwrap(), None);
+        let totp = crate::seal::Keys::new(state.config.ui_secret.as_deref().unwrap());
+        crate::reseal::seal(&state.db, peppers, (totp, None)).await.unwrap();
+        let tunnel = state.db.get_tunnel("abcdefghij".into()).await.unwrap().unwrap();
+        assert!(tunnel.access.password_hash.as_deref().unwrap().starts_with("pw1:"));
+        let form = LoginForm {
+            to: tunnel.id.clone(),
+            username: "test".into(),
+            password: "legacy tunnel password".into(),
+            next: "/".into(),
+        };
+        assert!(matches!(
+            login(&state, "203.0.113.1".parse().unwrap(), &tunnel, form, &[]).await,
+            LoginOutcome::Granted(_)
+        ));
     }
 
     /// An authorization that presented only `hash`.

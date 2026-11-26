@@ -158,6 +158,34 @@ async fn owner(state: &Arc<AppState>) -> Browser {
     sign_up(state, &token, "olivia", 1).await
 }
 
+#[tokio::test]
+async fn legacy_account_signs_in_after_startup_conversion() {
+    let state = state();
+    let phc = crate::password::hash("legacy-password".into()).await.unwrap();
+    state
+        .db
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at)
+            VALUES ('legacy', 'ann', ?1, 'owner', 0)",
+                rusqlite::params![phc],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let peppers = crate::pepper::PepperSet::new(state.config.ui_secret.as_deref().unwrap(), None);
+    let totp = crate::seal::Keys::new(state.config.ui_secret.as_deref().unwrap());
+    crate::reseal::seal(&state.db, peppers, (totp, None)).await.unwrap();
+    let mut browser = Browser::new(1);
+    let response = browser
+        .call(&state, "POST", "/ui/api/login", Some(json!({"username": "ann", "password": "legacy-password"})))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let user = state.db.credentials(None, Some("legacy".into())).await.unwrap().unwrap();
+    assert!(user.password_hash.starts_with("pw1:"));
+}
+
 /// Owner invites a member; returns the member's browser.
 async fn member(state: &Arc<AppState>, owner: &mut Browser, name: &str, ip: u8) -> Browser {
     let r = owner.call(state, "POST", "/ui/api/invites", Some(json!({ "role": "member" }))).await;
@@ -992,7 +1020,13 @@ async fn credential_changes_checked_before_a_recovery_cannot_land_after_it() {
     assert!(
         state
             .db
-            .set_password(creds.user.id.clone(), "attacker".into(), creds.auth_epoch, session.clone())
+            .set_password(
+                creds.user.id.clone(),
+                "attacker".into(),
+                creds.auth_epoch,
+                session.clone(),
+                state.pepper.clone()
+            )
             .await
             .unwrap()
             .is_none()

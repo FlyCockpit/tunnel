@@ -315,7 +315,7 @@ pub struct Access {
     pub mode: AccessMode,
     /// Set in password mode only.
     pub password_user: Option<String>,
-    /// PHC-format argon2 hash; set in password mode only.
+    /// Row-bound password seal; set in password mode only.
     pub password_hash: Option<String>,
 }
 
@@ -757,6 +757,7 @@ impl Db {
         enable_wal(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let objects: i64 = tx.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |r| r.get(0))?;

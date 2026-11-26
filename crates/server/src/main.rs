@@ -16,9 +16,11 @@ mod listener;
 mod mail;
 mod metrics;
 mod password;
+mod pepper;
 mod pool;
 mod ratelimit;
 mod registry;
+mod reseal;
 mod role;
 mod seal;
 mod services;
@@ -56,6 +58,11 @@ enum Cmd {
     Token {
         #[command(subcommand)]
         cmd: TokenCmd,
+    },
+    /// Rotate the server secret and re-seal stored passwords and two-factor secrets.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
     },
     /// Protect /healthz with an optional token (for uptime monitors).
     HealthToken {
@@ -216,6 +223,14 @@ enum HealthTokenCmd {
 }
 
 #[derive(Subcommand)]
+enum SecretCmd {
+    /// Generate a new server secret and restart to re-seal the database.
+    Rotate,
+    /// Check, without changing anything, that the database's seals open with the configured secret.
+    Check,
+}
+
+#[derive(Subcommand)]
 enum TokenCmd {
     /// Generate a new admin API token, print it once, restart the service.
     Rotate,
@@ -247,9 +262,24 @@ async fn main() -> anyhow::Result<()> {
         Some(p) => p,
         None => config::mode::Mode::current().config_path()?,
     };
+    let _admin_lock = if matches!(
+        &cli.cmd,
+        Cmd::Setup(_)
+            | Cmd::Mail { cmd: MailCmd::Setup { .. } | MailCmd::Off }
+            | Cmd::Token { cmd: TokenCmd::Rotate }
+            | Cmd::HealthToken { .. }
+            | Cmd::Restore { .. }
+            | Cmd::Secret { cmd: SecretCmd::Rotate }
+    ) {
+        cli::admin_lock(&config)?
+    } else {
+        None
+    };
     match cli.cmd {
         Cmd::Serve => cli::serve(&config).await,
         Cmd::Setup(args) => cli::setup::run(&config, *args).await,
+        Cmd::Secret { cmd: SecretCmd::Rotate } => cli::secret_rotate(&config).await,
+        Cmd::Secret { cmd: SecretCmd::Check } => cli::secret_check(&config).await,
         Cmd::Token { cmd: TokenCmd::Rotate } => cli::token_rotate(&config).await,
         Cmd::HealthToken { cmd } => cli::health_token(&config, matches!(cmd, HealthTokenCmd::Set)).await,
         Cmd::Status => cli::status(&config).await,

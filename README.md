@@ -142,7 +142,8 @@ The installer verifies the binary, installs it to `/usr/local/bin`, and
 execs `tunnel-server setup </dev/tty`. The wizard asks for domains,
 ACME email, DNS provider (Cloudflare, Hetzner, DigitalOcean, Route53) and
 token, and whether to enable WebRTC; then creates the service user and
-directories, writes `/etc/tunnel-server/config.toml`, creates and verifies
+directories, generates the server secret (`ui_secret`) even without the web UI,
+writes `/etc/tunnel-server/config.toml`, creates and verifies
 DNS records, issues the certificate (DNS-01), configures the
 firewall, installs the systemd unit, self-tests, and prints the admin token
 once. For root installs, `config.toml` is owned by `root:tunnel-server` with
@@ -230,12 +231,20 @@ The client reads `TUNNEL_TOKEN`, `TUNNEL_SERVER`, `TUNNEL_ICE_FILE` and `TUNNEL_
 
 ### Web UI, accounts and hosts
 
-The web UI lives on its own host, `ui_host`, and is off until that is set
-(together with `ui_secret`, at least 32 random characters, e.g.
-`openssl rand -base64 33`; it seals TOTP secrets and derives CSRF tokens, so
-keep it with the config's other secrets). The UI host serves the app, its JSON
+The web UI lives on its own host, `ui_host`, and is off until that is set.
+`ui_secret` is the server secret: setup always generates it, and `serve` requires
+at least 32 random characters even without the UI. It seals TOTP secrets,
+peppers every stored account and tunnel password hash, and derives CSRF tokens.
+Password hashes use Argon2id inside AES-256-GCM encryption with an HKDF-SHA256
+key derived from `ui_secret`, bound to the row id and to account or tunnel use.
+Keep this secret with the config's other secrets. The UI host serves the app, its JSON
 API under `/ui/api/*`, the client installer (`/install.sh`) and the bearer API
 under `/v1/*`; `api_host` serves the bearer API under `/v1/*` too.
+
+A database-only leak does not allow offline password guessing without
+`config.toml`'s `ui_secret`. It still exposes usernames, email addresses, metadata
+and hashes of high-entropy random tokens. A leak of both the database and config
+allows offline Argon2id password guessing, as before.
 
 **Hosts and domains.** `ui_host` and `preview_zone` are independent:
 
@@ -464,7 +473,7 @@ TURN connections are closed if they do not authenticate promptly.
 
 ### Administration
 
-Admin commands: `tunnel-server status`, `token rotate`, `backup <path>`, `restore <path>`,
+Admin commands: `tunnel-server status`, `token rotate`, `secret rotate | check`, `backup <path>`, `restore <path>`,
 `cert renew [--force]`, `admin link`, `user list | invite [--role member|admin] [--hours N] | reset <name> [--hours N] | delete <name>`,
 `mail setup | test <address> | off`,
 `client add <name> [--user <name>] | list | rename <name> <new-name> | delete <name>`, and
@@ -481,13 +490,35 @@ callers presenting the printed health token (`Authorization: Bearer …` or
 `health-token clear` reopens it.
 
 Backups: `backup <path>` writes a consistent copy of the database (0600; it holds
-token hashes). `restore <path>` checks the copy's integrity, stops the service,
-keeps the current database as `tunnel.db.before-restore-<time>`, swaps the
-copy in, and starts the service again. The config file (`config.toml`) and the
-`certs/` directory are not in the database; back them up separately. The server
+sealed password hashes, two-factor secrets and token hashes). Back up
+`config.toml`, which holds `ui_secret`, together with the database; also back up
+the separate `certs/` directory. Losing `ui_secret` means every account and tunnel
+password must be reset and two-factor sign-in re-enrolled. `restore <path>` checks
+the copy's integrity and refuses a backup sealed with another `ui_secret`, unless
+that secret is configured as `ui_secret_previous`. Legacy unsealed password
+hashes are accepted and converted at startup. Restore then stops the service,
+keeps the current database as `tunnel.db.before-restore-<time>`, swaps the copy in,
+and starts the service again. The server
 and `restore` accept only databases with the schema this build creates (its
 version and every table, column and index), so a database made or left by
 another build is refused rather than misread.
+
+Backups taken before the password-sealing upgrade still contain unwrapped
+password hashes, as do pre-upgrade database copies kept by `restore` as
+`tunnel.db.before-restore-*`. Delete these copies once they are no longer needed.
+
+Rotate the server secret with `tunnel-server secret rotate`. It saves the old
+`ui_secret` as `ui_secret_previous`, generates a new secret, and tries to restart
+the service. On restart, passwords and TOTP secrets are re-sealed in one
+transaction before listening; a wrong key or damaged seal rolls the transaction
+back and refuses startup. If the service was stopped or restarting failed,
+start it to apply the rotation. Another rotation is refused while the database
+still needs the previous key. The non-secret `sealed-key-id` file in the data directory records which key the server last started with, and only one server at a time serves a data directory (`serve.lock`). Admin commands that change the config or replace the database (`setup`, `mail`, `token rotate`, `health-token`, `restore`, `secret rotate`) run one at a time (`config.toml.lock`). `secret check` reports, without changing anything,
+whether the database's seals open with the configured secret (and how many
+legacy or previous-key values the next start will seal). Web UI sessions stay signed in; reload open pages
+for new CSRF tokens. Keep `ui_secret_previous` until you no longer need to restore
+backups made before the rotation; a later rotation replaces it. Keep the config
+backup matching any older database backup you retain.
 
 ### Tunnels and access
 
@@ -700,7 +731,7 @@ Cargo.toml                 workspace, shared dependency versions, release profil
 install.sh                 curl | sh installer: download, verify, exec `setup`
 crates/protocol/           wire messages, constants, mux (rust-yamux driver), WebSocket↔bytes bridge
 crates/server/             tunnel-server (VPS)
-  src/main.rs              CLI: serve | setup | token rotate | health-token | status | backup | restore | cert renew | admin | user | client | service
+  src/main.rs              CLI: serve | setup | token rotate | secret rotate|check | health-token | status | backup | restore | cert renew | admin | user | client | service
   src/ui/                  web UI host: /ui/api/* (accounts, sessions, TOTP, invites, admin), embedded assets
   src/ui/install.rs        the client's /install.sh and /install.ps1 on the UI host
   src/cli/                 non-interactive subcommands (`serve` wires everything together); setup/: interactive wizard (prompts, firewall, systemd)
@@ -721,7 +752,7 @@ crates/server/             tunnel-server (VPS)
   src/ice.rs metrics.rs    TURN REST credentials, Prometheus text on 127.0.0.1:9464
   src/config/              config file; mode.rs: system vs rootless install layout and its checks; dns/: DNS providers
   src/files.rs util.rs     safe file writes and ownership; HTTP body helpers
-  src/tokens.rs password.rs seal.rs  token formats, password hashing, sealing with the UI secret
+  src/tokens.rs password.rs pepper.rs seal.rs  tokens, Argon2id, row-bound password seals, TOTP and CSRF keys from the server secret
 crates/client/             tunnel-client (sandbox); see crates/client/README.md
 crates/web/                web UI (Leptos CSR, wasm32); build.sh writes dist/ for the server's `ui` feature
 docs/agent/SKILL.md        how AI agents share apps with tunnel (`tunnel help agent`)

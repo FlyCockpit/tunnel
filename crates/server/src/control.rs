@@ -461,6 +461,7 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         let config: crate::config::Config = serde_json::from_value(json!({
+            "ui_secret": "public-test-fixture-server-secret-0123456789",
             "preview_zone": "previews.example.com", "api_host": "api.example.com",
             "tunnel_host": "tunnel.example.com", "turn_host": "turn.example.com",
             "admin_token_hash": "x", "acme": {"email": "test@example.com"},

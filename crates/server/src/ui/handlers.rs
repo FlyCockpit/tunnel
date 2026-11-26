@@ -39,11 +39,6 @@ pub const OWNER_LINK_TTL_S: i64 = 15 * 60;
 /// Sign-in reset links last this long unless another lifetime is picked (15 min ..= 24 h).
 pub const RESET_LINK_TTL_S: i64 = 3600;
 pub const RESET_LINK_TTL_RANGE: std::ops::RangeInclusive<i64> = 15 * 60..=86_400;
-/// Argon2id PHC of a public fixture password, checked when a username is
-/// unknown so that answers take as long as for a wrong password.
-const DUMMY_PHC: &str =
-    "$argon2id$v=19$m=19456,t=2,p=1$cHVibGljLXRlc3Qtc2FsdA$BimFkRyg6Ge8LT3LbudUr7ob0dRYFhuwqMT54saxJvQ";
-
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/ui/api/session", get(session))
@@ -241,11 +236,19 @@ async fn login(
         return Err(too_many());
     }
     let creds = state.db.credentials(Some(username.clone()), None).await?.filter(|c| c.user.username == username);
-    let (phc, known) = match &creds {
+    let (stored, known) = match &creds {
         Some(c) if !c.user.disabled => (c.password_hash.clone(), true),
-        _ => (DUMMY_PHC.to_string(), false),
+        _ => (String::new(), false),
     };
-    match password::verify_phc(phc, req.password).await {
+    match password::verify_password(
+        state.pepper.clone(),
+        stored,
+        crate::pepper::Purpose::User,
+        creds.as_ref().map(|c| c.user.id.clone()).unwrap_or_default(),
+        req.password,
+    )
+    .await
+    {
         Verdict::Busy => return Err(busy()),
         Verdict::Match if known => {}
         _ => {
@@ -411,7 +414,7 @@ async fn invite_accept(
                 can_public: false,
             })
         };
-    let (user_id, epoch, tunnels) = match state.db.accept_invite(hash, acceptance).await? {
+    let (user_id, epoch, tunnels) = match state.db.accept_invite(hash, acceptance, state.pepper.clone()).await? {
         Ok(found) => found,
         Err(AcceptError::UsernameTaken) => {
             return Err(ApiError::new(StatusCode::CONFLICT, "username_taken", "that username is taken"));
@@ -477,7 +480,7 @@ async fn change_password(
     // One transaction: the new hash and the end of every session.
     let epoch = state
         .db
-        .set_password(user_id.clone(), hash, checked_at, s.session.id_hash.clone())
+        .set_password(user_id.clone(), hash, checked_at, s.session.id_hash.clone(), state.pepper.clone())
         .await?
         .ok_or_else(changed_meanwhile)?;
     audit(&state, Some(&user_id), "password_changed", None, &s.ctx).await;

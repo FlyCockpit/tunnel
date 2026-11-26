@@ -162,6 +162,7 @@ impl UiState {
 
 pub struct AppState {
     pub config: Config,
+    pub pepper: crate::pepper::Pepper,
     pub db: Db,
     pub registry: Registry,
     pub certs: Arc<CertStore>,
@@ -188,6 +189,7 @@ impl AppState {
         db.set_limit_defaults(crate::limits::Defaults::new(&config.limits));
         Arc::new(Self {
             ui: UiState::new(&config),
+            pepper: crate::pepper::Pepper::new(config.ui_secret.as_deref().expect("serve requires ui_secret")),
             config,
             db,
             registry: Registry::default(),
@@ -357,6 +359,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let config: Config = toml::from_str(
             r#"
+ui_secret = "public-test-fixture-server-secret-0123456789"
 preview_zone = "previews.example.com"
 api_host = "api.example.com"
 tunnel_host = "tunnel.example.com"

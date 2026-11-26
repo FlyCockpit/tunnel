@@ -1,4 +1,4 @@
-//! Keys derived from the config's `ui_secret`: AES-256-GCM sealing of TOTP
+//! Keys derived from the server's `ui_secret`: AES-256-GCM sealing of TOTP
 //! secrets at rest (a database copy alone does not reveal them) and the
 //! per-session CSRF token.
 
@@ -9,6 +9,10 @@ use rand::TryRng;
 use rand::rngs::SysRng;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use sha2::Sha256;
+
+pub fn totp_aad(user_id: &str) -> String {
+    format!("totp:{user_id}")
+}
 
 pub struct Keys {
     seal: LessSafeKey,

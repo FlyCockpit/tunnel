@@ -46,3 +46,30 @@ Tunnel issue if it bypasses the gate or crosses a tunnel/token boundary.
 Local state and backups contain sensitive material and require filesystem access
 controls. Use a dedicated preview domain and restrict `frame_ancestors` to the
 sites that should embed previews.
+
+Account and tunnel password hashes use Argon2id, wrapped with AES-256-GCM under
+an HKDF-SHA256 key derived from the server's `ui_secret` and bound to the row id
+and password purpose. A database-only leak does not permit offline password
+guessing without `config.toml`'s `ui_secret`; it still exposes usernames, email
+addresses, metadata and hashes of high-entropy random tokens. A database and
+config leak permits offline Argon2id guessing, as before. The same server secret
+also seals TOTP secrets and derives CSRF tokens; setup always generates it and
+`serve` requires it, including when the web UI is disabled.
+
+Back up `config.toml` together with the database. Losing `ui_secret` means every
+account and tunnel password must be reset and two-factor sign-in re-enrolled.
+Restore refuses a backup sealed with another secret unless that secret is
+available as `ui_secret_previous`; legacy raw password hashes are converted at
+startup. A wrong key or damaged password seal refuses startup before listening
+and rolls back the entire conversion.
+
+Backups taken before the password-sealing upgrade and pre-upgrade database
+copies kept by `restore` as `tunnel.db.before-restore-*` still contain unwrapped
+password hashes. Delete these copies once they are no longer needed.
+
+Run `tunnel-server secret rotate` to save the old secret as `ui_secret_previous`,
+generate a new secret, and try to restart the service. Restart re-seals passwords
+and TOTP secrets in one transaction. Sessions remain valid; reload web UI pages
+for new CSRF tokens. Apply the pending rotation by restarting before rotating
+again. Retain `ui_secret_previous` while you need backups from before the
+rotation; a later rotation replaces it, so retain matching config backups too.

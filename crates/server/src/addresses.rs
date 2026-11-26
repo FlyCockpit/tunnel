@@ -323,6 +323,7 @@ pub(crate) fn redeem_password_reset(
     epoch: Option<i64>,
     email: Option<String>,
     password_hash: &str,
+    pepper: &crate::pepper::Pepper,
     revoke_machines: bool,
     tunnels: &mut Vec<String>,
 ) -> anyhow::Result<Option<String>> {
@@ -337,7 +338,13 @@ pub(crate) fn redeem_password_reset(
     if !current {
         return Ok(None);
     }
-    new_password(tx, &target, password_hash, revoke_machines, tunnels)?;
+    new_password(
+        tx,
+        &target,
+        &pepper.wrap(password_hash, crate::pepper::Purpose::User, &target),
+        revoke_machines,
+        tunnels,
+    )?;
     Ok(Some(target))
 }
 

@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn the_admin_lock_alone_does_not_count_as_a_foreign_entry() {
+    let dir = std::env::temp_dir().join(format!("tunnel-setup-lock-{}-{}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    assert!(!foreign_entries(&dir, &config).unwrap());
+    let lock = crate::cli::admin_lock(&config).unwrap().expect("directory exists");
+    assert!(!foreign_entries(&dir, &config).unwrap(), "only our own lock");
+    std::fs::write(dir.join("other"), b"x").unwrap();
+    assert!(foreign_entries(&dir, &config).unwrap());
+    drop(lock);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn config_directory_takeover_requires_a_config_or_no_entries() {
     let dir = Path::new("/etc/tunnel-server");
     check_config_dir_takeover(dir, false, false).unwrap();
@@ -545,18 +559,26 @@ async fn ask_config_sets_up_the_ui_and_a_separate_preview_zone() {
 }
 
 #[test]
-fn the_ui_secret_is_generated_with_the_ui() {
+fn the_ui_secret_is_generated_with_or_without_the_ui() {
     let mut cfg = hosts_config();
     cfg.admin_token_hash = "set".into();
     generate_secrets(&mut cfg);
-    assert!(cfg.ui_secret.is_none());
+    assert!(cfg.ui_secret.as_ref().unwrap().len() >= 32);
+    let original = cfg.ui_secret.clone();
     cfg.ui_host = Some("tunnel-ui.example.com".into());
     generate_secrets(&mut cfg);
     let secret = cfg.ui_secret.clone().unwrap();
+    assert_eq!(cfg.ui_secret, original);
     assert!(secret.len() >= 32);
     cfg.validate().unwrap();
     generate_secrets(&mut cfg);
     assert_eq!(cfg.ui_secret.as_deref(), Some(secret.as_str()), "kept on re-runs");
+    cfg.ui_secret = Some("é".repeat(16));
+    generate_secrets(&mut cfg);
+    assert_eq!(cfg.ui_secret.as_deref(), Some("é".repeat(16).as_str()));
+    cfg.ui_secret = Some("é".repeat(15));
+    generate_secrets(&mut cfg);
+    assert!(cfg.ui_secret.as_ref().unwrap().len() >= 32);
 }
 
 #[tokio::test]

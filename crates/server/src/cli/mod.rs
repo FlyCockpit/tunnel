@@ -1,4 +1,4 @@
-//! Non-interactive subcommands: `serve`, `token rotate`, `status`, `backup`,
+//! Non-interactive subcommands: `serve`, `token rotate`, `secret rotate`, `status`, `backup`,
 //! `cert renew`, `client …`, `service …`.
 
 use std::path::Path;
@@ -25,7 +25,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
+    let peppers = password_peppers(&cfg, config_path)?;
+    let _serving = serve_lock(&cfg)?;
     let db = Db::open_configured(&cfg)?;
+    let counts = crate::reseal::seal(&db, peppers, rotation_totp(&cfg)).await?;
+    write_sealed_key_id(&cfg, config_path)?;
+    tracing::info!(converted = counts.converted, rewrapped = counts.rewrapped, "password seals checked");
     let certs = tls::CertStore::new(cfg.cert_dir());
     certs.reload().with_context(|| {
         format!(
@@ -93,6 +98,150 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Serving requires the secret even when the web UI is disabled.
+fn password_peppers(cfg: &Config, path: &Path) -> anyhow::Result<crate::pepper::PepperSet> {
+    let secret = cfg.ui_secret.as_deref().filter(|s| s.len() >= 32).ok_or_else(|| anyhow::anyhow!(
+        "ui_secret is missing from {}: it seals passwords and two-factor secrets; run `tunnel-server setup` to generate it (or restore it from your backup)", path.display()
+    ))?;
+    Ok(crate::pepper::PepperSet::new(secret, cfg.ui_secret_previous.as_deref()))
+}
+
+fn rotation_totp(cfg: &Config) -> (crate::seal::Keys, Option<crate::seal::Keys>) {
+    (
+        crate::seal::Keys::new(cfg.ui_secret.as_deref().expect("ui_secret checked by password_peppers")),
+        cfg.ui_secret_previous.as_deref().map(crate::seal::Keys::new),
+    )
+}
+
+fn check_password_backup(cfg: &Config, config_path: &Path, backup: &Path) -> anyhow::Result<crate::reseal::Counts> {
+    let peppers = password_peppers(cfg, config_path)?;
+    let totp = rotation_totp(cfg);
+    crate::reseal::check(backup, &peppers, (&totp.0, totp.1.as_ref()))
+}
+
+fn write_sealed_key_id(cfg: &Config, config_path: &Path) -> anyhow::Result<()> {
+    let peppers = password_peppers(cfg, config_path)?;
+    crate::files::write_atomic(&cfg.data_dir.join("sealed-key-id"), peppers.current.id().as_bytes(), 0o600)
+}
+
+fn prepare_secret_rotation(cfg: &mut Config, config_path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(cfg.ui_secret.is_some(), "ui_secret is missing; run `tunnel-server setup` first");
+    let peppers = password_peppers(cfg, config_path)?;
+    if cfg.ui_secret_previous.is_some() {
+        let counts = check_password_backup(cfg, config_path, &cfg.db_path())?;
+        anyhow::ensure!(
+            counts.rewrapped == 0,
+            "the database still uses ui_secret_previous; restart the server to apply the last rotation before rotating again"
+        );
+        let marker = std::fs::read(cfg.data_dir.join("sealed-key-id"));
+        anyhow::ensure!(
+            marker.as_deref().ok() == Some(peppers.current.id().as_bytes()),
+            "the server has not started with the current ui_secret yet (run `systemctl restart tunnel-server` or start the server, check that it runs), then rotate again"
+        );
+    }
+    cfg.ui_secret_previous = cfg.ui_secret.replace(tokens::random_secret());
+    Ok(())
+}
+
+/// Read-only: would `serve` accept the database's password and two-factor seals?
+pub async fn secret_check(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path)?;
+    let counts = check_password_backup(&cfg, config_path, &cfg.db_path())?;
+    println!(
+        "Every stored password opens with the configured ui_secret ({} legacy to seal, {} to re-seal from ui_secret_previous at the next start).",
+        counts.converted, counts.rewrapped
+    );
+    Ok(())
+}
+
+pub fn admin_lock(config_path: &Path) -> anyhow::Result<Option<std::fs::File>> {
+    let mut path = config_path.as_os_str().to_os_string();
+    path.push(".lock");
+    let path = std::path::PathBuf::from(path);
+    let parent = config_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !parent.try_exists()? {
+        return Ok(None);
+    }
+    let busy =
+        format!("another tunnel-server admin command is running (lock {}); wait for it to finish", path.display());
+    lock_file(&path, 0o600, &busy).map(Some)
+}
+
+/// Held for the server's lifetime, so a second `serve` on the same data never
+/// re-seals (and records a key id) while another server is still writing.
+fn serve_lock(cfg: &Config) -> anyhow::Result<std::fs::File> {
+    let path = cfg.data_dir.join("serve.lock");
+    let busy = format!("another tunnel-server is already serving {}; stop it first", cfg.data_dir.display());
+    // Empty and not secret: readable by the service even if root created it.
+    lock_file(&path, 0o644, &busy)
+}
+
+/// An exclusive, non-blocking `flock` on `path` (created with `mode`, never through a symlink).
+fn lock_file(path: &Path, mode: u32, busy: &str) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    unsafe extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    let flags = crate::files::O_NOFOLLOW | crate::files::O_CLOEXEC;
+    // `flock` needs only a readable descriptor, so a lock file another account
+    // created (e.g. root running `serve` once) still works when readable.
+    let file = match std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(mode)
+                .custom_flags(flags)
+                .open(path)?;
+            // `mode` above is filtered by the umask; set it exactly.
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            file
+        }
+        other => other?,
+    };
+    // SAFETY: file owns a live descriptor; LOCK_EX | LOCK_NB takes a nonblocking exclusive lock.
+    if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!("{busy}");
+        }
+        return Err(error.into());
+    }
+    Ok(file)
+}
+
+fn rotate_secret(config_path: &Path, mode: Mode, restart: impl FnOnce() -> bool) -> anyhow::Result<()> {
+    let mut cfg = Config::load(config_path)?;
+    prepare_secret_rotation(&mut cfg, config_path)?;
+    if mode == Mode::System {
+        mode::check_system_config_dir(config_path)?;
+    }
+    cfg.save_rotated(config_path)?;
+    if mode == Mode::System {
+        mode::secure_system_config(config_path)?;
+    }
+    if restart() {
+        println!("Rotated the server secret and restarted {SERVICE_NAME} (if it was running).");
+    } else {
+        anyhow::bail!(
+            "rotation was saved, but restarting {SERVICE_NAME} failed; the service must be restarted to re-seal the database; another rotation is refused until then"
+        );
+    }
+    println!("Web UI sessions stay signed in; reload pages for new CSRF tokens.");
+    println!(
+        "Keep ui_secret_previous while you need to restore backups from before this rotation; a later rotation replaces it."
+    );
+    Ok(())
+}
+
+pub async fn secret_rotate(config_path: &Path) -> anyhow::Result<()> {
+    ensure_can_write(config_path, "secret rotate")?;
+    let mode = install_mode(config_path);
+    rotate_secret(config_path, mode, || mode.systemctl_ok(&["try-restart", SERVICE_NAME]))
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {
@@ -316,6 +465,7 @@ pub async fn restore(config_path: &Path, backup: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
     check_privileged_data_dir(&cfg)?;
     check_backup(backup)?;
+    check_password_backup(&cfg, config_path, backup)?;
     let db_path = cfg.db_path();
 
     let was_running = mode.service_state(SERVICE_NAME) == "active";
@@ -915,6 +1065,124 @@ mod tests {
         std::env::temp_dir().join(format!("tunnel-{name}-{}-{}", std::process::id(), rand::random::<u64>()))
     }
 
+    fn password_config(dir: &Path) -> Config {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "preview_zone": "previews.example.com", "api_host": "api.example.com",
+            "tunnel_host": "tunnel.example.com", "turn_host": "turn.example.com",
+            "ui_secret": "public-current-server-fixture-0123456789",
+            "admin_token_hash": "x", "acme": {"email": "test@example.com"},
+            "dns": {"provider": "cloudflare", "zone": "example.com"}
+        }))
+        .unwrap();
+        cfg.data_dir = dir.to_path_buf();
+        cfg
+    }
+
+    #[test]
+    fn only_one_server_serves_a_data_directory() {
+        let dir = test_dir("serve-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = password_config(&dir);
+        let held = serve_lock(&cfg).unwrap();
+        let error = serve_lock(&cfg).unwrap_err().to_string();
+        assert!(error.contains("already serving"), "{error}");
+        drop(held);
+        drop(serve_lock(&cfg).unwrap());
+        // A read-only lock file (as another account's 0644 file looks) still locks.
+        use std::os::unix::fs::PermissionsExt;
+        let lock = dir.join("serve.lock");
+        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o644);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let held = serve_lock(&cfg).unwrap();
+        assert!(serve_lock(&cfg).unwrap_err().to_string().contains("already serving"));
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn serving_requires_a_server_secret_but_other_commands_can_load_old_configs() {
+        let dir = test_dir("missing-secret");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut cfg = password_config(&dir);
+        for host in [None, Some("ui.example.com".to_string())] {
+            cfg.ui_host = host;
+            for secret in [None, Some("short".to_string())] {
+                cfg.ui_secret = secret;
+                cfg.save(&path).unwrap();
+                let loaded = Config::load(&path).unwrap();
+                let error = password_peppers(&loaded, &path).unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    format!(
+                        "ui_secret is missing from {}: it seals passwords and two-factor secrets; run `tunnel-server setup` to generate it (or restore it from your backup)",
+                        path.display()
+                    )
+                );
+            }
+        }
+        cfg.ui_secret = None;
+        assert!(
+            prepare_secret_rotation(&mut cfg, &path).unwrap_err().to_string().contains("run `tunnel-server setup`")
+        );
+        cfg.ui_secret = Some("é".repeat(16));
+        assert!(password_peppers(&cfg, &path).is_ok());
+        cfg.ui_secret = Some("é".repeat(15));
+        assert!(password_peppers(&cfg, &path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_locks_through_restart_and_reports_a_saved_rotation_on_failure() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = test_dir("rotation-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = password_config(&dir);
+        cfg.save(&path).unwrap();
+        let db = Db::open(&cfg.db_path()).unwrap();
+        let stored = password_peppers(&cfg, &path).unwrap().current.wrap(
+            crate::password::DUMMY_PHC,
+            crate::pepper::Purpose::User,
+            "u1",
+        );
+        db.call(move |c| {
+            c.execute("INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', ?1, 'owner', 0)", [stored])?;
+            Ok(())
+        }).await.unwrap();
+        let lock_path = dir.join("config.toml.lock");
+        symlink(&path, &lock_path).unwrap();
+        assert!(admin_lock(&path).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+        let lock = admin_lock(&path).unwrap();
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777, 0o600);
+        let message = format!(
+            "another tunnel-server admin command is running (lock {}); wait for it to finish",
+            lock_path.display()
+        );
+        assert_eq!(admin_lock(&path).unwrap_err().to_string(), message);
+        drop(lock);
+        let lock = admin_lock(&path).unwrap();
+        let error = rotate_secret(&path, Mode::User, || {
+            assert_eq!(admin_lock(&path).unwrap_err().to_string(), message);
+            false
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rotation was saved"));
+        assert!(error.contains("must be restarted to re-seal"));
+        assert!(error.contains("another rotation is refused until then"));
+        let mut saved = Config::load(&path).unwrap();
+        assert_eq!(saved.ui_secret_previous, cfg.ui_secret);
+        assert_ne!(saved.ui_secret, cfg.ui_secret);
+        assert!(prepare_secret_rotation(&mut saved, &path).unwrap_err().to_string().contains("restart the server"));
+        drop(lock);
+        assert!(admin_lock(&path).unwrap().is_some());
+        assert!(admin_lock(&dir.join("missing/config.toml")).unwrap().is_none());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn service_token_file_is_written_before_commit_and_removed_on_failure() {
         use std::os::unix::fs::PermissionsExt;
@@ -998,6 +1266,93 @@ mod tests {
         assert!(!db.with_extension("db.restoring").exists());
     }
 
+    #[tokio::test]
+    async fn damaged_or_foreign_totp_refuses_startup_check_and_restore_without_a_previous_secret() {
+        use crate::seal::{Keys, totp_aad};
+        for column in ["totp_secret_sealed", "totp_pending_sealed"] {
+            for foreign in [false, true] {
+                let dir = test_dir("backup-totp-key");
+                let cfg = password_config(&dir);
+                let path = dir.join("config.toml");
+                cfg.save(&path).unwrap();
+                let db = Db::open(&cfg.db_path()).unwrap();
+                let sealed = if foreign {
+                    Keys::new("public foreign totp fixture").seal(b"public totp fixture", &totp_aad("u1"))
+                } else {
+                    "damaged totp fixture".into()
+                };
+                let before = sealed.clone();
+                db.call(move |c| {
+                    c.execute(&format!("INSERT INTO users (id, username, password_hash, role, created_at, {column}) VALUES ('u1', 'ann', '!', 'owner', 0, ?1)"), [sealed])?;
+                    Ok(())
+                }).await.unwrap();
+                let backup = dir.join("backup.db");
+                db.backup_to(backup.clone()).await.unwrap();
+                let bytes = std::fs::read(&backup).unwrap();
+                let errors = [
+                    crate::reseal::seal(&db, password_peppers(&cfg, &path).unwrap(), rotation_totp(&cfg))
+                        .await
+                        .unwrap_err(),
+                    secret_check(&path).await.unwrap_err(),
+                    check_password_backup(&cfg, &path, &backup).unwrap_err(),
+                ];
+                for error in errors {
+                    let error = error.to_string();
+                    assert!(error.contains("users row u1"));
+                    assert!(error.contains(column));
+                    assert!(!error.contains(&before));
+                }
+                assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+                drop(db);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_checks_password_keys_without_modifying_the_backup() {
+        use crate::pepper::{PepperSet, Purpose};
+        let dir = test_dir("backup-password-key");
+        let cfg = password_config(&dir);
+        let db = Db::open(&cfg.db_path()).unwrap();
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at)
+                VALUES ('legacy', 'legacy', ?1, 'owner', 0)",
+                [crate::password::DUMMY_PHC],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let backup = dir.join("backup.db");
+        db.backup_to(backup.clone()).await.unwrap();
+        let before = std::fs::read(&backup).unwrap();
+        assert_eq!(check_password_backup(&cfg, Path::new("config.toml"), &backup).unwrap().converted, 1);
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        let other = PepperSet::new("public-other-server-fixture-0123456789", None);
+        crate::reseal::seal(
+            &db,
+            other.clone(),
+            (crate::seal::Keys::new("public-other-server-fixture-0123456789"), None),
+        )
+        .await
+        .unwrap();
+        let sealed = db.credentials(None, Some("legacy".into())).await.unwrap().unwrap().password_hash;
+        let backup = dir.join("sealed-backup.db");
+        db.backup_to(backup.clone()).await.unwrap();
+        let before = std::fs::read(&backup).unwrap();
+        let error = check_password_backup(&cfg, Path::new("config.toml"), &backup).unwrap_err().to_string();
+        assert!(error.contains("users row legacy"));
+        assert!(error.contains(other.current.id()));
+        assert!(error.contains("the database was sealed with a different ui_secret"));
+        assert!(!error.contains(&sealed));
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        assert!(other.unwrap(&sealed, Purpose::User, "legacy").is_some());
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn database_moved_aside_is_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -1048,6 +1403,57 @@ mod tests {
         assert!(err.contains("schema differs from this build's"), "{err}");
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn another_secret_rotation_waits_for_passwords_and_totp_to_be_resealed() {
+        use crate::pepper::Purpose;
+        let dir = test_dir("secret-rotation");
+        let path = dir.join("config.toml");
+        let mut cfg = password_config(&dir);
+        let db = Db::open(&cfg.db_path()).unwrap();
+        let original = cfg.ui_secret.clone();
+        let peppers = password_peppers(&cfg, &path).unwrap();
+        let stored = peppers.current.wrap(crate::password::DUMMY_PHC, Purpose::User, "u1");
+        let totp = crate::seal::Keys::new(cfg.ui_secret.as_deref().unwrap())
+            .seal(b"public totp fixture", &crate::seal::totp_aad("u1"));
+        db.call(move |c| {
+            c.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at, totp_secret_sealed)
+                VALUES ('u1', 'ann', ?1, 'owner', 0, ?2)",
+                rusqlite::params![stored, totp],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        prepare_secret_rotation(&mut cfg, &path).unwrap();
+        assert_eq!(cfg.ui_secret_previous, original);
+        assert_ne!(cfg.ui_secret, original);
+        let first = cfg.ui_secret.clone();
+        assert!(prepare_secret_rotation(&mut cfg, &path).unwrap_err().to_string().contains("restart the server"));
+        assert_eq!(cfg.ui_secret, first);
+        // Passwords alone are insufficient: a previous-key TOTP value also blocks rotation.
+        let stored =
+            password_peppers(&cfg, &path).unwrap().current.wrap(crate::password::DUMMY_PHC, Purpose::User, "u1");
+        db.call(move |c| {
+            c.execute("UPDATE users SET password_hash = ?1 WHERE id = 'u1'", [stored])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(prepare_secret_rotation(&mut cfg, &path).unwrap_err().to_string().contains("restart the server"));
+        crate::reseal::seal(&db, password_peppers(&cfg, &path).unwrap(), rotation_totp(&cfg)).await.unwrap();
+        let refusal = "the server has not started with the current ui_secret yet";
+        assert!(prepare_secret_rotation(&mut cfg, &path).unwrap_err().to_string().contains(refusal));
+        let old_id = crate::pepper::PepperSet::new(original.as_deref().unwrap(), None).current.id().to_owned();
+        std::fs::write(dir.join("sealed-key-id"), old_id).unwrap();
+        assert!(prepare_secret_rotation(&mut cfg, &path).unwrap_err().to_string().contains(refusal));
+        write_sealed_key_id(&cfg, &path).unwrap();
+        prepare_secret_rotation(&mut cfg, &path).unwrap();
+        assert_eq!(cfg.ui_secret_previous, first);
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -259,16 +259,25 @@ fn system_preflight(config_path: &Path, unit_path: &Path) -> anyhow::Result<()> 
     }
     let dir = config_path.parent().context("config path has no parent directory")?;
     let config_loadable = Config::load(config_path).is_ok();
-    let has_entries = if config_loadable {
-        false
-    } else {
-        match std::fs::read_dir(dir) {
-            Ok(mut entries) => entries.next().transpose()?.is_some(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-        }
-    };
+    let has_entries = if config_loadable { false } else { foreign_entries(dir, config_path)? };
     check_config_dir_takeover(dir, config_loadable, has_entries)
+}
+
+/// Whether `dir` holds anything but our own admin lock (`main` takes it before setup runs).
+fn foreign_entries(dir: &Path, config_path: &Path) -> anyhow::Result<bool> {
+    let lock = config_path.file_name().map(|n| format!("{}.lock", n.to_string_lossy()));
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                if Some(entry?.file_name().to_string_lossy().into_owned()) != lock {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("reading {}", dir.display())),
+    }
 }
 
 fn check_config_dir_takeover(dir: &Path, config_loadable: bool, has_entries: bool) -> anyhow::Result<()> {
@@ -1121,9 +1130,9 @@ fn generate_secrets(cfg: &mut Config) -> Option<String> {
         minted = Some(token);
         println!("Generated a new admin API token (shown at the end)");
     }
-    if cfg.ui_host.is_some() && cfg.ui_secret.as_deref().is_none_or(|s| s.len() < 32) {
+    if cfg.ui_secret.as_deref().is_none_or(|s| s.len() < 32) {
         cfg.ui_secret = Some(tokens::random_secret());
-        println!("Generated the web UI secret");
+        println!("Generated the server secret (passwords, two-factor secrets and CSRF)");
     }
     if cfg.webrtc.enabled && cfg.webrtc.static_auth_secret.is_empty() {
         cfg.webrtc.static_auth_secret = tokens::random_secret();

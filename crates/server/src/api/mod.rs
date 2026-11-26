@@ -932,13 +932,13 @@ async fn create_tunnel(
     if let Some(a) = &req.access {
         caller.check_public(a.mode, limits)?;
     }
+    let id = fresh_tunnel_id(&state).await?;
     let access = match req.access {
-        Some(a) => build_access(a, None).await?,
+        Some(a) => build_access(a, None, state.pepper.clone(), &id).await?,
         None => Access::default(),
     };
     let mode = access.mode;
 
-    let id = fresh_tunnel_id(&state).await?;
     let token = tokens::random_token(TUNNEL_TOKEN_PREFIX);
     let row = state
         .db
@@ -1103,7 +1103,7 @@ async fn patch_tunnel(
     let keep_password_hash =
         req.access.as_ref().is_some_and(|a| a.mode == AccessMode::Password && a.password.is_none());
     let access = match req.access {
-        Some(a) => Some(build_access(a, Some(&current.access)).await?),
+        Some(a) => Some(build_access(a, Some(&current.access), state.pepper.clone(), &id).await?),
         None => None,
     };
 
@@ -1520,7 +1520,12 @@ fn validate_label(label: Option<&str>) -> ApiResult<()> {
 /// Validate an access request; hashes a new password. `current` is the stored
 /// setting on PATCH, which supplies an omitted username and permits keeping
 /// the password in the update transaction.
-async fn build_access(req: AccessRequest, current: Option<&Access>) -> ApiResult<Access> {
+async fn build_access(
+    req: AccessRequest,
+    current: Option<&Access>,
+    pepper: crate::pepper::Pepper,
+    row_id: &str,
+) -> ApiResult<Access> {
     if req.mode != AccessMode::Password {
         if req.username.is_some() || req.password.is_some() {
             return Err(ApiError::validation("username and password apply only to access mode \"password\""));
@@ -1549,7 +1554,7 @@ async fn build_access(req: AccessRequest, current: Option<&Access>) -> ApiResult
                     password::MAX_PASSWORD_LEN
                 )));
             }
-            Some(password::hash(p).await?)
+            Some(pepper.wrap(&password::hash(p).await?, crate::pepper::Purpose::Tunnel, row_id))
         }
         // PATCH carries preservation to the transaction; never copy a hash
         // from this earlier read over a concurrent password rotation.

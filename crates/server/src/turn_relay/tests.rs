@@ -978,6 +978,7 @@ async fn state_with_tunnel() -> (Arc<crate::state::AppState>, TempDir) {
     let db = crate::db::Db::open(&path).unwrap();
     let config: Config = toml::from_str(
         r#"
+ui_secret = "public-test-fixture-server-secret-0123456789"
 preview_zone = "previews.example.com"
 api_host = "api.example.com"
 tunnel_host = "tunnel.example.com"

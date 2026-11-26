@@ -42,6 +42,15 @@ pub fn write_if_changed(path: &Path, content: &[u8], mode: u32) -> anyhow::Resul
 /// like the config, hold secrets in directories others may traverse), and
 /// a leftover or pre-planted file or symlink at that name is never reused.
 pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
+    write_atomic_with_sync(path, content, mode, |parent| std::fs::File::open(parent)?.sync_all())
+}
+
+fn write_atomic_with_sync(
+    path: &Path,
+    content: &[u8],
+    mode: u32,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -59,6 +68,8 @@ pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    sync_parent(parent)?;
     Ok(())
 }
 
@@ -265,6 +276,28 @@ mod tests {
         assert!(std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(&dir).is_ok());
         let err = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir.join("file")).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(20), "ENOTDIR expected, got {err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_syncs_parent_after_rename_and_propagates_failure() {
+        let dir = test_dir("atomic-sync");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, b"old config").unwrap();
+        let mut synced = false;
+        let error = write_atomic_with_sync(&path, b"new config", 0o600, |parent| {
+            assert_eq!(parent, dir);
+            assert_eq!(std::fs::read(&path).unwrap(), b"new config");
+            assert!(!path.with_extension("tmp").exists());
+            synced = true;
+            Err(std::io::Error::other("directory sync failed"))
+        })
+        .unwrap_err();
+        assert!(synced);
+        assert!(error.to_string().contains("directory sync failed"));
+        write_atomic(&path, b"durable config", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"durable config");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

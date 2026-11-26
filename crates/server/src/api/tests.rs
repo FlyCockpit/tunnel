@@ -10,15 +10,22 @@ async fn access_patch_defers_omitted_password_to_transaction() {
     let access = build_access(
         AccessRequest { mode: AccessMode::Password, username: Some("beth".into()), password: None },
         Some(&current),
+        test_state(false, 20).pepper.clone(),
+        "row1",
     )
     .await
     .unwrap();
     assert_eq!(access.password_user.as_deref(), Some("beth"));
     assert!(access.password_hash.is_none(), "a partial PATCH must not carry an earlier hash");
     assert!(
-        build_access(AccessRequest { mode: AccessMode::Password, username: Some("ann".into()), password: None }, None,)
-            .await
-            .is_err(),
+        build_access(
+            AccessRequest { mode: AccessMode::Password, username: Some("ann".into()), password: None },
+            None,
+            test_state(false, 20).pepper.clone(),
+            "row1"
+        )
+        .await
+        .is_err(),
         "creation still requires a password"
     );
 }
@@ -29,6 +36,7 @@ const HEALTH_CREDENTIAL: &str = "public-health-test-fixture";
 
 fn test_state(health: bool, quota: u32) -> Arc<AppState> {
     let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+        "ui_secret": "public-test-fixture-server-secret-0123456789",
         "preview_zone": "previews.example.com", "api_host": "api.example.com",
         "tunnel_host": "tunnel.example.com", "turn_host": "turn.example.com",
         "admin_token_hash": tokens::hash_token(ADMIN_CREDENTIAL),
@@ -78,6 +86,16 @@ async fn enroll_test_client(state: &Arc<AppState>, id: &str, name: &str) {
     state.db.enroll_client(format!("code-{id}"), tokens::hash_token(CLIENT_CREDENTIAL)).await.unwrap().unwrap();
 }
 
+async fn gate_password_login(state: &AppState, id: &str, username: &str, password: &str) -> bool {
+    use crate::edge::gate::{LoginForm, LoginOutcome};
+    let tunnel = state.db.get_tunnel(id.into()).await.unwrap().unwrap();
+    let form = LoginForm { to: id.into(), username: username.into(), password: password.into(), next: "/".into() };
+    matches!(
+        crate::edge::gate::login(state, "203.0.113.1".parse().unwrap(), &tunnel, form, &[]).await,
+        LoginOutcome::Granted(_)
+    )
+}
+
 #[tokio::test]
 async fn open_health_omits_version_even_with_admin_token() {
     let state = test_state(false, 20);
@@ -87,6 +105,57 @@ async fn open_health_omits_version_even_with_admin_token() {
         assert_eq!(body["database"], true);
         assert!(body.get("version").is_none());
     }
+}
+
+#[tokio::test]
+async fn password_tunnel_creation_rotation_and_preservation_use_stored_seals() {
+    let state = test_state(false, 20);
+    enroll_test_client(&state, "cltest", "test-machine").await;
+    let (status, created) = request(
+        &state,
+        "POST",
+        "/v1/tunnels",
+        Some(CLIENT_CREDENTIAL),
+        Some(serde_json::json!({"ttl_s": 600, "access": {
+            "mode": "password", "username": "ann", "password": "original-password"
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let first = state.db.get_tunnel(id.into()).await.unwrap().unwrap().access.password_hash.unwrap();
+    assert!(first.starts_with(&format!("pw1:{}:", state.pepper.clone().id())));
+    assert!(gate_password_login(&state, id, "ann", "original-password").await);
+    let path = format!("/v1/tunnels/{id}");
+    let (status, body) = request(
+        &state,
+        "PATCH",
+        &path,
+        Some(CLIENT_CREDENTIAL),
+        Some(serde_json::json!({"access": {"mode": "password", "password": "replacement-password"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = state.db.get_tunnel(id.into()).await.unwrap().unwrap().access.password_hash.unwrap();
+    assert_ne!(first, second);
+    assert!(second.starts_with("pw1:"));
+    assert!(!gate_password_login(&state, id, "ann", "original-password").await);
+    assert!(gate_password_login(&state, id, "ann", "replacement-password").await);
+    let (status, body) = request(
+        &state,
+        "PATCH",
+        &path,
+        Some(CLIENT_CREDENTIAL),
+        Some(serde_json::json!({"access": {"mode": "password", "username": "beth"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state.db.get_tunnel(id.into()).await.unwrap().unwrap().access.password_hash.as_deref(),
+        Some(second.as_str())
+    );
+    assert!(gate_password_login(&state, id, "beth", "replacement-password").await);
+    assert!(!gate_password_login(&state, id, "ann", "replacement-password").await);
 }
 
 #[tokio::test]

@@ -240,6 +240,7 @@ pub(crate) mod tests {
     pub(crate) fn test_state(parents: &[&str]) -> Arc<AppState> {
         let mut config: crate::config::Config = toml::from_str(
             r#"
+ui_secret = "public-test-fixture-server-secret-0123456789"
 preview_zone = "previews.example.com"
 api_host = "api.example.com"
 tunnel_host = "tunnel.example.com"
