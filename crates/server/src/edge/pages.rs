@@ -29,6 +29,11 @@ static ICON_LINKS: LazyLock<String> = LazyLock::new(|| {
 /// What every page here allows: its inline style and the inline icon.
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
 
+/// The web UI's viewport scale (crates/web/style/app.css, template rule
+/// V1): the browser default up to a 1920px long side, then up to 150% at
+/// 3840, so these pages are as legible on a 4K screen as the UI.
+const SCALE: &str = "html{font-size:clamp(100%,calc(100% + (max(100vw,100vh) - 1920px) / 240),150%)}";
+
 /// The web UI's neutral colours (crates/web/style/tokens.css: --background,
 /// --foreground, --muted-foreground, --input, --destructive). These pages are
 /// on other origins and cannot see the UI's light/dark choice, so they follow
@@ -48,7 +53,7 @@ fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>
     let html = format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark">{refresh}<title>{title}</title>{icon}
-<style>{PALETTE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{max-width:30rem;padding:1.5rem;text-align:center}}h1{{margin:0 0 .5rem;font-size:1.25rem}}p{{margin:0;color:var(--muted)}}</style></head>
+<style>{PALETTE}{SCALE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:1rem/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{max-width:30rem;padding:1.5rem;text-align:center}}h1{{margin:0 0 .5rem;font-size:1.25rem}}p{{margin:0;color:var(--muted)}}</style></head>
 <body><main><h1>{title}</h1><p>{message}</p></main></body></html>
 "#,
         icon = ICON_LINKS.as_str(),
@@ -92,7 +97,7 @@ pub fn login(status: StatusCode, target: &LoginTarget<'_>, error: Option<&str>) 
     let html = format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark"><title>Sign in</title>{icon}
-<style>{PALETTE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:var(--muted)}}input{{width:100%;min-height:44px;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit}}button{{margin-top:1rem;width:100%;min-height:44px;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:var(--fg);color:var(--bg);cursor:pointer}}.err{{margin:0 0 .5rem;color:var(--err);font-size:.875rem}}</style></head>
+<style>{PALETTE}{SCALE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:1rem/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:var(--muted)}}input{{width:100%;min-height:44px;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit}}button{{margin-top:1rem;width:100%;min-height:44px;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:var(--fg);color:var(--bg);cursor:pointer}}.err{{margin:0 0 .5rem;color:var(--err);font-size:.875rem}}</style></head>
 <body><main><h1>Sign in to view this preview</h1>{error}
 <form method="post" action="/__login"><input type="hidden" name="to" value="{to}"><input type="hidden" name="next" value="{next}">
 <label for="u">Username</label><input id="u" name="username" autocomplete="username" required autofocus>
@@ -287,7 +292,16 @@ mod tests {
             let html = String::from_utf8(body.to_vec()).unwrap();
             assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#), "{html}");
             assert!(html.contains(PALETTE), "{html}");
+            assert!(html.contains(&format!("{SCALE}body{{")), "{html}");
         }
+        // The same scale as the web UI's root rule.
+        let app = include_str!("../../../web/style/app.css");
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let scale = SCALE.strip_prefix("html{font-size:").and_then(|s| s.strip_suffix('}')).unwrap();
+        assert!(
+            squash(app).contains(&format!("html{{font-size:{};}}", squash(scale))),
+            "app.css has another root scale"
+        );
         let tokens = include_str!("../../../web/style/tokens.css");
         let colours: Vec<_> = PALETTE.split("oklch(").skip(1).map(|c| &c[..c.find(')').unwrap()]).collect();
         assert_eq!(colours.len(), 10);

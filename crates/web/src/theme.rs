@@ -128,6 +128,38 @@ mod tests {
         assert!(checked >= 7, "found only {checked} state rules in app.css");
     }
 
+    /// Type sizes are rem, so they follow the root's viewport scale, and none
+    /// is below 12px (0.75rem) at the browser default. The one px value is
+    /// the touch floor that keeps iOS from zooming into a focused input; the
+    /// root rule is the viewport scale itself.
+    #[test]
+    fn type_sizes_are_rem_and_at_least_12px() {
+        let root = "html { font-size: clamp(100%, calc(100% + (max(100vw, 100vh) - 1920px) / 240), 150%); }";
+        assert_eq!(APP.matches(root).count(), 1, "app.css has the root scale once");
+        let css = APP.replace(root, "");
+        let mut checked = 0;
+        // Every declaration, wherever it sits: the text between `{`, `;` and `}`.
+        for decl in css.split(['{', ';', '}']) {
+            let Some((property, value)) = decl.split_once(':') else { continue };
+            let (property, value) = (property.trim(), value.trim());
+            match property {
+                "font" => assert_eq!(value, "inherit", "font shorthand sets a size: {decl}"),
+                "font-size" if value == "max(16px, 1rem)" => {}
+                "font-size" => {
+                    let rem: f64 = value
+                        .strip_suffix("rem")
+                        .unwrap_or_else(|| panic!("font-size {value} is not rem"))
+                        .parse()
+                        .unwrap();
+                    assert!(rem >= 0.75, "font-size {value} is below 12px");
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(checked >= 20, "found only {checked} font sizes in app.css");
+    }
+
     #[test]
     fn the_first_paint_background_is_the_background_token() {
         let line =

@@ -1295,7 +1295,7 @@ fn Users(me: User) -> impl IntoView {
     let owner = me.role == "owner";
     let me_id = me.id.clone();
     view! {
-        <div class="page">
+        <div class="page page-wide">
             <div class="page-head"><div>
                 <h1>"Users"</h1>
                 <p class="muted">"Invite people with a single-use link. Members see only their own machines and tunnels. Reset sign-in makes a link for someone who is locked out."</p>
@@ -1326,7 +1326,7 @@ fn Users(me: User) -> impl IntoView {
             </form>
             <div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
             <div class="card card-tight table-wrap">
-                <table class="table table-stack">
+                <table class="table table-stack table-stack-md">
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
                         <th>{move || format!("Traffic {}", month.get())}</th><th>"Public previews"</th><th>"2FA"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
@@ -1375,7 +1375,7 @@ fn Users(me: User) -> impl IntoView {
                                 }.into_any() } else { view! { {if can_public { "allowed" } else { "no" }} }.into_any() }
                             } else { view! { "admin" }.into_any() }}</td>
                             <td data-label="2FA">{if u.totp { "on" } else { "off" }}</td>
-                            <td class="actions">{editable.then(|| view! {
+                            <td class="actions actions-fold">{editable.then(|| view! {
                                 <button id=opener class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
                                     on:click=move |_| { notice.set(None); editing.update(|e| *e = !*e); }>"Limits"</button>" "
                                 {(!disabled).then(|| view! {

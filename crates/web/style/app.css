@@ -16,6 +16,14 @@
 *, *::before, *::after { box-sizing: border-box; }
 /* No theme class yet (theme.js not run): follow the system. */
 html { color-scheme: light dark; }
+/* Viewport scale (template rule V1): the browser default up to a 1920px
+   long side, then +1px per 240px to 150% at 3840. Every size below is rem,
+   so type, controls, paddings and page widths grow together; hairlines,
+   shadows and the 44px touch floors stay px. Breakpoints are em, which in a
+   media query is the browser's default size (16px unless the reader chose
+   another), not this rule: they do not move with the viewport scale, and a
+   larger default font switches to the compact layouts sooner. */
+html { font-size: clamp(100%, calc(100% + (max(100vw, 100vh) - 1920px) / 240), 150%); }
 html.light { color-scheme: light; }
 html.dark { color-scheme: dark; }
 /* The app is mounted straight into body: header, main, footer. Main grows,
@@ -25,61 +33,72 @@ body {
   min-height: 100vh; min-height: 100dvh;
   margin: 0;
   font-family: "Roboto Variable", system-ui, sans-serif;
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.45;
   background: var(--background);
   color: var(--foreground);
   -webkit-font-smoothing: antialiased;
 }
 a { color: var(--primary); text-underline-offset: 3px; }
-code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
-h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
-h2 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
-p { margin: 0 0 8px; }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78125rem; }
+h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.25rem; letter-spacing: -0.01em; }
+h2 { font-size: 0.9375rem; font-weight: 600; margin: 0 0 0.5rem; }
+p { margin: 0 0 0.5rem; }
 .muted { color: var(--muted-foreground); }
-.small { font-size: 12px; }
+.small { font-size: 0.75rem; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 
 /* Shell */
 .header {
   position: sticky; top: 0; z-index: 10;
-  display: flex; align-items: center; gap: 16px;
-  height: 52px; padding: 0 16px;
+  display: flex; align-items: center; gap: 1rem;
+  min-height: 3.25rem; padding: 0 1rem;
   border-bottom: 1px solid var(--border);
   background: color-mix(in oklch, var(--background) 92%, transparent);
   backdrop-filter: blur(6px);
 }
-.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--foreground); text-decoration: none; }
-.brand img { width: 24px; height: 24px; }
-.nav { display: flex; gap: 2px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 0.5rem; font-weight: 600; color: var(--foreground); text-decoration: none; }
+.brand img { width: 1.5rem; height: 1.5rem; }
+.nav { display: flex; gap: 0.125rem; flex-wrap: wrap; }
 .nav a {
-  padding: 6px 10px; color: var(--muted-foreground); text-decoration: none; font-size: 13px; font-weight: 500;
+  padding: 0.375rem 0.625rem; color: var(--muted-foreground); text-decoration: none; font-size: 0.8125rem; font-weight: 500;
 }
 .nav a:hover { color: var(--foreground); background: var(--muted); }
 .nav a[aria-current="page"] { color: var(--foreground); box-shadow: inset 0 -2px 0 var(--primary); }
 .spacer { flex: 1; }
-.page { max-width: 1040px; margin: 0 auto; padding: 28px 16px 64px; }
-.page-head { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-.page-head > div:first-child { flex: 1; min-width: 240px; }
-.narrow { max-width: 420px; margin: 48px auto; }
+/* The full name is the link's title; a long one must not push the nav
+   onto extra rows. */
+.account-link { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.page { max-width: 65rem; margin: 0 auto; padding: 1.75rem 1rem 4rem; }
+/* Dense admin tables (Users): a wider tier, so the columns and the row
+   actions fit instead of overflowing the card (template rule V4). */
+.page-wide { max-width: 90rem; }
+.page-wide .page-head p { max-width: 75ch; }
+/* A username is one word of up to 32 characters: let it break, so it
+   cannot hold the table wider than the page. */
+.page-wide td.cell-main { min-width: 6rem; }
+.page-wide td .name { overflow-wrap: anywhere; }
+.page-head { display: flex; align-items: flex-end; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+.page-head > div:first-child { flex: 1; min-width: 15rem; }
+.narrow { max-width: 26.25rem; margin: 3rem auto; }
 .main { flex: 1 0 auto; }
-.footer { flex-shrink: 0; border-top: 1px solid var(--border); padding: 16px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.footer { flex-shrink: 0; border-top: 1px solid var(--border); padding: 1rem; color: var(--muted-foreground); font-size: 0.75rem; text-align: center; }
 
 /* Card. Edge lines (crates/web/README.md § Edge lines): the header, page
    and card text lines are 16px in; tables put their edge cells on the
    container's text line through --table-inset. */
-.card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); padding: 16px; margin-bottom: 16px; }
+.card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); padding: 1rem; margin-bottom: 1rem; }
 .card-tight { padding: 0; }
-.stack > * + * { margin-top: 12px; }
-.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.stack > * + * { margin-top: 0.75rem; }
+.row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13.75rem), 1fr)); gap: 0.75rem; }
 
 /* Button */
 .btn {
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  height: 32px; padding: 0 10px; border: 1px solid transparent; border-radius: 0;
-  font: inherit; font-size: 12px; font-weight: 500; white-space: nowrap; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.375rem;
+  height: 2rem; padding: 0 0.625rem; border: 1px solid transparent; border-radius: 0;
+  font: inherit; font-size: 0.75rem; font-weight: 500; white-space: nowrap; cursor: pointer;
   background: var(--primary); color: var(--primary-foreground);
   transition: background-color 150ms, border-color 150ms, opacity 150ms;
 }
@@ -92,87 +111,115 @@ p { margin: 0 0 8px; }
 .btn-ghost:hover { background: var(--muted); }
 .btn-destructive { background: color-mix(in oklch, var(--destructive) 10%, transparent); color: var(--destructive); }
 .btn-destructive:hover { background: color-mix(in oklch, var(--destructive) 20%, transparent); }
-.btn-sm { height: 26px; padding: 0 8px; }
+.btn-sm { height: 1.625rem; padding: 0 0.5rem; }
 
 /* Form */
-label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 4px; }
-.field + .field { margin-top: 12px; }
+label { display: block; font-size: 0.75rem; font-weight: 500; margin-bottom: 0.25rem; }
+.field + .field { margin-top: 0.75rem; }
 .input, select.input {
-  display: block; width: 100%; height: 32px; padding: 0 10px; border-radius: 0;
-  border: 1px solid var(--input); background: transparent; color: var(--foreground); font: inherit; font-size: 13px;
+  display: block; width: 100%; height: 2rem; padding: 0 0.625rem; border-radius: 0;
+  border: 1px solid var(--input); background: transparent; color: var(--foreground); font: inherit; font-size: 0.8125rem;
 }
 .input:focus { outline: none; border-color: var(--ring); box-shadow: 0 0 0 2px color-mix(in oklch, var(--ring) 35%, transparent); }
 .input[aria-invalid="true"] { border-color: var(--destructive); }
-.check { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 400; }
-.code-input { font-family: ui-monospace, monospace; letter-spacing: 0.2em; text-transform: uppercase; font-size: 18px; height: 44px; text-align: center; }
+.check { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; font-weight: 400; }
+.code-input { font-family: ui-monospace, monospace; letter-spacing: 0.2em; text-transform: uppercase; font-size: 1.125rem; height: 2.75rem; text-align: center; }
 
 /* Table */
-.table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.table th { text-align: left; font-weight: 500; color: var(--muted-foreground); font-size: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
-.table td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.table th { text-align: left; font-weight: 500; color: var(--muted-foreground); font-size: 0.75rem; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); }
+.table td { padding: 0.625rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
 .table tr:last-child td { border-bottom: 0; }
 /* Edge cells sit on the container's text line: flush inside a padded card or
    panel, 16px in where the table is the card's edge (.card-tight). */
 .table { --table-inset: 0px; }
-.card-tight > .table { --table-inset: 16px; }
+.card-tight > .table { --table-inset: 1rem; }
 .table :is(th, td):first-child { padding-left: var(--table-inset); }
 .table :is(th, td):last-child { padding-right: var(--table-inset); }
 .table .actions { text-align: right; white-space: nowrap; }
+/* Users: eight columns and up to four row actions. Wide enough, the
+   actions fold onto a second line instead of widening the table; below
+   960px (tablets) the rows stack as on phones (`.table-stack-md`, the same
+   rules as `.table-stack` under 760px). */
+@media (min-width: 60.0625em) {
+  .table .actions.actions-fold { white-space: normal; }
+  .table .actions.actions-fold > .btn { margin: 0.125rem 0 0.125rem 0.25rem; }
+}
+@media (max-width: 60em) {
+  .table-stack-md, .table-stack-md tbody, .table-stack-md tr, .table-stack-md td { display: block; width: 100%; }
+  .table-stack-md thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .table-stack-md tr { padding: 0.75rem var(--table-inset); border-bottom: 1px solid var(--border); }
+  .table-stack-md tr:last-child { border-bottom: 0; }
+  .table.table-stack-md td { border: 0; padding: 0.1875rem 0; overflow-wrap: anywhere; }
+  .table.table-stack-md td[data-label] { position: relative; padding-left: 7.5rem; min-height: 1.5rem; }
+  .table-stack-md td[data-label]::before {
+    content: attr(data-label); position: absolute; left: 0; top: 0.1875rem; width: 7rem;
+    color: var(--muted-foreground); font-size: 0.75rem; font-weight: 500;
+  }
+  .table.table-stack-md td.cell-main { padding-bottom: 0.375rem; font-size: 0.875rem; }
+  .table.table-stack-md td.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; text-align: left; padding-top: 0.5rem; }
+  .table-stack-md td.actions:empty { display: none; }
+  .table-stack-md td.actions .btn { margin: 0; flex: 1 1 auto; }
+  .table-stack-md tr.panel-row { padding: 0; }
+  .table.table-stack-md td.links-panel { padding: 0.75rem var(--table-inset); }
+  .card-tight > .table-stack-md { --table-inset: 1rem; }
+  .table-wrap:has(> .table-stack-md) { overflow-x: visible; }
+}
 .table-wrap { overflow-x: auto; }
 
 /* Badges and states */
-.badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px; font-size: 11px; font-weight: 500; border: 1px solid var(--border); color: var(--muted-foreground); }
+.badge { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.0625rem 0.375rem; font-size: 0.75rem; font-weight: 500; border: 1px solid var(--border); color: var(--muted-foreground); }
 .badge-success { color: var(--state-success-text); background: var(--state-success-bg); border-color: transparent; }
 .badge-warning { color: var(--state-warning-text); background: var(--state-warning-bg); border-color: transparent; }
 .badge-info { color: var(--state-info-text); background: var(--state-info-bg); border-color: transparent; }
 .badge-danger { color: var(--destructive); background: color-mix(in oklch, var(--destructive) 10%, transparent); border-color: transparent; }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-foreground); display: inline-block; }
+.dot { width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: var(--muted-foreground); display: inline-block; }
 .dot-on { background: var(--state-success); }
-.alert { padding: 10px 12px; border: 1px solid var(--border); font-size: 13px; margin-bottom: 12px; }
+.alert { padding: 0.625rem 0.75rem; border: 1px solid var(--border); font-size: 0.8125rem; margin-bottom: 0.75rem; }
 .alert-error { border-color: color-mix(in oklch, var(--destructive) 40%, transparent); background: color-mix(in oklch, var(--destructive) 8%, transparent); color: var(--destructive); }
 .alert-warning { background: var(--state-warning-bg); color: var(--state-warning-text); border-color: transparent; }
 .alert-success { background: var(--state-success-bg); color: var(--state-success-text); border-color: transparent; }
-.empty { text-align: center; padding: 40px 20px; color: var(--muted-foreground); }
+.empty { text-align: center; padding: 2.5rem 1.25rem; color: var(--muted-foreground); }
 .empty h2 { color: var(--foreground); }
 
 /* Copy field / code snippet */
 .copy { display: flex; align-items: stretch; border: 1px solid var(--border); background: var(--muted); }
-.copy code { flex: 1; padding: 8px 10px; overflow-x: auto; white-space: nowrap; }
+.copy code { flex: 1; padding: 0.5rem 0.625rem; overflow-x: auto; white-space: nowrap; }
 .copy .btn { height: auto; border-left: 1px solid var(--border); }
 .secret { word-break: break-all; }
-.codes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 16px; font-family: ui-monospace, monospace; }
+.codes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.25rem 1rem; font-family: ui-monospace, monospace; }
 
 /* Dialog */
-dialog { border: 1px solid var(--border); background: var(--popover); color: var(--popover-foreground); padding: 20px; max-width: 440px; width: calc(100% - 32px); }
+dialog { border: 1px solid var(--border); background: var(--popover); color: var(--popover-foreground); padding: 1.25rem; max-width: 27.5rem; width: calc(100% - 2rem); }
 dialog::backdrop { background: rgb(0 0 0 / 40%); }
 
-.qr { width: 200px; height: 200px; background: #fff; padding: 8px; }
-.table td.links-panel { background: var(--muted); padding: 12px var(--table-inset); }
+.qr { width: 12.5rem; max-width: 100%; height: auto; aspect-ratio: 1; background: #fff; padding: 0.5rem; }
+.table td.links-panel { background: var(--muted); padding: 0.75rem var(--table-inset); }
 .input.w-auto { width: auto; }
 /* Users → Limits: one row per limit, read as a sentence ("Machines
    [Custom] [5] machines"); the hint and the field's error sit under the
    controls. One column on phones. */
-.limits-list { display: grid; gap: 14px; }
-.limit-row { display: grid; grid-template-columns: minmax(10rem, 15rem) minmax(0, 1fr); column-gap: 16px; align-items: center; }
+.limits-list { display: grid; gap: 0.875rem; }
+.limit-row { display: grid; grid-template-columns: minmax(10rem, 15rem) minmax(0, 1fr); column-gap: 1rem; align-items: center; }
 .limit-row > .limit-label { margin: 0; }
-.limit-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.limit-number { display: inline-flex; gap: 8px; align-items: center; }
+.limit-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.limit-number { display: inline-flex; gap: 0.5rem; align-items: center; }
 .limit-number > select.input.input-sm { width: auto; }
 .input.input-sm.limit-mode { width: 13rem; }
-.limit-unit { font-size: 13px; }
-.limit-row > .limit-hint, .limit-row > .limit-error { grid-column: 2; margin: 4px 0 0; }
+.limit-unit { font-size: 0.8125rem; }
+.limit-row > .limit-hint, .limit-row > .limit-error { grid-column: 2; margin: 0.25rem 0 0; }
 .limit-row > .limit-error:empty { display: none; }
-.field-error { color: var(--destructive); font-size: 12px; font-weight: 500; }
-.limits-actions .muted { margin-left: 4px; }
+.field-error { color: var(--destructive); font-size: 0.75rem; font-weight: 500; }
+.limits-actions .muted { margin-left: 0.25rem; }
 .limits .alert { margin-bottom: 0; }
-.card-note > .alert { margin: 8px 16px 4px; }
-.ua-raw { margin-top: 2px; }
+.card-note > .alert { margin: 0.5rem 1rem 0.25rem; }
+.ua-raw { margin-top: 0.125rem; }
 .ua-raw > summary { cursor: pointer; width: fit-content; }
-.ua-raw > div { margin-top: 4px; }
-.input.input-sm { height: 26px; width: 14rem; padding: 0 8px; }
+.ua-raw > div { margin-top: 0.25rem; }
+.input.input-sm { height: 1.625rem; width: 14rem; padding: 0 0.5rem; }
 .input.input-sm.input-num { width: 6rem; }
 .grow { flex: 1; }
-.card-head { padding: 16px 16px 4px; margin: 0; }
+.card-head { padding: 1rem 1rem 0.25rem; margin: 0; }
 .row.card-head > h2 { margin: 0; }
 
 /* First paint (static/shell.html, static/shell.js): the same header, nav
@@ -189,21 +236,21 @@ html[data-boot-page="machines"] .boot .nav a[href="/machines"],
 html[data-boot-page="cli"] .boot .nav a[href="/cli"],
 html[data-boot-page="users"] .boot .nav a[href="/admin/users"],
 html[data-boot-page="status"] .boot .nav a[href="/admin/status"] { color: var(--foreground); box-shadow: inset 0 -2px 0 var(--primary); }
-.skel { background: var(--muted); height: 12px; margin-top: 10px; }
+.skel { background: var(--muted); height: 0.75rem; margin-top: 0.625rem; }
 .skel:first-child { margin-top: 0; }
-.skel-title { width: 9rem; height: 22px; }
+.skel-title { width: 9rem; height: 1.375rem; }
 .skel-text { width: min(26rem, 80%); }
-.skel-row { height: 28px; margin-top: 14px; }
-.skel-field { height: 32px; margin-top: 16px; }
-.skel-button { width: 6rem; height: 32px; margin-top: 16px; }
+.skel-row { height: 1.75rem; margin-top: 0.875rem; }
+.skel-field { height: 2rem; margin-top: 1rem; }
+.skel-button { width: 6rem; height: 2rem; margin-top: 1rem; }
 @media (prefers-reduced-motion: no-preference) {
   .skel { animation: skel-pulse 1.6s ease-in-out infinite; }
   @keyframes skel-pulse { 50% { opacity: 0.55; } }
 }
 
 /* Page-head controls ("Show all users", Refresh) stay together. */
-.head-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.tunnel-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.head-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.tunnel-name { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
 .tunnel-name .dot { flex: none; }
 /* Names may be one unbroken 80-character word: let them break anywhere,
    and keep the name column from being squeezed below a readable width. */
@@ -212,9 +259,9 @@ td .name { font-weight: 600; overflow-wrap: break-word; }
 .tunnels-table td.cell-main { min-width: 9rem; }
 .break { overflow-wrap: anywhere; }
 .table .actions { display: table-cell; }
-.table .actions > * + * { margin-left: 4px; }
-.table-kv th { width: 45%; font-weight: 500; color: var(--muted-foreground); font-size: 12px; }
-.table-kv :is(th, td) { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.table .actions > * + * { margin-left: 0.25rem; }
+.table-kv th { width: 45%; font-weight: 500; color: var(--muted-foreground); font-size: 0.75rem; }
+.table-kv :is(th, td) { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
 .table-kv tr:last-child :is(th, td) { border-bottom: 0; }
 .table-kv :is(th, td):first-child { padding-left: var(--table-inset); }
 .table-kv :is(th, td):last-child { padding-right: var(--table-inset); }
@@ -223,75 +270,87 @@ a.btn { text-decoration: none; }
 
 /* Touch: every control at least 44px tall (phones, tablets, and any
    coarse pointer), and 16px input text so iOS does not zoom on focus. */
-@media (max-width: 820px), (pointer: coarse) {
-  .btn, .btn-sm { min-height: 44px; height: auto; padding: 0 14px; font-size: 13px; }
-  .input, select.input, .input.input-sm { height: 44px; font-size: 16px; }
+@media (max-width: 51.25em), (pointer: coarse) {
+  .btn, .btn-sm { min-height: 44px; height: auto; padding: 0 0.875rem; font-size: 0.8125rem; }
+  .input, select.input, .input.input-sm { height: max(44px, 2.75rem); font-size: max(16px, 1rem); }
   .input.input-sm { width: auto; }
   .check { min-height: 44px; }
-  .check input { width: 20px; height: 20px; }
+  .check input { width: 1.25rem; height: 1.25rem; }
   .nav a { min-height: 44px; display: inline-flex; align-items: center; }
   .brand, .account-link { min-height: 44px; display: inline-flex; align-items: center; }
   .brand { min-width: 44px; }
-  .copy .btn { min-width: 64px; }
+  .copy .btn { min-width: 4rem; }
   a.tap { display: inline-flex; align-items: center; min-height: 44px; }
   .table .actions > * + * { margin-left: 0; }
   .table .actions { white-space: normal; }
   .table td.actions { display: table-cell; }
-  .table .actions .btn { margin: 2px 0 2px 4px; }
+  .table .actions .btn { margin: 0.125rem 0 0.125rem 0.25rem; }
+}
+
+/* Tall screens (portrait monitors, 1440px+ landscape): the narrow card
+   (sign-in, invite, machine approval, and its first-paint placeholder) sits
+   in the middle of the space between header and footer instead of at the
+   top of an empty page. Phones, tablets in landscape and short windows keep
+   it near the top, where an on-screen keyboard cannot cover it. */
+@media (min-width: 47.5625em) and (min-height: 81.25em) {
+  .main:not(.boot):has(> .narrow), html:not([data-boot-shape="page"]) .main.boot {
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .main > .narrow { width: 100%; }
 }
 
 /* Phones and narrow tablets: the header becomes two rows (brand and
    account controls, then the page links as a strip that scrolls sideways
    if it must). */
-@media (max-width: 820px) {
-  .header { height: auto; flex-wrap: wrap; gap: 0 4px; padding: 0 16px; }
+@media (max-width: 51.25em) {
+  .header { height: auto; flex-wrap: wrap; gap: 0 0.25rem; padding: 0 1rem; }
   .header .spacer { min-width: 0; }
   .nav {
     order: 10; flex: 1 0 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none;
-    margin: 0 -16px; padding: 0 12px; border-top: 1px solid var(--border);
+    margin: 0 -1rem; padding: 0 0.75rem; border-top: 1px solid var(--border);
   }
   .nav::-webkit-scrollbar { display: none; }
-  .nav a { flex: none; white-space: nowrap; padding: 0 10px; }
+  .nav a { flex: none; white-space: nowrap; padding: 0 0.625rem; }
   .account-link {
     max-width: 8.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block;
-    line-height: 44px; padding: 0 6px; font-size: 13px;
+    line-height: 44px; padding: 0 0.375rem; font-size: 0.8125rem;
   }
-  .header .btn-ghost { padding: 0 8px; }
+  .header .btn-ghost { padding: 0 0.5rem; }
 }
 
 /* Phones: data tables become one card per row with labelled fields. */
-@media (max-width: 760px) {
-  .page { padding: 20px 16px 48px; }
+@media (max-width: 47.5em) {
+  .page { padding: 1.25rem 1rem 3rem; }
   .page-head { align-items: flex-start; }
   .page-head > div:first-child { min-width: 100%; }
-  .narrow { margin: 24px 16px; }
+  .narrow { margin: 1.5rem 1rem; }
 
   .table-stack, .table-stack tbody, .table-stack tr, .table-stack td { display: block; width: 100%; }
   .table-stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-  .table-stack tr { padding: 12px var(--table-inset); border-bottom: 1px solid var(--border); }
+  .table-stack tr { padding: 0.75rem var(--table-inset); border-bottom: 1px solid var(--border); }
   .table-stack tr:last-child { border-bottom: 0; }
-  .table.table-stack td { border: 0; padding: 3px 0; overflow-wrap: anywhere; }
-  .table.table-stack td[data-label] { position: relative; padding-left: 7.5rem; min-height: 24px; }
+  .table.table-stack td { border: 0; padding: 0.1875rem 0; overflow-wrap: anywhere; }
+  .table.table-stack td[data-label] { position: relative; padding-left: 7.5rem; min-height: 1.5rem; }
   .table-stack td[data-label]::before {
-    content: attr(data-label); position: absolute; left: 0; top: 3px; width: 7rem;
-    color: var(--muted-foreground); font-size: 12px; font-weight: 500;
+    content: attr(data-label); position: absolute; left: 0; top: 0.1875rem; width: 7rem;
+    color: var(--muted-foreground); font-size: 0.75rem; font-weight: 500;
   }
-  .table.table-stack td.cell-main { padding-bottom: 6px; font-size: 14px; }
-  .table.table-stack td.actions { display: flex; flex-wrap: wrap; gap: 8px; text-align: left; padding-top: 8px; }
+  .table.table-stack td.cell-main { padding-bottom: 0.375rem; font-size: 0.875rem; }
+  .table.table-stack td.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; text-align: left; padding-top: 0.5rem; }
   .table-stack td.actions:empty { display: none; }
   .table-stack td.actions .btn { margin: 0; flex: 1 1 auto; }
   .table-stack tr.panel-row { padding: 0; }
-  .table.table-stack td.links-panel { padding: 12px var(--table-inset); }
-  .card-tight > .table-stack { --table-inset: 16px; }
+  .table.table-stack td.links-panel { padding: 0.75rem var(--table-inset); }
+  .card-tight > .table-stack { --table-inset: 1rem; }
   .table-wrap { overflow-x: visible; }
   .card-head-actions { flex-wrap: wrap; }
   .link-form > * { flex: 1 1 auto; }
   .limit-row { grid-template-columns: minmax(0, 1fr); }
-  .limit-row > .limit-label { margin-bottom: 4px; }
+  .limit-row > .limit-label { margin-bottom: 0.25rem; }
   .limit-row > .limit-hint, .limit-row > .limit-error { grid-column: 1; }
   .limit-controls > .input.limit-mode { flex: 1 1 10rem; width: auto; }
 }
-@media (max-width: 400px) {
+@media (max-width: 25em) {
   .brand-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .account-link { max-width: 7rem; }
 }
