@@ -1064,6 +1064,8 @@ fn Account() -> impl IntoView {
     let new_pw = RwSignal::new(String::new());
     let totp_pw = RwSignal::new(String::new());
     let totp_code = RwSignal::new(String::new());
+    // A refused code is said at the code field, not at the top of the page.
+    let code_error = RwSignal::new(None::<String>);
     let setup = RwSignal::new(None::<Value>);
     let recovery = RwSignal::new(None::<Vec<String>>);
     let sessions = RwSignal::new(Vec::<SessionRow>::new());
@@ -1115,7 +1117,7 @@ fn Account() -> impl IntoView {
             return;
         }
         let body = json!({ "code": totp_code.get() });
-        run(error, enabling, async move {
+        run(code_error, enabling, async move {
             let v = api::post::<Value>("/ui/api/account/totp/enable", &body).await?;
             recovery.set(serde_json::from_value(v["recovery_codes"].clone()).ok());
             setup.set(None);
@@ -1238,7 +1240,9 @@ fn Account() -> impl IntoView {
                                         <div class="field">
                                             <label for="totp-code">"Code from the app"</label>
                                             <input id="totp-code" class="input" autocomplete="one-time-code" required
-                                                prop:value=move || totp_code.get() on:input=move |ev| totp_code.set(value(&ev)) />
+                                                aria-describedby="totp-code-error" aria-invalid=move || code_error.get().map(|_| "true")
+                                                prop:value=move || totp_code.get() on:input=move |ev| { code_error.set(None); totp_code.set(value(&ev)) } />
+                                            <p id="totp-code-error" class="field-error" aria-live="polite">{move || code_error.get()}</p>
                                         </div>
                                         <div class="row">
                                             <button class="btn" type="submit" disabled=move || enabling.get()>"Turn on"</button>
@@ -1247,6 +1251,7 @@ fn Account() -> impl IntoView {
                                                 setup.set(None);
                                                 totp_code.set(String::new());
                                                 error.set(None);
+                                                code_error.set(None);
                                                 // Its form is gone: the focus goes to the one drawn instead.
                                                 set_timeout(|| _ = focus_id("totp-pw"), std::time::Duration::ZERO);
                                             }>"Not now"</button>
@@ -1578,6 +1583,7 @@ fn Users(me: User) -> impl IntoView {
                                 let (disabled, name) = (s.disabled, s.name);
                                 s.editable.then(|| view! {
                                 <button id=opener.get_value() class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
+                                    aria-label=format!("Limits for {name}")
                                     on:click=move |_| { notice.set(None); editing.update(|e| *e = !*e); }>"Limits"</button>" "
                                 {(!disabled).then(|| view! {
                                     <button class="btn btn-outline btn-sm" aria-expanded=move || resetting.get().to_string()
@@ -1594,6 +1600,7 @@ fn Users(me: User) -> impl IntoView {
                                     </button>" "
                                 })}
                                 <button class=if disabled { "btn btn-outline btn-sm" } else { "btn btn-destructive btn-sm" }
+                                    aria-label=if disabled { format!("Enable {name}") } else { format!("Disable {name}") }
                                     on:click=move |_| update(id.get_value(), json!({ "disabled": !disabled }))>
                                     {if disabled { "Enable" } else { "Disable" }}
                                 </button>
@@ -1959,6 +1966,29 @@ mod tests {
         assert_eq!(invite_title(Some(("email_verify", None)), false), "Confirm your email address");
     }
 
+    /// A refused two-factor code is said at the code field (next to Turn on),
+    /// not in the page's error box at the top; typing or Not now clears it.
+    #[test]
+    fn a_refused_two_factor_code_is_said_at_the_field() {
+        let src = source();
+        let confirm = &src[src.find("let confirm_totp").unwrap()..];
+        let confirm = &confirm[..confirm.find("};").unwrap()];
+        assert!(confirm.contains("run(code_error, enabling,"), "{confirm}");
+        assert!(src.contains(r#"aria-describedby="totp-code-error" aria-invalid=move || code_error.get()"#));
+        assert!(src.contains(r#"on:input=move |ev| { code_error.set(None); totp_code.set(value(&ev)) }"#));
+        assert!(src.contains(r#"<p id="totp-code-error" class="field-error" aria-live="polite">"#));
+        let not_now = &src[src.find(r#""Turn on""#).unwrap()..];
+        assert!(not_now[..not_now.find(r#""Not now""#).unwrap()].contains("code_error.set(None)"));
+    }
+
+    /// Row buttons say whose row they act on, like "Reset sign-in for <name>".
+    #[test]
+    fn user_row_buttons_name_the_user() {
+        let src = source();
+        assert!(src.contains(r#"aria-label=format!("Limits for {name}")"#));
+        assert!(src.contains(r#"format!("Enable {name}") } else { format!("Disable {name}")"#));
+    }
+
     /// Two-factor setup can be left without turning it on.
     #[test]
     fn two_factor_setup_has_a_way_back() {
@@ -1973,7 +2003,7 @@ mod tests {
         assert!(start.contains("if starting.get_untracked() {\n            return;"), "{start}");
         assert!(start.contains("run(error, starting, async move {"), "its own in-flight flag");
         assert!(not_now.contains(r#"focus_id("totp-pw")"#), "the focus is not dropped");
-        assert!(src.contains("run(error, enabling, async move {"), "its own in-flight flag");
+        assert!(src.contains("run(code_error, enabling, async move {"), "its own in-flight flag");
     }
 
     #[test]

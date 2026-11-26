@@ -39,9 +39,11 @@ const SCALE: &str = "html{font-size:clamp(100%,calc(100% + (max(100vw,100vh) - 1
 /// on other origins and cannot see the UI's light/dark choice, so they follow
 /// the system, native controls and scrollbars included.
 const PALETTE: &str = ":root{color-scheme:light dark;--bg:oklch(1 0 0);--fg:oklch(0.148 0.004 228.8);\
---muted:oklch(0.54 0.021 213.5);--line:oklch(0.925 0.005 214.3);--err:oklch(0.464 0.245 27.325)}\
+--muted:oklch(0.54 0.021 213.5);--line:oklch(0.925 0.005 214.3);--input:oklch(0.62 0.012 214.3);\
+--err:oklch(0.464 0.245 27.325)}\
 @media (prefers-color-scheme:dark){:root{--bg:oklch(0.148 0.004 228.8);--fg:oklch(0.987 0.002 197.1);\
---muted:oklch(0.723 0.014 214.4);--line:oklch(1 0 0 / 15%);--err:oklch(0.867 0.191 22.216)}}";
+--muted:oklch(0.723 0.014 214.4);--line:oklch(1 0 0 / 15%);--input:oklch(0.56 0.012 220);\
+--err:oklch(0.867 0.191 22.216)}}";
 
 fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>) -> Response<Body> {
     // A meta refresh lets the offline pages recover on their own once the
@@ -97,7 +99,7 @@ pub fn login(status: StatusCode, target: &LoginTarget<'_>, error: Option<&str>) 
     let html = format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark"><title>Sign in</title>{icon}
-<style>{PALETTE}{SCALE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:1rem/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:var(--muted)}}input{{width:100%;min-height:44px;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit}}button{{margin-top:1rem;width:100%;min-height:44px;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:var(--fg);color:var(--bg);cursor:pointer}}.err{{margin:0 0 .5rem;color:var(--err);font-size:.875rem}}.to{{margin:0 0 1rem;color:var(--muted);font-size:.875rem;overflow-wrap:anywhere}}</style></head>
+<style>{PALETTE}{SCALE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:1rem/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:var(--muted)}}input{{width:100%;min-height:44px;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid var(--input);border-radius:6px;background:transparent;color:inherit}}button{{margin-top:1rem;width:100%;min-height:44px;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:var(--fg);color:var(--bg);cursor:pointer}}.err{{margin:0 0 .5rem;color:var(--err);font-size:.875rem}}.to{{margin:0 0 1rem;color:var(--muted);font-size:.875rem;overflow-wrap:anywhere}}</style></head>
 <body><main><h1>Sign in to view this preview</h1><p class="to">After you sign in, this opens <b>{host}</b>.</p>{error}
 <form method="post" action="/__login"><input type="hidden" name="to" value="{to}"><input type="hidden" name="next" value="{next}">
 <label for="u">Username</label><input id="u" name="username" autocomplete="username" required autofocus>
@@ -359,9 +361,15 @@ mod tests {
         );
         let tokens = include_str!("../../../web/style/tokens.css");
         let colours: Vec<_> = PALETTE.split("oklch(").skip(1).map(|c| &c[..c.find(')').unwrap()]).collect();
-        assert_eq!(colours.len(), 10);
+        assert_eq!(colours.len(), 12);
         for c in colours {
             assert!(tokens.contains(&format!("oklch({c})")), "oklch({c}) is not a UI token");
         }
+        // Inputs have the UI's input edge (readable), not the faint card line.
+        let html = String::from_utf8(
+            login(StatusCode::OK, &target, None).into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("input{width:100%") && html.contains("border:1px solid var(--input)"), "{html}");
     }
 }
