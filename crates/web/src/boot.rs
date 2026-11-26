@@ -80,6 +80,47 @@ mod tests {
         assert!(shell.contains("<header class=\"header\" data-app-header>") && shell.contains("id=\"main-content\""));
     }
 
+    /// A PNG's `(width, height)` from its IHDR chunk.
+    fn png_size(png: &[u8]) -> (u32, u32) {
+        let be = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        (be(16), be(20))
+    }
+
+    #[test]
+    fn the_logo_slot_is_the_same_in_the_first_paint_and_crisp_at_every_density() {
+        let shell = include_str!("ui.rs");
+        // 32px box declared up front, 32/64/128w files chosen by drawn size
+        // (sizes=48px, the largest drawn width: the root scales up to 150% and
+        // `sizes` resolves rem against the initial font size, not that root), named once: the image
+        // is the link's name and the visible text is aria-hidden.
+        for attr in [
+            "src=\"/assets/favicon-32.png\"",
+            "srcset=\"/assets/favicon-32.png 32w, /assets/logo-64.png 64w, /assets/logo-128.png 128w\"",
+            "sizes=\"48px\"",
+            "alt=\"Tunnel\"",
+            "width=\"32\"",
+            "height=\"32\"",
+            "<span class=\"brand-text\" aria-hidden=\"true\">",
+        ] {
+            assert!(SHELL_HTML.contains(attr), "shell.html: {attr}");
+            assert!(shell.contains(attr), "ui.rs: {attr}");
+        }
+        assert_eq!(png_size(include_bytes!("../static/favicon-32.png")), (32, 32));
+        assert_eq!(png_size(include_bytes!("../static/logo-64.png")), (64, 64));
+        assert_eq!(png_size(include_bytes!("../static/logo-128.png")), (128, 128));
+        let build = include_str!("../build.sh");
+        for file in ["static/favicon-32.png", "static/logo-64.png", "static/logo-128.png"] {
+            assert!(build.contains(file), "build.sh copies {file}");
+        }
+        // The first-paint logo counts against the first-load budget.
+        assert!(
+            build.contains("for f in dist/assets/logo-64.png dist/assets/logo-128.png; do")
+                && build.contains("total=$((total + logo + $(wc -c < dist/assets/favicon-32.png)))"),
+            "build.sh counts the largest logo file (by bytes) and the favicon in the first-load budget"
+        );
+        assert!(include_str!("../style/app.css").contains(".brand img { width: 2rem; height: 2rem;"));
+    }
+
     #[test]
     fn the_hint_names_the_roles_the_app_writes() {
         assert!(SHELL_JS.contains("\"tunnel-shell\""));

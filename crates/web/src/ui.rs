@@ -63,8 +63,16 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     view! {
         <header class="header" data-app-header>
             <a class="brand" href="/" on:click=move |ev| { ev.prevent_default(); navigate("/"); }>
-                <img src="/assets/logo-64.png" alt="" width="24" height="24" />
-                <span class="brand-text">"Tunnel"</span>
+                // The logo slot (static/shell.html has the same markup): 2rem
+                // with 32/64/128px files from the same artwork as the favicon
+                // (make-logos.py), picked by drawn size x density. sizes is the
+                // largest drawn width (2rem at the 150% root cap) as a literal:
+                // sizes resolves rem against the initial font size, not the
+                // scaled root. The image names the link; the visible text
+                // is aria-hidden, so the name is "Tunnel" once.
+                <img src="/assets/favicon-32.png" srcset="/assets/favicon-32.png 32w, /assets/logo-64.png 64w, /assets/logo-128.png 128w" sizes="48px"
+                    alt="Tunnel" width="32" height="32" decoding="async" />
+                <span class="brand-text" aria-hidden="true">"Tunnel"</span>
             </a>
             <Show when=signed_in>
                 <nav class="nav" aria-label="Main">

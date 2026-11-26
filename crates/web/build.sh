@@ -57,7 +57,7 @@ cp static/shell.js "dist/assets/$shell"
 css="app-$(hash "$out/app.css").css"
 cp "$out/app.css" "dist/assets/$css"
 # Stable names: referenced from CSS and the shell; small and rarely changed.
-cp static/roboto-latin-wght-normal.woff2 static/logo-64.png static/favicon-32.png static/ROBOTO-LICENSE.txt dist/assets/
+cp static/roboto-latin-wght-normal.woff2 static/logo-64.png static/logo-128.png static/favicon-32.png static/ROBOTO-LICENSE.txt dist/assets/
 
 cat > dist/index.html <<HTML
 <!doctype html>
@@ -90,6 +90,15 @@ for f in dist/index.html dist/assets/$js dist/assets/$wasm dist/assets/$boot dis
   total=$((total + $(wc -c < "$f.gz")))
 done
 total=$((total + $(wc -c < dist/assets/roboto-latin-wght-normal.woff2)))
+# The header logo is on the first paint too (static/shell.html). A screen
+# fetches one of its srcset files: count the largest in bytes (not the widest:
+# logo-128.png is a palette PNG and can be smaller than logo-64.png; PNGs are
+# not gzipped), plus the favicon, which every load fetches (it is also the 1x).
+logo=0
+for f in dist/assets/logo-64.png dist/assets/logo-128.png; do
+  n=$(wc -c < "$f"); [ "$n" -gt "$logo" ] && logo=$n
+done
+total=$((total + logo + $(wc -c < dist/assets/favicon-32.png)))
 echo "build.sh: dist/ ready; first load is $total bytes gzip (budget $BUDGET)"
 ls -l dist/assets
 [ "$total" -le "$BUDGET" ] || { echo "build.sh: over the size budget" >&2; exit 1; }
