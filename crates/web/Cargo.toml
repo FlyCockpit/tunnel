@@ -19,7 +19,7 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
   "Window", "Document", "Location", "History", "Headers", "Request", "RequestInit", "RequestCredentials",
   "Response", "HtmlElement", "Element", "Navigator", "Clipboard",
-  "PopStateEvent", "Event", "HtmlCollection",
+  "PopStateEvent", "Event", "HtmlCollection", "DomRect",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

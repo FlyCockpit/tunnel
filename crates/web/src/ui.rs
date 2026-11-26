@@ -260,14 +260,33 @@ pub fn relative(unix: i64) -> String {
     if d >= 0 { format!("in {span}") } else { format!("{span} ago") }
 }
 
-/// Moves the keyboard focus to the element with `id`; false when it is not there.
+/// Moves the keyboard focus to the element with `id`, out from under the
+/// header; false when it is not there.
 pub fn focus_id(id: &str) -> bool {
     use wasm_bindgen::JsCast;
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(id))
-        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-        .is_some_and(|el| el.focus().is_ok())
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return false };
+    let Some(el) = doc.get_element_by_id(id).and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) else {
+        return false;
+    };
+    let focused = el.focus().is_ok();
+    if focused {
+        clear_of_header(&doc, &el);
+    }
+    focused
+}
+
+/// `focus()` scrolls only an element outside the viewport; one under the
+/// sticky header counts as in view and stays hidden. Scroll it out by the
+/// overlap with the header as drawn (it wraps onto two rows on narrow
+/// screens and grows with the font size).
+fn clear_of_header(doc: &web_sys::Document, el: &web_sys::Element) {
+    let Some(header) = doc.query_selector("header.header:not(.boot)").ok().flatten() else { return };
+    let covered = header.get_bounding_client_rect().bottom() - el.get_bounding_client_rect().top();
+    if covered > 0.0
+        && let Some(w) = web_sys::window()
+    {
+        w.scroll_by_with_x_and_y(0.0, -(covered + 8.0));
+    }
 }
 
 /// Run `fut`, storing its error message in `error`.
