@@ -1242,16 +1242,28 @@ fn Users(me: User) -> impl IntoView {
     let saving_limits = RwSignal::new(false);
     // Loading the lists does not disable the invite button (only a submit in flight does).
     let loading = RwSignal::new(false);
+    // The three lists appear together once all are fetched (`listed`), so
+    // they never push each other down while the page loads.
+    let listed = RwSignal::new(false);
     let load = move || {
         run(error, loading, async move {
-            let u = api::get::<Value>("/ui/api/users").await?;
-            users.set(serde_json::from_value(u["users"].clone()).unwrap_or_default());
-            month.set(u["month"].as_str().unwrap_or_default().to_string());
-            let i = api::get::<Value>("/ui/api/invites").await?;
-            invites.set(serde_json::from_value(i["invites"].clone()).unwrap_or_default());
-            let s = api::get::<Value>("/ui/api/services").await?;
-            services.set(serde_json::from_value(s["services"].clone()).unwrap_or_default());
-            Ok(())
+            let u = api::get::<Value>("/ui/api/users").await;
+            let i = api::get::<Value>("/ui/api/invites").await;
+            let s = api::get::<Value>("/ui/api/services").await;
+            // Each list that arrived is shown, even when another failed (its
+            // error then shows above them).
+            if let Ok(u) = &u {
+                users.set(serde_json::from_value(u["users"].clone()).unwrap_or_default());
+                month.set(u["month"].as_str().unwrap_or_default().to_string());
+            }
+            if let Ok(i) = &i {
+                invites.set(serde_json::from_value(i["invites"].clone()).unwrap_or_default());
+            }
+            if let Ok(s) = &s {
+                services.set(serde_json::from_value(s["services"].clone()).unwrap_or_default());
+            }
+            listed.set(true);
+            u.and(i).and(s).map(|_| ())
         });
     };
     load();
@@ -1325,6 +1337,8 @@ fn Users(me: User) -> impl IntoView {
                 })}
             </form>
             <div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
+            <Show when=move || !listed.get() && error.get().is_none()><p class="muted">"Loading…"</p></Show>
+            <div class:pending=move || !listed.get()>
             <div class="card card-tight table-wrap">
                 <table class="table table-stack table-stack-md">
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
@@ -1461,6 +1475,7 @@ fn Users(me: User) -> impl IntoView {
                         </table> }.into_any()
                     }
                 }}
+            </div>
             </div>
         </div>
     }

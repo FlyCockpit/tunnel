@@ -61,7 +61,7 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     let abuse = move || c.session.get().and_then(|s| s.server.abuse_contact);
     let version = move || c.session.get().map(|s| s.server.version).unwrap_or_default();
     view! {
-        <header class="header">
+        <header class="header" data-app-header>
             <a class="brand" href="/" on:click=move |ev| { ev.prevent_default(); navigate("/"); }>
                 <img src="/assets/logo-64.png" alt="" width="24" height="24" />
                 <span class="brand-text">"Tunnel"</span>
@@ -82,7 +82,7 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
                 <button class="btn btn-ghost btn-sm" on:click=sign_out>"Sign out"</button>
             </Show>
         </header>
-        <main class="main">{children()}</main>
+        <main class="main" id="main-content">{children()}</main>
         <footer class="footer">
             "Tunnel " {version}
             {move || abuse().map(|a| view! { " · Report abuse: " {a} })}

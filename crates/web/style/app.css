@@ -219,6 +219,8 @@ dialog::backdrop { background: rgb(0 0 0 / 40%); }
 .input.input-sm { height: 1.625rem; width: 14rem; padding: 0 0.5rem; }
 .input.input-sm.input-num { width: 6rem; }
 .grow { flex: 1; }
+/* Rendered but not shown until its data is all there (no shifts while loading). */
+.pending { display: none; }
 .card-head { padding: 1rem 1rem 0.25rem; margin: 0; }
 .row.card-head > h2 { margin: 0; }
 

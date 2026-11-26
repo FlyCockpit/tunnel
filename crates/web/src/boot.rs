@@ -64,10 +64,20 @@ mod tests {
             let tag = SHELL_HTML.split(&format!("href=\"{href}\"")).next().unwrap().rsplit("<a").next().unwrap();
             assert_eq!(tag.contains("boot-admin"), admin, "{href}");
         }
-        // Every element of the copy is removed by class when the app renders.
-        for tag in ["<header class=\"header boot\"", "<main class=\"main boot\"", "<footer class=\"footer boot\""] {
+        // Every element of the copy is removed by class when the app renders;
+        // it carries the markers the shell loading check measures (the same
+        // as the template's: header, main, route skeleton), as does ui::Shell.
+        for tag in [
+            "<header class=\"header boot\" data-app-header",
+            "<main class=\"main boot\" id=\"main-content\"",
+            "<footer class=\"footer boot\"",
+            "data-route-skeleton",
+            "data-slot=\"skeleton\"",
+        ] {
             assert!(SHELL_HTML.contains(tag), "{tag}");
         }
+        let shell = include_str!("ui.rs");
+        assert!(shell.contains("<header class=\"header\" data-app-header>") && shell.contains("id=\"main-content\""));
     }
 
     #[test]

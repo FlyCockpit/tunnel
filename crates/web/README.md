@@ -74,13 +74,22 @@ real shell. `src/boot.rs` tests that the copy's nav is `ui::NAV`, which the
 real shell renders from; change both together. The font is preloaded and
 `font-display: optional`, so text never reflows under the reader.
 
-`checks/reload-shell.mjs` checks it in a browser: hard reloads of two
-signed-in pages at 390 and 1280 px, light and dark, on a slow link, comparing
-the first painted frame's header, nav and account link with the loaded page:
+`checks/reload-shell.mjs` checks it in a browser, with the rules and markers
+of the template's `check:shell-loading` (patterns/agent-ui-testing.md §
+Shell loading check there: `[data-app-header]`, `#main-content`,
+`[data-route-skeleton]`, `[data-slot="skeleton"]`): hard reloads of
+/tunnels, /admin/users, /machines and /account at 1280 and 390 px, in light,
+dark and a stored dark over a light system, on a slow link and a 4× slower
+CPU, recording the shell on every frame. It fails when a painted frame lacks
+the header or `<main>`, is not the placeholder first, shows other nav links,
+moves the header, a nav link, the account link or the top of `<main>`, is in
+the other theme, or when the layout shift exceeds 0.05 (pages that load
+several lists show them together, as the Users page does). The template's
+script cannot run here as is (it drives a pnpm/Vite app and the template's
+theme key), so this is its port:
 
 ```sh
-node crates/web/checks/reload-shell.mjs <cdp-ws-url> https://<ui_host> <out-dir> [path...]
+node crates/web/checks/reload-shell.mjs <cdp-ws-url> https://<ui_host> <out-dir> [path=ready-selector ...]
 ```
 
-The browser must be signed in as an admin (for the Users page) and have
-visited the UI once.
+The browser must be signed in as an admin (for the Users page).
