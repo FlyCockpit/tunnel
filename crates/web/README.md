@@ -84,7 +84,13 @@ CPU, recording the shell on every frame. It fails when a painted frame lacks
 the header or `<main>`, is not the placeholder first, shows other nav links,
 moves the header, a nav link, the account link or the top of `<main>`, is in
 the other theme, or when the layout shift exceeds 0.05 (pages that load
-several lists show them together, as the Users page does). The template's
+several lists show them together, as the Users page does), or when content
+that fits the viewport ends without the footer in it. On a page whose
+content does not fit, a shift that only pushes the footer below the first
+screen does not count (it is logged as "below the fold"). The Users page
+fills the screen while its lists load (as its placeholder does), so the
+footer starts below the fold; there every shift counts, as a browser's own
+layout-shift score would. The template's
 script cannot run here as is (it drives a pnpm/Vite app and the template's
 theme key), so this is its port:
 
@@ -92,4 +98,5 @@ theme key), so this is its port:
 node crates/web/checks/reload-shell.mjs <cdp-ws-url> https://<ui_host> <out-dir> [path=ready-selector ...]
 ```
 
-The browser must be signed in as an admin (for the Users page).
+The browser must be signed in as an admin (for the Users page). The rules are
+tested apart from a browser with `node --test crates/web/checks/`.

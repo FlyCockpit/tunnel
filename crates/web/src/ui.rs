@@ -260,6 +260,16 @@ pub fn relative(unix: i64) -> String {
     if d >= 0 { format!("in {span}") } else { format!("{span} ago") }
 }
 
+/// Moves the keyboard focus to the element with `id`; false when it is not there.
+pub fn focus_id(id: &str) -> bool {
+    use wasm_bindgen::JsCast;
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+        .is_some_and(|el| el.focus().is_ok())
+}
+
 /// Run `fut`, storing its error message in `error`.
 pub fn run<F>(error: RwSignal<Option<String>>, busy: RwSignal<bool>, fut: F)
 where

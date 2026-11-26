@@ -24,6 +24,9 @@ html { color-scheme: light dark; }
    another), not this rule: they do not move with the viewport scale, and a
    larger default font switches to the compact layouts sooner. */
 html { font-size: clamp(100%, calc(100% + (max(100vw, 100vh) - 1920px) / 240), 150%); }
+/* A page that grows past the screen (lists arriving) or shrinks back must not
+   move everything sideways where scrollbars take space. */
+html { scrollbar-gutter: stable; }
 html.light { color-scheme: light; }
 html.dark { color-scheme: dark; }
 /* The app is mounted straight into body: header, main, footer. Main grows,
@@ -221,6 +224,10 @@ dialog::backdrop { background: rgb(0 0 0 / 40%); }
 .grow { flex: 1; }
 /* Rendered but not shown until its data is all there (no shifts while loading). */
 .pending { display: none; }
+/* A page whose lists are often longer than the screen fills it while they
+   load (the first paint's placeholder too), so the footer starts below the
+   fold instead of being pushed out of view when they arrive. */
+.page-fill, html[data-boot-page="users"] .boot .boot-page { min-height: 100vh; min-height: 100dvh; }
 .card-head { padding: 1rem 1rem 0.25rem; margin: 0; }
 .row.card-head > h2 { margin: 0; }
 

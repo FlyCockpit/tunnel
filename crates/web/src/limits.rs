@@ -6,11 +6,10 @@
 
 use leptos::prelude::*;
 use serde_json::{Map, Value, json};
-use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::types::{Limit, Limits};
-use crate::ui::{ErrorBox, bytes, duration_text, gb_text, parse_gb, run, value};
+use crate::types::{Limit, Limits, User, UserRow};
+use crate::ui::{ErrorBox, bytes, duration_text, focus_id as focus, gb_text, parse_gb, run, value};
 
 /// A limit's number as the form shows it: the amount and, for lifetimes,
 /// its unit (`s`, `m`, `h`, `d`; the largest that is exact).
@@ -223,29 +222,62 @@ impl LimitField {
     }
 }
 
-/// Moves the keyboard focus to the element with `id`, if it is there.
-fn focus(id: &str) {
-    if let Some(el) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id(id))
-        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-    {
-        let _ = el.focus();
-    }
-}
-
 /// The id of a user row's Limits button, where the focus returns when the
-/// editor closes.
+/// editor is cancelled.
 pub fn opener_id(user: &str) -> String {
     format!("limits-open-{user}")
 }
 
+/// The id of a user's editor form.
+fn form_id(user: &str) -> String {
+    format!("limits-{user}")
+}
+
+/// Where the keyboard focus is when a save comes back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FocusAt {
+    /// In the editor that saved (on its Save button, or a field).
+    Editor,
+    /// Nowhere (`<body>`): the editor it was in is gone.
+    Nowhere,
+    /// Somewhere the user moved to: another editor, a link, the invite form.
+    Elsewhere,
+}
+
+impl FocusAt {
+    /// Whether the page should give the focus a place after the save (the
+    /// editor closes, taking the focused element with it). Focus the user
+    /// moved elsewhere stays there.
+    pub fn needs_a_place(self) -> bool {
+        self != FocusAt::Elsewhere
+    }
+
+    /// The focus now, relative to `user`'s editor.
+    pub fn in_editor(user: &str) -> Self {
+        Self::now(&form_id(user))
+    }
+
+    /// The focus now, relative to the form with `form` as its id.
+    fn now(form: &str) -> Self {
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return FocusAt::Nowhere };
+        match doc.active_element() {
+            None => FocusAt::Nowhere,
+            Some(el) if doc.body().is_some_and(|b| *b == el) => FocusAt::Nowhere,
+            Some(el) if doc.get_element_by_id(form).is_some_and(|f| f.contains(Some(&el))) => FocusAt::Editor,
+            Some(_) => FocusAt::Elsewhere,
+        }
+    }
+}
+
 /// An admin's editor for a user's four limits. After a save, `saved` runs
-/// with the username (the page reloads the list, which closes the panel and
-/// shows the new limits in the row, and says so); Cancel closes it
-/// unchanged. `saving` is the page's lock for limits saves only: it outlives
-/// a closed editor and nothing else clears it, so a save still in flight
-/// blocks the next one and cannot land after it. Nothing owned by the
+/// with the username, the saved user as the server sent it back and where
+/// the focus was when the save came back (the page closes the panel, says
+/// so, shows the user, gives the focus a stable place if it was in the
+/// panel, and reloads the lists);
+/// Cancel closes it unchanged and focuses the row's Limits button. `saving`
+/// is the page's lock for limits saves only: it outlives a closed editor and
+/// nothing else clears it, so a save still in flight blocks the next one and
+/// cannot land after it. Nothing owned by the
 /// editor is read once the request is sent (the editor may be gone by then).
 #[component]
 pub fn LimitsEditor<F>(
@@ -257,7 +289,7 @@ pub fn LimitsEditor<F>(
     saved: F,
 ) -> impl IntoView
 where
-    F: Fn(String) + Copy + 'static,
+    F: Fn(String, Option<User>, FocusAt) + Copy + 'static,
 {
     let fields = [
         LimitField::new("tunnels", "Live tunnels (across their machines)", &limits.tunnels),
@@ -288,15 +320,18 @@ where
         let path = format!("/ui/api/users/{}", user.get_value());
         let body = patch_body(body);
         let name = name.get_value();
+        let form = form_id(&user.get_value());
         run(error, saving, async move {
-            api::patch::<Value>(&path, &body).await?;
-            saved(name);
+            let v = api::patch::<Value>(&path, &body).await?;
+            // As a list row (the same decoding the list uses, so no extra code).
+            let user = serde_json::from_value::<UserRow>(v["user"].clone()).ok().map(|r| r.user);
+            saved(name, user, FocusAt::now(&form));
             Ok(())
         });
     };
     let user_id = user.get_value();
     view! {
-        <form class="limits stack" on:submit=submit novalidate>
+        <form id=form_id(&user_id) class="limits stack" on:submit=submit novalidate>
             <div class="limits-list">
                 {fields.into_iter().map(|f| f.view(&user_id)).collect_view()}
             </div>
@@ -375,6 +410,16 @@ mod tests {
         }
         assert_eq!(default_text("machines", None), "unlimited");
         assert!(["tunnels", "machines", "tunnel_ttl_s", "traffic_bytes"].iter().all(|k| !hint(k).is_empty()));
+    }
+
+    #[test]
+    fn a_save_moves_the_focus_only_when_it_was_in_the_editor_or_lost() {
+        // Saving from the editor (or after a reload removed it) gives the
+        // focus a place; a user who moved on keeps theirs.
+        assert!(FocusAt::Editor.needs_a_place());
+        assert!(FocusAt::Nowhere.needs_a_place());
+        assert!(!FocusAt::Elsewhere.needs_a_place());
+        assert_ne!(form_id("u1"), opener_id("u1"));
     }
 
     #[test]

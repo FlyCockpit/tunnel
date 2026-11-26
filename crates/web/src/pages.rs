@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 use crate::api::{self, ApiError};
 use crate::device::device_name;
 use crate::email::{AddressCard, ConfirmAddress, ForgotPassword, MailStatus};
-use crate::limits::LimitsEditor;
+use crate::limits::{FocusAt, LimitsEditor};
 use crate::types::*;
-use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, relative, run, traffic_text, value, when};
+use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, focus_id, relative, run, traffic_text, value, when};
 use crate::{ctx, navigate, refresh_session};
 
 pub fn route(path: String) -> AnyView {
@@ -1224,6 +1224,40 @@ fn Account() -> impl IntoView {
 
 // -------------------------------------------------------------------- admin
 
+/// The Users page's notice of the last change in the table; a saved limits
+/// editor leaves the focus here when its row's Limits button is gone.
+const NOTICE_ID: &str = "users-notice";
+
+/// What a Users row's buttons depend on: they are drawn anew only when it
+/// changes, so a reload that changes only numbers keeps them (and the focus).
+#[derive(Clone, PartialEq)]
+struct RowShape {
+    /// Whether this admin may change the user (not the owner, not themselves,
+    /// admins only by the owner).
+    editable: bool,
+    disabled: bool,
+    role: String,
+    name: String,
+}
+
+/// Whether an editor opened on `before` (none: this is the first look) no
+/// longer matches the user's limits `now`. Usage (tunnels, machines, traffic)
+/// is not part of them, so it never closes an editor.
+fn outdated(before: Option<&Limits>, now: &Limits) -> bool {
+    before.is_some_and(|b| b != now)
+}
+
+impl RowShape {
+    fn of(u: &User, me: &str, owner: bool) -> Self {
+        Self {
+            editable: u.role != "owner" && u.id != me && (owner || u.role == "member"),
+            disabled: u.disabled,
+            role: u.role.clone(),
+            name: u.username.clone(),
+        }
+    }
+}
+
 #[component]
 fn Users(me: User) -> impl IntoView {
     let users = RwSignal::new(Vec::<UserRow>::new());
@@ -1249,11 +1283,19 @@ fn Users(me: User) -> impl IntoView {
     // The three lists appear together once all are fetched (`listed`), so
     // they never push each other down while the page loads.
     let listed = RwSignal::new(false);
+    // Only the latest reload shows its lists: an older one that returns later
+    // would put back what a newer change (a limits save) already replaced.
+    let generation = StoredValue::new(0u64);
     let load = move || {
+        let this = generation.get_value() + 1;
+        generation.set_value(this);
         run(error, loading, async move {
             let u = api::get::<Value>("/ui/api/users").await;
             let i = api::get::<Value>("/ui/api/invites").await;
             let s = api::get::<Value>("/ui/api/services").await;
+            if generation.try_get_value() != Some(this) {
+                return Ok(());
+            }
             // Each list that arrived is shown, even when another failed (its
             // error then shows above them).
             if let Ok(u) = &u {
@@ -1311,7 +1353,10 @@ fn Users(me: User) -> impl IntoView {
     let owner = me.role == "owner";
     let me_id = me.id.clone();
     view! {
-        <div class="page page-wide">
+        // Until the lists are in, the page fills the screen (as its first-paint
+        // placeholder does), so lists longer than the screen push nothing the
+        // reader sees: the footer starts below the fold.
+        <div class="page page-wide" class:page-fill=move || !listed.get()>
             <div class="page-head"><div>
                 <h1>"Users"</h1>
                 <p class="muted">"Invite people with a single-use link. Members see only their own machines and tunnels. Reset sign-in makes a link for someone who is locked out."</p>
@@ -1340,7 +1385,7 @@ fn Users(me: User) -> impl IntoView {
                     <Copy value=Signal::derive(move || u.clone()) label="Invite link" />
                 })}
             </form>
-            <div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
+            <div id=NOTICE_ID role="status" tabindex="-1">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
             <Show when=move || !listed.get() && error.get().is_none()><p class="muted">"Loading…"</p></Show>
             <div class:pending=move || !listed.get()>
             <div class="card card-tight table-wrap">
@@ -1348,85 +1393,139 @@ fn Users(me: User) -> impl IntoView {
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
                         <th>{move || format!("Traffic {}", month.get())}</th><th>"Public previews"</th><th>"2FA"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
-                    // Keyed by the whole row: a reload re-renders only rows that changed, so
-                    // the panels open in the others (and what is typed in them) stay.
-                    <For each=move || users.get() key=|row: &UserRow| (row.user.id.clone(), format!("{row:?}")) children=move |row: UserRow| {
-                        let u = row.user.clone();
-                        let editable = u.role != "owner" && u.id != me_id && (owner || u.role == "member");
-                        let (id1, id2, id3, id4) = (u.id.clone(), u.id.clone(), u.id.clone(), u.id.clone());
-                        let (id5, id6) = (u.id.clone(), u.id.clone());
-                        let cap = u.limits.traffic_bytes.effective;
-                        let limited = cap.is_some_and(|c| row.traffic_bytes >= c);
+                    // Keyed by the user, not the row's data: a reload updates a row's cells in
+                    // place, so its buttons, its open panels (and what is typed in them) and
+                    // the keyboard focus stay. Only the buttons follow the row's shape
+                    // (role, disabled, name), which a limits save or a usage change keeps.
+                    <For each=move || users.get() key=|row: &UserRow| row.user.id.clone() children=move |first: UserRow| {
+                        let id = first.user.id.clone();
+                        // The row as last listed (a removed user's keeps its data until it goes).
+                        let row = Memo::new({
+                            let id = id.clone();
+                            move |prev: Option<&UserRow>| {
+                                users.with(|all| all.iter().find(|r| r.user.id == id).cloned())
+                                    .or_else(|| prev.cloned())
+                                    .unwrap_or_else(|| first.clone())
+                            }
+                        });
+                        let shape = Memo::new({
+                            let me_id = me_id.clone();
+                            move |_| row.with(|r| RowShape::of(&r.user, &me_id, owner))
+                        });
                         let editing = RwSignal::new(false);
-                        let (reset_id, reset_name, name2, id7) = (u.id.clone(), u.username.clone(), u.username.clone(), u.id.clone());
-                        let reset_email = u.email.clone().filter(|_| mail);
-                        let resetting = Memo::new({ let id = u.id.clone(); move |_| resets.with(|r| r.contains_key(&id)) });
-                        let can_public = u.can_public;
-                        let disabled = u.disabled;
-                        let is_admin = u.role == "admin";
-                        let limits = u.limits.clone();
-                        let saved = move |name: String| {
+                        let resetting = Memo::new({ let id = id.clone(); move |_| resets.with(|r| r.contains_key(&id)) });
+                        let opener = StoredValue::new(crate::limits::opener_id(&id));
+                        // Closes the row's editor; the focus, when it was in there (or
+                        // lost), goes to the row's Limits button (the row stays, so it is
+                        // still there), else to the notice. The row may be gone already.
+                        let close = move |focus: FocusAt| {
+                            editing.try_set(false);
+                            if focus.needs_a_place() && !opener.try_with_value(|o| focus_id(o)).unwrap_or(false) {
+                                focus_id(NOTICE_ID);
+                            }
+                        };
+                        // A save closes the editor (also one reopened while it was on its
+                        // way: that one showed the limits from before it) and shows the
+                        // saved user at once, so the editor opens on them even before
+                        // the reload is back.
+                        let saved = move |name: String, user: Option<User>, focus: FocusAt| {
                             notice.set(Some(format!("Saved the limits of {name}.")));
+                            close(focus);
+                            if let Some(user) = user {
+                                users.update(|all| all.iter_mut().filter(|r| r.user.id == user.id).for_each(|r| r.user = user.clone()));
+                            }
                             load();
                         };
-                        let limits_name = u.username.clone();
-                        let opener = crate::limits::opener_id(&u.id);
+                        // Limits that change under an open editor (a role change, another
+                        // admin) close it: what it would compare against is gone.
+                        Effect::new({
+                            let id = id.clone();
+                            move |prev: Option<Limits>| {
+                                let now = row.with(|r| r.user.limits.clone());
+                                if outdated(prev.as_ref(), &now) && editing.get_untracked() {
+                                    let name = row.with_untracked(|r| r.user.username.clone());
+                                    notice.set(Some(format!("The limits of {name} changed meanwhile; open Limits to change them again.")));
+                                    close(FocusAt::in_editor(&id));
+                                }
+                                now
+                            }
+                        });
+                        let id = StoredValue::new(id);
                         view! { <tr>
-                            <td class="cell-main"><span class="name">{u.username.clone()}</span>{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}
-                                {u.email.clone().map(|e| view! { <div class="muted small break">{e}</div> })}</td>
-                            <td data-label="Role">{u.role.clone()}</td>
-                            <td data-label="Machines">{used_of(row.clients.max(0) as u64, u.limits.machines.effective)}</td>
-                            <td data-label="Tunnels">{used_of(row.tunnels.max(0) as u64, u.limits.tunnels.effective)}
-                                <div class="muted small">{format!("lifetime {}", u.limits.tunnel_ttl_s.effective.map(duration_text).unwrap_or_else(|| "unlimited".into()))}</div></td>
+                            <td class="cell-main">{move || row.with(|r| {
+                                let u = &r.user;
+                                view! {
+                                    <span class="name">{u.username.clone()}</span>{u.disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}
+                                    {u.email.clone().map(|e| view! { <div class="muted small break">{e}</div> })}
+                                }
+                            })}</td>
+                            <td data-label="Role">{move || row.with(|r| r.user.role.clone())}</td>
+                            <td data-label="Machines">{move || row.with(|r| used_of(r.clients.max(0) as u64, r.user.limits.machines.effective))}</td>
+                            <td data-label="Tunnels">{move || row.with(|r| used_of(r.tunnels.max(0) as u64, r.user.limits.tunnels.effective))}
+                                <div class="muted small">{move || row.with(|r| format!("lifetime {}", r.user.limits.tunnel_ttl_s.effective.map(duration_text).unwrap_or_else(|| "unlimited".into())))}</div></td>
                             <td data-label="Traffic">
-                                <div>{traffic_text(row.traffic_bytes, cap)}
-                                    {limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })}</div>
-                                {editable.then(|| view! {
+                                <div>{move || row.with(|r| {
+                                    let cap = r.user.limits.traffic_bytes.effective;
+                                    let limited = cap.is_some_and(|c| r.traffic_bytes >= c);
+                                    view! { {traffic_text(r.traffic_bytes, cap)}
+                                        {limited.then(|| view! { " " <span class="badge badge-danger">"limit reached"</span> })} }
+                                })}</div>
+                                {move || shape.get().editable.then(|| view! {
                                     <button class="btn btn-ghost btn-sm" type="button" disabled=move || busy.get()
-                                        on:click=move |_| reset_traffic(id6.clone())>"Reset month"</button>
+                                        on:click=move |_| reset_traffic(id.get_value())>"Reset month"</button>
                                 })}
                             </td>
-                            <td data-label="Public previews">{if u.role == "member" {
-                                if editable { view! {
-                                    <label class="check"><input type="checkbox" prop:checked=can_public
-                                        on:change=move |ev| update(id1.clone(), json!({ "can_public": event_target_checked(&ev) })) />"allowed"</label>
-                                }.into_any() } else { view! { {if can_public { "allowed" } else { "no" }} }.into_any() }
-                            } else { view! { "admin" }.into_any() }}</td>
-                            <td data-label="2FA">{if u.totp { "on" } else { "off" }}</td>
-                            <td class="actions actions-fold">{editable.then(|| view! {
-                                <button id=opener class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
+                            <td data-label="Public previews">{move || {
+                                let s = shape.get();
+                                if s.role != "member" {
+                                    view! { "admin" }.into_any()
+                                } else if s.editable { view! {
+                                    <label class="check"><input type="checkbox" prop:checked=move || row.with(|r| r.user.can_public)
+                                        on:change=move |ev| update(id.get_value(), json!({ "can_public": event_target_checked(&ev) })) />"allowed"</label>
+                                }.into_any() } else {
+                                    view! { {move || if row.with(|r| r.user.can_public) { "allowed" } else { "no" }} }.into_any()
+                                }
+                            }}</td>
+                            <td data-label="2FA">{move || if row.with(|r| r.user.totp) { "on" } else { "off" }}</td>
+                            <td class="actions actions-fold">{move || {
+                                let s = shape.get();
+                                let is_admin = s.role == "admin";
+                                let (disabled, name) = (s.disabled, s.name);
+                                s.editable.then(|| view! {
+                                <button id=opener.get_value() class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
                                     on:click=move |_| { notice.set(None); editing.update(|e| *e = !*e); }>"Limits"</button>" "
                                 {(!disabled).then(|| view! {
                                     <button class="btn btn-outline btn-sm" aria-expanded=move || resetting.get().to_string()
-                                        aria-label=format!("Reset sign-in for {name2}")
+                                        aria-label=format!("Reset sign-in for {name}")
                                         on:click=move |_| resets.update(|r| {
-                                            if r.remove(&id7).is_none() {
-                                                r.insert(id7.clone(), None);
+                                            if r.remove(&id.get_value()).is_none() {
+                                                r.insert(id.get_value(), None);
                                             }
                                         })>"Reset sign-in"</button>" "
                                 })}
                                 {(owner && !disabled).then(|| view! {
-                                    <button class="btn btn-outline btn-sm" on:click=move |_| update(id2.clone(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
+                                    <button class="btn btn-outline btn-sm" on:click=move |_| update(id.get_value(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
                                         {if is_admin { "Make member" } else { "Make admin" }}
                                     </button>" "
                                 })}
                                 <button class=if disabled { "btn btn-outline btn-sm" } else { "btn btn-destructive btn-sm" }
-                                    on:click=move |_| update(id3.clone(), json!({ "disabled": !disabled }))>
+                                    on:click=move |_| update(id.get_value(), json!({ "disabled": !disabled }))>
                                     {if disabled { "Enable" } else { "Disable" }}
                                 </button>
-                                <span class="sr-only">{id4.clone()}</span>
-                            })}</td>
+                                <span class="sr-only">{id.get_value()}</span>
+                            })}}</td>
                         </tr>
-                        {move || editing.get().then(|| view! {
+                        // The panels take the row as it was when they opened.
+                        {move || editing.get().then(|| row.with_untracked(|r| view! {
                             <tr class="limits-row panel-row"><td colspan="8" class="links-panel">
-                                <LimitsEditor id=id5.clone() username=limits_name.clone() limits=limits.clone() open=editing saving=saving_limits saved=saved />
+                                <LimitsEditor id=id.get_value() username=r.user.username.clone() limits=r.user.limits.clone() open=editing saving=saving_limits saved=saved />
                             </td></tr>
-                        })}
-                        {move || resetting.get().then(|| view! {
+                        }))}
+                        {move || resetting.get().then(|| row.with_untracked(|r| view! {
                             <tr class="panel-row"><td colspan="8" class="links-panel">
-                                <ResetPanel id=reset_id.clone() username=reset_name.clone() email=reset_email.clone() resets=resets reload=load />
+                                <ResetPanel id=id.get_value() username=r.user.username.clone() email=r.user.email.clone().filter(|_| mail) resets=resets reload=load />
                             </td></tr>
-                        })}
+                        }))}
                         }
                     } />
                     </tbody>
@@ -1692,5 +1791,56 @@ fn Status() -> impl IntoView {
                 </table>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, role: &str, traffic: u64) -> UserRow {
+        serde_json::from_value(
+            json!({ "id": id, "username": format!("{id}-name"), "role": role, "traffic_bytes": traffic }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_users_row_keeps_its_buttons_when_only_numbers_change() {
+        // The buttons (and the focus on them) are drawn anew only when the
+        // shape changes: a saved limit or new traffic leaves it as it was.
+        let before = row("u1", "member", 10);
+        let mut after = row("u1", "member", 99);
+        after.tunnels = 3;
+        after.user.limits.tunnels.effective = Some(3);
+        assert!(RowShape::of(&before.user, "me", false) == RowShape::of(&after.user, "me", false));
+        after.user.disabled = true;
+        assert!(RowShape::of(&before.user, "me", false) != RowShape::of(&after.user, "me", false));
+    }
+
+    #[test]
+    fn an_open_editor_closes_only_when_the_limits_change() {
+        let before = row("u1", "member", 10);
+        // Usage only: the editor and what is typed in it stay.
+        let mut used = row("u1", "member", 99);
+        used.tunnels = 4;
+        used.clients = 2;
+        assert!(!outdated(Some(&before.user.limits), &used.user.limits));
+        assert!(!outdated(None, &before.user.limits));
+        // Another admin set a limit, or a role change reset them to other defaults.
+        let mut set = before.clone();
+        set.user.limits.tunnels.setting = json!(3);
+        assert!(outdated(Some(&before.user.limits), &set.user.limits));
+        let mut role = before.clone();
+        role.user.limits.traffic_bytes.default = Some(1);
+        assert!(outdated(Some(&before.user.limits), &role.user.limits));
+    }
+
+    #[test]
+    fn who_may_change_a_user() {
+        let shape = |role: &str, id: &str, owner: bool| RowShape::of(&row(id, role, 0).user, "me", owner).editable;
+        assert!(shape("member", "u1", false) && shape("member", "u1", true));
+        assert!(!shape("admin", "u1", false) && shape("admin", "u1", true));
+        assert!(!shape("owner", "u1", true) && !shape("member", "me", true));
     }
 }

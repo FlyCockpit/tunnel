@@ -29,11 +29,19 @@
 //   more than 1px, or the top of `<main>` moves, between a painted frame and
 //   the loaded page; a nav link is missing or extra in any frame;
 // - a painted frame is in the other theme; the page goes back to the
-//   placeholder after it had loaded; cumulative layout shift exceeds 0.05.
+//   placeholder after it had loaded; cumulative layout shift exceeds 0.05;
+//   the loaded content fits the viewport but the footer is not in it.
+// Layout shift counts the shell and the first screen. On a page whose content
+// does not fit the viewport, a shift whose every moved box is the footer
+// pushed below the first screen does not count: a long list pushing the
+// footer below the fold moves nothing the reader sees (it is reported as
+// "below the fold"). Any other shift counts in full. /admin/users fills the
+// screen while its lists load, so there every shift counts.
 // It clears the profile's stored theme choice. Screenshots of the loaded
 // pages go to <out-dir>. Needs Node 22+ (global WebSocket). Exit 0 when
 // every case passes.
 import fs from "node:fs";
+import { footerPushedBelow, judge, shiftScore } from "./reload-shell-judge.mjs";
 
 const [, , cdp, origin, out, ...args] = process.argv;
 if (!cdp || !origin || !out) {
@@ -46,11 +54,10 @@ const PAGES = args.length
   : [
       ["/", "#main-content :is(.tunnels-table, .empty)"],
       ["/tunnels", "#main-content :is(.tunnels-table, .empty)"],
-      ["/admin/users", "#main-content table thead"],
+      ["/admin/users", "#main-content table thead", true],
       ["/machines", "#main-content :is(table thead, .empty)"],
       ["/account", "#main-content .ua-raw"],
     ];
-const MAX_CLS = 0.05;
 fs.mkdirSync(out, { recursive: true });
 
 // Runs at document start in the page; records the shell on every frame.
@@ -73,6 +80,17 @@ const INIT = `(() => {
     const visible = (el) => !!el && !!box(el) && getComputedStyle(el).visibility === "visible";
     const links = header ? [...header.querySelectorAll(".nav a")].filter(visible) : [];
     const account = header && header.querySelector(".account-link");
+    const footer = seen("body > footer");
+    const main = document.getElementById("main-content");
+    // Where the content ends: the lowest visible box without children, plus
+    // the page's bottom padding (not a min-height that holds it taller).
+    let end = 0;
+    if (main) for (const el of main.querySelectorAll("*")) {
+      if (el.children.length || getComputedStyle(el).visibility !== "visible") continue;
+      const r = el.getBoundingClientRect();
+      if (r.width || r.height) end = Math.max(end, r.bottom);
+    }
+    const last = main && main.lastElementChild;
     return {
       t: performance.now(),
       painted,
@@ -81,6 +99,9 @@ const INIT = `(() => {
       nav: links.map((a) => [a.textContent, box(a)]),
       current: links.filter((a) => getComputedStyle(a).boxShadow !== "none").map((a) => a.textContent),
       account: visible(account) ? box(account) : null,
+      footer: box(footer),
+      vh: innerHeight,
+      contentEnd: Math.round(end + (last ? parseFloat(getComputedStyle(last).paddingBottom) || 0 : 0)),
       dark: document.documentElement.classList.contains("dark"),
       skeleton: !!seen("#main-content [data-route-skeleton]"),
       loading: !!seen('#main-content [data-slot="skeleton"]'),
@@ -89,10 +110,20 @@ const INIT = `(() => {
   const frames = [];
   window.__shellFrames = frames;
   window.__shellSnap = snap;
-  window.__shellCls = 0;
+  // Each shift, and whether it only pushed the footer below the first screen.
+  const shifts = [];
+  window.__shellShifts = shifts;
+  const footerPushedBelow = ${footerPushedBelow.toString()};
   try {
     new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) if (!e.hadRecentInput) window.__shellCls += e.value;
+      for (const e of list.getEntries())
+        if (!e.hadRecentInput) {
+          const sources = (e.sources || []).map((s) => {
+            const live = s.node && s.node.nodeType === 1 && s.node.isConnected ? s.node : null;
+            return { footer: !!live && live.matches("body > footer"), top: live ? live.getBoundingClientRect().top : null, rect: s.currentRect };
+          });
+          shifts.push({ t: e.startTime, v: e.value, below: footerPushedBelow(sources, innerHeight) });
+        }
     }).observe({ type: "layout-shift", buffered: true });
   } catch {}
   const tick = () => {
@@ -104,52 +135,9 @@ const INIT = `(() => {
 })()`;
 const READ = `(() => {
   window.__shellDone = true;
-  return JSON.stringify({ fresh: !window.__reloadShellOld, frames: window.__shellFrames || [], final: window.__shellSnap(), cls: Math.round((window.__shellCls || 0) * 1000) / 1000, truncated: !!window.__shellTruncated });
+  return JSON.stringify({ fresh: !window.__reloadShellOld, frames: window.__shellFrames || [], final: window.__shellSnap(), shifts: window.__shellShifts || [], truncated: !!window.__shellTruncated });
 })()`;
 
-const moved = (a, b) => (!a || !b ? a !== b : a.some((v, i) => Math.abs(v - (b[i] ?? 0)) > 1));
-
-/** One message per broken rule; empty means the page loads inside its shell. */
-function judge(label, { fresh, frames, final, cls, truncated }, expectDark) {
-  if (!fresh) return [`${label}: measured the page before the reload (the reload did not replace it)`];
-  // Every frame from the first paint on, blank ones included (a blank flash
-  // is a frame without the header).
-  const from = frames.findIndex((f) => f.painted);
-  if (from < 0) return [`${label}: no painted frame was recorded`];
-  if (truncated) return [`${label}: the load took too many frames to record`];
-  const painted = frames.slice(from);
-  const first = painted[0];
-  if (final.skeleton || final.loading) return [`${label}: the page never finished loading`];
-  if (!final.header || !final.main) return [`${label}: the loaded page has no ${final.header ? "<main>" : "header"}`];
-  if (!final.nav.length || !final.account) return [`${label}: the loaded page has no nav or account link (not signed in?)`];
-  const bad = [];
-  const at = (f) => `${Math.round(f.t)}ms`;
-  if (!first.header) bad.push(`${label}: the first painted frame has no header`);
-  if (!first.main) bad.push(`${label}: the first painted frame has no <main>`);
-  if (!first.skeleton) bad.push(`${label}: the first painted frame is not the content placeholder`);
-  const lost = painted.find((f) => !f.header || !f.main);
-  if (lost) bad.push(`${label}: the ${lost.header ? "<main>" : "header"} is missing ${at(lost)} into the load`);
-  const jump = painted.find((f) => f.header && moved(f.header, final.header));
-  if (jump) bad.push(`${label}: the header moves (${jump.header} at ${at(jump)}, ${final.header} loaded)`);
-  const names = (f) => JSON.stringify(f.nav.map((n) => n[0]));
-  const navOff = painted.find((f) => f.header && names(f) !== names(final));
-  if (navOff) bad.push(`${label}: the nav shows ${names(navOff)} at ${at(navOff)}, ${names(final)} loaded`);
-  const linkJump = painted.find((f) => f.nav.some(([text, b]) => moved(b, final.nav.find((n) => n[0] === text)?.[1] ?? null)));
-  if (linkJump) bad.push(`${label}: a nav link moves at ${at(linkJump)}: ${JSON.stringify(linkJump.nav)} vs ${JSON.stringify(final.nav)}`);
-  const current = painted.find((f) => f.header && JSON.stringify(f.current) !== JSON.stringify(final.current));
-  if (current) bad.push(`${label}: the current link is ${JSON.stringify(current.current)} at ${at(current)}, ${JSON.stringify(final.current)} loaded`);
-  const account = painted.find((f) => f.header && moved(f.account, final.account));
-  if (account) bad.push(`${label}: the account link is ${account.account} at ${at(account)}, ${final.account} loaded`);
-  const mainTop = painted.find((f) => f.main && Math.abs(f.main[1] - final.main[1]) > 1);
-  if (mainTop) bad.push(`${label}: the content starts at ${mainTop.main[1]}px at ${at(mainTop)}, ${final.main[1]}px loaded`);
-  const loadedAt = painted.findIndex((f) => !f.skeleton && !f.loading);
-  const relapse = loadedAt >= 0 ? painted.slice(loadedAt).find((f) => f.skeleton) : undefined;
-  if (relapse) bad.push(`${label}: back to the placeholder ${at(relapse)} into the load`);
-  const theme = painted.find((f) => f.dark !== expectDark);
-  if (theme) bad.push(`${label}: a frame at ${at(theme)} is ${theme.dark ? "dark" : "light"}, expected ${expectDark ? "dark" : "light"}`);
-  if (cls > MAX_CLS) bad.push(`${label}: cumulative layout shift ${cls} exceeds ${MAX_CLS}`);
-  return bad;
-}
 
 const ws = new WebSocket(cdp);
 let seq = 0;
@@ -193,7 +181,7 @@ for (const [system, stored, expectDark] of MODES)
   for (const [w, h, mobile] of [[1280, 800, false], [390, 844, true]]) {
     await send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile }, s);
     await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: system }] }, s);
-    for (const [path, ready] of PAGES) {
+    for (const [path, ready, strict = false] of PAGES) {
       const label = `${path} ${w}x${h} system ${system}${stored ? `, stored ${stored}` : ""}`;
       await fast();
       await send("Page.navigate", { url: origin + path }, s);
@@ -212,16 +200,19 @@ for (const [system, stored, expectDark] of MODES)
       let loaded = false;
       while (Date.now() < until && !(loaded = (await evaluate(done)) === true)) await sleep(250);
       await sleep(1000);
+      const recording = !navError && loaded ? JSON.parse(await evaluate(READ)) : null;
       const problems = navError
         ? [`${label}: the reload failed: ${navError}`]
-        : loaded
-          ? judge(label, JSON.parse(await evaluate(READ)), expectDark)
+        : recording
+          ? judge(label, recording, expectDark, strict)
           : [`${label}: still loading after 60s (waiting for ${ready})`];
+      const score = recording?.final ? shiftScore(recording.shifts, recording.final) : null;
+      const cls = score ? ` (CLS ${score.cls}${score.belowFold ? `, ${score.belowFold} below the fold` : ""}, all ${score.all})` : "";
       const shot = await send("Page.captureScreenshot", { format: "png" }, s);
       const name = `${path.replace(/\//g, "-").replace(/^-/, "") || "root"}-${w}-${system}${stored ? `-stored-${stored}` : ""}`;
       fs.writeFileSync(`${out}/loaded-${name}.png`, Buffer.from(shot.result.data, "base64"));
       failed += problems.length ? 1 : 0;
-      console.log(`${problems.length ? "FAIL" : "ok  "} ${label}${problems.map((p) => "\n     " + p).join("")}`);
+      console.log(`${problems.length ? "FAIL" : "ok  "} ${label}${cls}${problems.map((p) => "\n     " + p).join("")}`);
     }
   }
 await fast();
