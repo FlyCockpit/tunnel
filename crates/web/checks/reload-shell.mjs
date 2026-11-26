@@ -16,7 +16,7 @@
 //
 // <cdp-ws-url> is a Chromium's browser websocket (agent-browser: `get
 // cdp-url`) whose profile is signed in to <ui-origin> as an admin. For each
-// page (default /tunnels, /admin/users, /machines, /account) at 1280x800 and 390x844, with the
+// page (default /, /tunnels, /admin/users, /machines, /account) at 1280x800 and 390x844, with the
 // system light and no stored theme, the system dark and no stored theme, and
 // the system light with "dark" stored, it loads the page once normally (that
 // visit writes the hint the first paint uses), then reloads it with the cache
@@ -44,6 +44,7 @@ if (!cdp || !origin || !out) {
 const PAGES = args.length
   ? args.map((a) => a.split(/=(.*)/s).slice(0, 2))
   : [
+      ["/", "#main-content :is(.tunnels-table, .empty)"],
       ["/tunnels", "#main-content :is(.tunnels-table, .empty)"],
       ["/admin/users", "#main-content table thead"],
       ["/machines", "#main-content :is(table thead, .empty)"],

@@ -78,7 +78,7 @@ real shell renders from; change both together. The font is preloaded and
 of the template's `check:shell-loading` (patterns/agent-ui-testing.md §
 Shell loading check there: `[data-app-header]`, `#main-content`,
 `[data-route-skeleton]`, `[data-slot="skeleton"]`): hard reloads of
-/tunnels, /admin/users, /machines and /account at 1280 and 390 px, in light,
+/ (the tunnels list), /tunnels, /admin/users, /machines and /account at 1280 and 390 px, in light,
 dark and a stored dark over a light system, on a slow link and a 4× slower
 CPU, recording the shell on every frame. It fails when a painted frame lacks
 the header or `<main>`, is not the placeholder first, shows other nav links,

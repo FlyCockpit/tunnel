@@ -1030,6 +1030,7 @@ fn Account() -> impl IntoView {
     let start_totp = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let body = json!({ "password": totp_pw.get() });
+        notice.set(None);
         run(error, busy, async move {
             setup.set(Some(api::post::<Value>("/ui/api/account/totp/setup", &body).await?));
             totp_pw.set(String::new());
@@ -1055,6 +1056,9 @@ fn Account() -> impl IntoView {
         run(error, busy, async move {
             api::post::<Value>("/ui/api/account/totp/disable", &body).await?;
             totp_pw.set(String::new());
+            // The recovery codes shown after turning it on no longer work.
+            recovery.set(None);
+            setup.set(None);
             refresh_session().await;
             notice.set(Some("Two-factor sign-in is off.".into()));
             Ok(())

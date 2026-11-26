@@ -16,16 +16,21 @@ pub fn A(
     children: Children,
 ) -> impl IntoView {
     let c = ctx();
-    let current = move || {
-        let p = c.path.get();
-        (p == href || (href != "/" && p.starts_with(href))).then_some("page")
-    };
+    let current = move || is_current(&c.path.get(), href).then_some("page");
     view! {
         <a href=href class=class title=move || title.map(|t| t.get()) aria-current=current
             on:click=move |ev| { ev.prevent_default(); navigate(href); }>
             {children()}
         </a>
     }
+}
+
+/// Whether the link to `href` is the page at `path`: the page itself or one
+/// below it. `/` shows the tunnels list, so it counts as `/tunnels` (as
+/// static/shell.js does for the first paint).
+fn is_current(path: &str, href: &str) -> bool {
+    let path = if path == "/" { "/tunnels" } else { path };
+    path == href || path.strip_prefix(href).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The header's page links: `(href, text, admins only)`. static/shell.html
@@ -275,4 +280,20 @@ where
 
 pub fn value(ev: &leptos::ev::Event) -> String {
     event_target_value(ev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_home_page_marks_tunnels_as_current() {
+        assert!(is_current("/", "/tunnels"));
+        assert!(!is_current("/", "/machines"));
+        assert!(is_current("/tunnels", "/tunnels"));
+        assert!(is_current("/admin/users", "/admin/users"));
+        assert!(is_current("/account/sessions", "/account"));
+        assert!(!is_current("/tunnelsx", "/tunnels"));
+        assert!(!is_current("/machines", "/tunnels"));
+    }
 }
