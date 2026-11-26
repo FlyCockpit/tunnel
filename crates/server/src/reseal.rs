@@ -1,4 +1,4 @@
-//! Validate and re-seal password and two-factor secrets before serving.
+//! Validate and re-seal password, recovery-code and two-factor secrets before serving.
 
 use std::path::Path;
 
@@ -10,8 +10,23 @@ use crate::seal::{Keys, totp_aad};
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Counts {
+    /// Legacy Argon2 password hashes to seal.
     pub converted: usize,
+    /// Password and TOTP seals under `ui_secret_previous`.
     pub rewrapped: usize,
+    /// Recovery-code rows (used or not).
+    pub codes: usize,
+    /// Legacy plain SHA-256 recovery-code rows to seal.
+    pub codes_converted: usize,
+    /// Recovery-code seals under `ui_secret_previous`.
+    pub codes_rewrapped: usize,
+}
+
+impl Counts {
+    /// Values still sealed with `ui_secret_previous`.
+    pub fn previous(&self) -> usize {
+        self.rewrapped + self.codes_rewrapped
+    }
 }
 
 pub async fn seal(db: &Db, peppers: PepperSet, totp: (Keys, Option<Keys>)) -> anyhow::Result<Counts> {
@@ -61,10 +76,16 @@ fn refusal(table: &str, row: &str, found: &str, peppers: &PepperSet) -> anyhow::
     )
 }
 
+/// The SHA-256 hex older versions stored for a recovery code.
+fn legacy_code_hash(stored: &str) -> bool {
+    stored.len() == 64 && stored.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Only print a well-formed public key id, never an untrusted hash fragment.
 fn found_id(stored: &str) -> &str {
     stored
         .strip_prefix("pw1:")
+        .or_else(|| stored.strip_prefix("rc1:"))
         .and_then(|s| s.split_once(':'))
         .map(|(id, _)| id)
         .filter(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
@@ -100,6 +121,38 @@ fn inspect(c: &Connection, peppers: &PepperSet, totp: (&Keys, Option<&Keys>), wr
             if write {
                 let sealed = peppers.current.wrap(&plain, purpose, &id);
                 c.execute(&format!("UPDATE {table} SET password_hash = ?2 WHERE id = ?1"), params![id, sealed])?;
+            }
+        }
+    }
+    {
+        // Recovery codes: legacy rows hold `hex(SHA-256(code))`, which is
+        // exactly what gets sealed, so they convert without the codes.
+        let rows = c
+            .prepare("SELECT rowid, user_id, code_hash FROM recovery_codes ORDER BY rowid")?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (rowid, user, stored) in rows {
+            counts.codes += 1;
+            let plain = if legacy_code_hash(&stored) {
+                counts.codes_converted += 1;
+                stored
+            } else {
+                let plain = peppers.unwrap(&stored, Purpose::Recovery, &user).ok_or_else(|| {
+                    refusal("recovery_codes", &format!("{rowid} (user {user})"), found_id(&stored), peppers)
+                })?;
+                anyhow::ensure!(
+                    legacy_code_hash(&plain),
+                    "recovery_codes row {rowid} (user {user}): invalid code hash"
+                );
+                if found_id(&stored) == peppers.current.id() {
+                    continue;
+                }
+                counts.codes_rewrapped += 1;
+                plain
+            };
+            if write {
+                let sealed = peppers.current.wrap(&plain, Purpose::Recovery, &user);
+                c.execute("UPDATE recovery_codes SET code_hash = ?2 WHERE rowid = ?1", params![rowid, sealed])?;
             }
         }
     }

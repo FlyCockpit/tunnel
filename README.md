@@ -237,12 +237,14 @@ at least 32 random characters even without the UI. It seals TOTP secrets,
 peppers every stored account and tunnel password hash, and derives CSRF tokens.
 Password hashes use Argon2id inside AES-256-GCM encryption with an HKDF-SHA256
 key derived from `ui_secret`, bound to the row id and to account or tunnel use.
+Two-factor recovery codes are stored as the code's SHA-256 inside AES-256-GCM
+under a second key derived from `ui_secret` and bound to the user.
 Keep this secret with the config's other secrets. The UI host serves the app, its JSON
 API under `/ui/api/*`, the client installer (`/install.sh`) and the bearer API
 under `/v1/*`; `api_host` serves the bearer API under `/v1/*` too.
 
-A database-only leak does not allow offline password guessing without
-`config.toml`'s `ui_secret`. It still exposes usernames, email addresses, metadata
+A database-only leak does not allow offline password or recovery-code guessing
+without `config.toml`'s `ui_secret`. It still exposes usernames, email addresses, metadata
 and hashes of high-entropy random tokens. A leak of both the database and config
 allows offline Argon2id password guessing, as before.
 
@@ -503,19 +505,21 @@ and `restore` accept only databases with the schema this build creates (its
 version and every table, column and index), so a database made or left by
 another build is refused rather than misread.
 
-Backups taken before the password-sealing upgrade still contain unwrapped
-password hashes, as do pre-upgrade database copies kept by `restore` as
-`tunnel.db.before-restore-*`. Delete these copies once they are no longer needed.
+Backups taken before the password- and recovery-code-sealing upgrades still
+contain unwrapped password hashes or plain recovery-code hashes, as do pre-upgrade
+database copies kept by `restore` as `tunnel.db.before-restore-*`. Delete these
+copies once they are no longer needed; if one may have leaked, have its users
+generate new recovery codes (turn two-factor sign-in off and on).
 
 Rotate the server secret with `tunnel-server secret rotate`. It saves the old
 `ui_secret` as `ui_secret_previous`, generates a new secret, and tries to restart
-the service. On restart, passwords and TOTP secrets are re-sealed in one
+the service. On restart, passwords, recovery codes and TOTP secrets are re-sealed in one
 transaction before listening; a wrong key or damaged seal rolls the transaction
 back and refuses startup. If the service was stopped or restarting failed,
 start it to apply the rotation. Another rotation is refused while the database
 still needs the previous key. The non-secret `sealed-key-id` file in the data directory records which key the server last started with, and only one server at a time serves a data directory (`serve.lock`). Admin commands that change the config or replace the database (`setup`, `mail`, `token rotate`, `health-token`, `restore`, `secret rotate`) run one at a time (`config.toml.lock`). `secret check` reports, without changing anything,
 whether the database's seals open with the configured secret (and how many
-legacy or previous-key values the next start will seal). Web UI sessions stay signed in; reload open pages
+legacy or previous-key values the next start will seal, passwords and recovery codes counted separately). Web UI sessions stay signed in; reload open pages
 for new CSRF tokens. Keep `ui_secret_previous` until you no longer need to restore
 backups made before the rotation; a later rotation replaces it. Keep the config
 backup matching any older database backup you retain.
@@ -752,7 +756,7 @@ crates/server/             tunnel-server (VPS)
   src/ice.rs metrics.rs    TURN REST credentials, Prometheus text on 127.0.0.1:9464
   src/config/              config file; mode.rs: system vs rootless install layout and its checks; dns/: DNS providers
   src/files.rs util.rs     safe file writes and ownership; HTTP body helpers
-  src/tokens.rs password.rs pepper.rs seal.rs  tokens, Argon2id, row-bound password seals, TOTP and CSRF keys from the server secret
+  src/tokens.rs password.rs pepper.rs seal.rs  tokens, Argon2id, row-bound password and recovery-code seals, TOTP and CSRF keys from the server secret
 crates/client/             tunnel-client (sandbox); see crates/client/README.md
 crates/web/                web UI (Leptos CSR, wasm32); build.sh writes dist/ for the server's `ui` feature
 docs/agent/SKILL.md        how AI agents share apps with tunnel (`tunnel help agent`)

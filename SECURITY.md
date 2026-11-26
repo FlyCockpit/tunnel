@@ -53,7 +53,8 @@ and password purpose. A database-only leak does not permit offline password
 guessing without `config.toml`'s `ui_secret`; it still exposes usernames, email
 addresses, metadata and hashes of high-entropy random tokens. A database and
 config leak permits offline Argon2id guessing, as before. The same server secret
-also seals TOTP secrets and derives CSRF tokens; setup always generates it and
+also seals TOTP secrets and recovery codes (the code's SHA-256, under a separate
+derived key and bound to the user) and derives CSRF tokens; setup always generates it and
 `serve` requires it, including when the web UI is disabled.
 
 Back up `config.toml` together with the database. Losing `ui_secret` means every
@@ -63,13 +64,15 @@ available as `ui_secret_previous`; legacy raw password hashes are converted at
 startup. A wrong key or damaged password seal refuses startup before listening
 and rolls back the entire conversion.
 
-Backups taken before the password-sealing upgrade and pre-upgrade database
-copies kept by `restore` as `tunnel.db.before-restore-*` still contain unwrapped
-password hashes. Delete these copies once they are no longer needed.
+Backups taken before the password- and recovery-code-sealing upgrades and
+pre-upgrade database copies kept by `restore` as `tunnel.db.before-restore-*`
+still contain unwrapped password hashes or plain SHA-256 recovery-code hashes.
+Delete these copies once they are no longer needed; if one may have leaked, its
+users should generate new recovery codes.
 
 Run `tunnel-server secret rotate` to save the old secret as `ui_secret_previous`,
-generate a new secret, and try to restart the service. Restart re-seals passwords
-and TOTP secrets in one transaction. Sessions remain valid; reload web UI pages
+generate a new secret, and try to restart the service. Restart re-seals passwords,
+recovery codes and TOTP secrets in one transaction. Sessions remain valid; reload web UI pages
 for new CSRF tokens. Apply the pending rotation by restarting before rotating
 again. Retain `ui_secret_previous` while you need backups from before the
 rotation; a later rotation replaces it, so retain matching config backups too.

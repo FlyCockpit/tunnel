@@ -406,6 +406,21 @@ async fn totp_enrolment_login_replay_and_recovery_codes() {
     let recovery: Vec<String> =
         r.body["recovery_codes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
     assert_eq!(recovery.len(), 10);
+    let stored: Vec<String> = state
+        .db
+        .call(|c| {
+            Ok(c.prepare("SELECT code_hash FROM recovery_codes")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    let prefix = format!("rc1:{}:", state.pepper.id());
+    assert!(stored.len() == 10 && stored.iter().all(|v| v.starts_with(&prefix)), "codes are stored sealed");
+    for code in &recovery {
+        let plain = crate::tokens::hash_token(&code.replace('-', ""));
+        assert!(stored.iter().all(|v| !v.contains(&plain)), "never the plain hash");
+    }
 
     let mut b = Browser::new(7);
     let r = b

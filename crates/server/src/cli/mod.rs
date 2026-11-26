@@ -30,7 +30,14 @@ pub async fn serve(config_path: &Path) -> anyhow::Result<()> {
     let db = Db::open_configured(&cfg)?;
     let counts = crate::reseal::seal(&db, peppers, rotation_totp(&cfg)).await?;
     write_sealed_key_id(&cfg, config_path)?;
-    tracing::info!(converted = counts.converted, rewrapped = counts.rewrapped, "password seals checked");
+    tracing::info!(
+        converted = counts.converted,
+        rewrapped = counts.rewrapped,
+        recovery_codes = counts.codes,
+        recovery_codes_converted = counts.codes_converted,
+        recovery_codes_rewrapped = counts.codes_rewrapped,
+        "password seals checked"
+    );
     let certs = tls::CertStore::new(cfg.cert_dir());
     certs.reload().with_context(|| {
         format!(
@@ -132,7 +139,7 @@ fn prepare_secret_rotation(cfg: &mut Config, config_path: &Path) -> anyhow::Resu
     if cfg.ui_secret_previous.is_some() {
         let counts = check_password_backup(cfg, config_path, &cfg.db_path())?;
         anyhow::ensure!(
-            counts.rewrapped == 0,
+            counts.previous() == 0,
             "the database still uses ui_secret_previous; restart the server to apply the last rotation before rotating again"
         );
         let marker = std::fs::read(cfg.data_dir.join("sealed-key-id"));
@@ -152,6 +159,10 @@ pub async fn secret_check(config_path: &Path) -> anyhow::Result<()> {
     println!(
         "Every stored password opens with the configured ui_secret ({} legacy to seal, {} to re-seal from ui_secret_previous at the next start).",
         counts.converted, counts.rewrapped
+    );
+    println!(
+        "Recovery codes: {} stored, {} legacy to seal, {} to re-seal from ui_secret_previous at the next start.",
+        counts.codes, counts.codes_converted, counts.codes_rewrapped
     );
     Ok(())
 }
@@ -1403,6 +1414,57 @@ mod tests {
         assert!(err.contains("schema differs from this build's"), "{err}");
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_codes_alone_block_rotation_and_a_foreign_backup() {
+        use crate::pepper::{PepperSet, Purpose};
+        let dir = test_dir("recovery-rotation");
+        let path = dir.join("config.toml");
+        let mut cfg = password_config(&dir);
+        let db = Db::open(&cfg.db_path()).unwrap();
+        let hash = crate::tokens::hash_token("abcde23456");
+        let sealed = password_peppers(&cfg, &path).unwrap().current.wrap(&hash, Purpose::Recovery, "u1");
+        db.call(move |c| {
+            c.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', '!', 'owner', 0)",
+                [],
+            )?;
+            c.execute("INSERT INTO recovery_codes (user_id, code_hash) VALUES ('u1', ?1)", [sealed])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        write_sealed_key_id(&cfg, &path).unwrap();
+        prepare_secret_rotation(&mut cfg, &path).unwrap();
+        let counts = check_password_backup(&cfg, &path, &cfg.db_path()).unwrap();
+        assert_eq!((counts.rewrapped, counts.codes_rewrapped, counts.previous()), (0, 1, 1));
+        assert!(prepare_secret_rotation(&mut cfg, &path).unwrap_err().to_string().contains("restart the server"));
+        crate::reseal::seal(&db, password_peppers(&cfg, &path).unwrap(), rotation_totp(&cfg)).await.unwrap();
+        write_sealed_key_id(&cfg, &path).unwrap();
+        let current = cfg.ui_secret.clone();
+        prepare_secret_rotation(&mut cfg, &path).unwrap();
+        assert_eq!(cfg.ui_secret_previous, current);
+
+        // A backup whose recovery codes are sealed with another secret is refused, unchanged.
+        let other = PepperSet::new("public-other-recovery-fixture-0123456789", None);
+        let foreign = other.current.wrap(&hash, Purpose::Recovery, "u1");
+        let stored = foreign.clone();
+        db.call(move |c| {
+            c.execute("UPDATE recovery_codes SET code_hash = ?1", [stored])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let backup = dir.join("foreign-codes.db");
+        db.backup_to(backup.clone()).await.unwrap();
+        let before = std::fs::read(&backup).unwrap();
+        let error = check_password_backup(&cfg, &path, &backup).unwrap_err().to_string();
+        assert!(error.contains("recovery_codes row") && error.contains(other.current.id()), "{error}");
+        assert!(!error.contains(&foreign) && !error.contains(&hash), "{error}");
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

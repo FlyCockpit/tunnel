@@ -14,9 +14,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Setup now generates `ui_secret` even without the UI, and `serve` requires it.
   Startup converts legacy hashes atomically and refuses unknown keys or damaged
   seals; restore checks backup keys without modifying the backup.
+- Two-factor recovery codes are stored sealed too: the code's SHA-256 inside
+  row-bound AES-256-GCM under a separate HKDF-SHA256 key from `ui_secret`, so a
+  database-only leak no longer allows offline guessing of the 50-bit codes.
+  Startup converts existing codes without needing them, and `secret check`
+  reports recovery-code counts.
 - `tunnel-server secret rotate`: retain the old key as `ui_secret_previous`,
-  generate a new server secret, and restart to re-seal passwords and TOTP secrets
-  in one transaction. Existing sessions remain valid; open UI pages need a reload.
+  generate a new server secret, and restart to re-seal passwords, recovery codes
+  and TOTP secrets in one transaction. Existing sessions remain valid; open UI pages need a reload.
   Back up the config with the database; losing the secret requires password
   resets and two-factor re-enrollment.
 - First public release of Tunnel, licensed under MIT.

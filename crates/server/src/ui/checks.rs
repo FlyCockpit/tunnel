@@ -118,7 +118,7 @@ pub(super) async fn check_second_factor(
             None => false,
         }
     } else if normalized.len() == 10 {
-        state.db.use_recovery_code(user_id.to_string(), tokens::hash_token(&normalized)).await?
+        state.db.use_recovery_code(user_id.to_string(), tokens::hash_token(&normalized), state.pepper.clone()).await?
     } else {
         false
     };

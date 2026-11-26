@@ -527,7 +527,8 @@ async fn totp_setup(
     Ok(Json(json!({ "secret": totp::base32(&secret), "otpauth_uri": uri, "qr": data_uri })))
 }
 
-fn new_recovery_codes() -> (Vec<String>, Vec<String>) {
+/// The codes to show once, and their sealed hashes to store (see `pepper`).
+fn new_recovery_codes(pepper: &crate::pepper::Pepper, user_id: &str) -> (Vec<String>, Vec<String>) {
     use rand::TryRng;
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut shown = Vec::new();
@@ -536,7 +537,7 @@ fn new_recovery_codes() -> (Vec<String>, Vec<String>) {
         let mut bytes = [0u8; 10];
         rand::rngs::SysRng.try_fill_bytes(&mut bytes).expect("OS random source failed");
         let code: String = bytes.iter().map(|b| ALPHABET[(b & 31) as usize] as char).collect();
-        hashes.push(tokens::hash_token(&code));
+        hashes.push(pepper.wrap(&tokens::hash_token(&code), crate::pepper::Purpose::Recovery, user_id));
         shown.push(format!("{}-{}", &code[..5], &code[5..]));
     }
     (shown, hashes)
@@ -561,7 +562,7 @@ async fn totp_enable(
     let step = totp::verify(&secret, &req.code, now(), None).ok_or_else(|| {
         ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "wrong code; check the time on your device")
     })?;
-    let (shown, hashes) = new_recovery_codes();
+    let (shown, hashes) = new_recovery_codes(&state.pepper, &user_id);
     if !state.db.enable_totp(user_id.clone(), sealed, step, hashes, creds.auth_epoch, s.session.id_hash.clone()).await?
     {
         return Err(ApiError::new(StatusCode::CONFLICT, "no_setup", "setup was restarted; scan the new code"));

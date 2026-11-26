@@ -715,13 +715,38 @@ impl Db {
         .await
     }
 
-    /// Consume a recovery code (single use).
-    pub async fn use_recovery_code(&self, user_id: String, code_hash: String) -> anyhow::Result<bool> {
+    /// Consume a recovery code (single use). `code_hash` is the SHA-256 hex of
+    /// the normalized code; each unused row is opened and compared in constant
+    /// time, without stopping at a match.
+    pub async fn use_recovery_code(
+        &self,
+        user_id: String,
+        code_hash: String,
+        pepper: crate::pepper::Pepper,
+    ) -> anyhow::Result<bool> {
         self.call(move |c| {
-            Ok(c.execute(
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut found = None;
+            {
+                let mut statement =
+                    tx.prepare("SELECT code_hash FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL")?;
+                let mut rows = statement.query(params![user_id])?;
+                while let Some(row) = rows.next()? {
+                    let stored: String = row.get(0)?;
+                    let opened = pepper.unwrap(&stored, crate::pepper::Purpose::Recovery, &user_id);
+                    let matches = crate::tokens::hashes_equal(opened.as_deref().unwrap_or(""), &code_hash);
+                    if matches && found.is_none() {
+                        found = Some(stored);
+                    }
+                }
+            }
+            let Some(stored) = found else { return Ok(false) };
+            let n = tx.execute(
                 "UPDATE recovery_codes SET used_at = ?3 WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL",
-                params![user_id, code_hash, now()],
-            )? == 1)
+                params![user_id, stored, now()],
+            )?;
+            tx.commit()?;
+            Ok(n == 1)
         })
         .await
     }

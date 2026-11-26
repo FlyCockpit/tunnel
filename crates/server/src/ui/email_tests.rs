@@ -680,9 +680,10 @@ async fn a_busy_server_does_not_use_up_a_recovery_code() {
     let _codes = enable_totp(&state, &mut ann, "ann-password").await;
     let users = owner.call(&state, "GET", "/ui/api/users", None).await;
     let ann_id = user_id(&users.body, "ann");
-    // A recovery code: only its hash is stored, so make a known one.
+    // A recovery code: only its sealed hash is stored, so make a known one.
     let code = "abcdefghij";
-    let (id, h) = (ann_id.clone(), tokens::hash_token(code));
+    let h = state.pepper.wrap(&tokens::hash_token(code), crate::pepper::Purpose::Recovery, &ann_id);
+    let id = ann_id.clone();
     state
         .db
         .call(move |c| {

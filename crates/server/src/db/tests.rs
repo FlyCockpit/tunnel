@@ -100,7 +100,7 @@ async fn startup_seals_legacy_passwords_and_preserves_absent_passwords() {
     let peppers = PepperSet::new("public conversion fixture", None);
     let keys = || (crate::seal::Keys::new("public conversion fixture"), None);
     let counts = crate::reseal::seal(&db, peppers.clone(), keys()).await.unwrap();
-    assert_eq!(counts, crate::reseal::Counts { converted: 2, rewrapped: 0 });
+    assert_eq!(counts, crate::reseal::Counts { converted: 2, rewrapped: 0, ..Default::default() });
     for file in [&path, &path.with_extension("db-wal")] {
         match std::fs::read(file) {
             Ok(bytes) => assert!(!bytes.windows(phc.len()).any(|part| part == phc.as_bytes())),
@@ -179,7 +179,7 @@ async fn totp_only_rotation_checkpoints_and_removes_old_values() {
     let peppers = PepperSet::new("public current totp fixture", Some("public old totp fixture"));
     let counts =
         crate::reseal::seal(&db, peppers.clone(), (Keys::new("public current totp fixture"), Some(old))).await.unwrap();
-    assert_eq!(counts, crate::reseal::Counts { converted: 0, rewrapped: 2 });
+    assert_eq!(counts, crate::reseal::Counts { converted: 0, rewrapped: 2, ..Default::default() });
     let path = dir.0.join("state.db");
     assert_eq!(std::fs::metadata(path.with_extension("db-wal")).unwrap().len(), 0);
     let bytes = std::fs::read(&path).unwrap();
@@ -421,7 +421,7 @@ async fn rotation_reseals_passwords_and_both_totp_columns() {
     .unwrap();
     let counts =
         crate::reseal::seal(&db, peppers, (Keys::new("public new rotation fixture"), Some(old_totp))).await.unwrap();
-    assert_eq!(counts, crate::reseal::Counts { converted: 0, rewrapped: 4 });
+    assert_eq!(counts, crate::reseal::Counts { converted: 0, rewrapped: 4, ..Default::default() });
     let current = PepperSet::new("public new rotation fixture", None);
     let user = db.credentials(None, Some("rotating".into())).await.unwrap().unwrap();
     let tunnel = db.get_tunnel("rotatetun".into()).await.unwrap().unwrap();
@@ -1298,4 +1298,162 @@ fn refuses_a_database_whose_schema_differs_from_this_builds() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+#[tokio::test]
+async fn recovery_codes_convert_without_the_codes_rotate_and_stay_single_use() {
+    use crate::pepper::{PepperSet, Purpose};
+    use crate::reseal::Counts;
+    use crate::seal::Keys;
+    let (db, dir) = isolated_db();
+    let path = dir.0.join("state.db");
+    let hash = |code: &str| crate::tokens::hash_token(code);
+    // Legacy rows as older versions stored them: plain `hex(SHA-256(code))`.
+    let legacy = [hash("aaaaabbbbb"), hash("cccccddddd"), hash("eeeeefffff")];
+    let rows = legacy.clone();
+    db.call(move |c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', '!', 'owner', 0)",
+            [],
+        )?;
+        c.execute("INSERT INTO recovery_codes (user_id, code_hash, used_at) VALUES ('u1', ?1, 5)", [&rows[0]])?;
+        for row in &rows[1..] {
+            c.execute("INSERT INTO recovery_codes (user_id, code_hash) VALUES ('u1', ?1)", [row])?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let old = PepperSet::new("public old recovery fixture", None);
+    let old_keys = || (Keys::new("public old recovery fixture"), None);
+    assert_eq!(
+        crate::reseal::check(&path, &old, (&old_keys().0, None)).unwrap(),
+        Counts { codes: 3, codes_converted: 3, ..Default::default() }
+    );
+
+    // Conversion seals the stored hashes; the plain hashes leave the files.
+    let counts = crate::reseal::seal(&db, old.clone(), old_keys()).await.unwrap();
+    assert_eq!(counts, Counts { codes: 3, codes_converted: 3, ..Default::default() });
+    for file in [&path, &path.with_extension("db-wal")] {
+        match std::fs::read(file) {
+            Ok(bytes) => {
+                for h in &legacy {
+                    assert!(!bytes.windows(h.len()).any(|part| part == h.as_bytes()), "plain hash left in {file:?}");
+                }
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+    let stored: Vec<(String, Option<i64>)> = db
+        .call(|c| {
+            Ok(c.prepare("SELECT code_hash, used_at FROM recovery_codes ORDER BY rowid")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    for (value, _) in &stored {
+        assert!(value.starts_with(&format!("rc1:{}:", old.current.id())), "{value}");
+    }
+    assert_eq!(stored[0].1, Some(5), "a used code stays used");
+    assert_eq!(old.current.unwrap(&stored[1].0, Purpose::Recovery, "u1").as_deref(), Some(legacy[1].as_str()));
+    assert_eq!(
+        crate::reseal::seal(&db, old.clone(), old_keys()).await.unwrap(),
+        Counts { codes: 3, ..Default::default() }
+    );
+
+    // Verify after conversion; single use; a used or unknown code is refused.
+    let pepper = old.current.clone();
+    assert!(!db.use_recovery_code("u1".into(), hash("aaaaabbbbb"), pepper.clone()).await.unwrap(), "used before");
+    assert!(!db.use_recovery_code("u1".into(), hash("zzzzzzzzzz"), pepper.clone()).await.unwrap());
+    assert!(!db.use_recovery_code("u2".into(), hash("cccccddddd"), pepper.clone()).await.unwrap(), "other user");
+    assert!(db.use_recovery_code("u1".into(), hash("cccccddddd"), pepper.clone()).await.unwrap());
+    assert!(!db.use_recovery_code("u1".into(), hash("cccccddddd"), pepper.clone()).await.unwrap(), "single use");
+    assert_eq!(db.recovery_codes_left("u1".into()).await.unwrap(), 1);
+
+    // A different ui_secret without the old one refuses to start and changes nothing.
+    let other = PepperSet::new("public other recovery fixture", None);
+    let error = crate::reseal::seal(&db, other.clone(), (Keys::new("public other recovery fixture"), None))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("recovery_codes row") && error.contains(old.current.id()), "{error}");
+    assert!(!error.contains(&legacy[1]), "{error}");
+    let after: Vec<String> = db
+        .call(|c| {
+            Ok(c.prepare("SELECT code_hash FROM recovery_codes ORDER BY rowid")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(after, stored.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>());
+    assert!(!db.use_recovery_code("u1".into(), hash("eeeeefffff"), other.current.clone()).await.unwrap());
+
+    // Rotation: the previous secret re-seals every row; codes keep working, used ones stay used.
+    let rotated = PepperSet::new("public new recovery fixture", Some("public old recovery fixture"));
+    let rotated_keys = || (Keys::new("public new recovery fixture"), Some(Keys::new("public old recovery fixture")));
+    let before = crate::reseal::check(&path, &rotated, (&rotated_keys().0, rotated_keys().1.as_ref())).unwrap();
+    assert_eq!(before, Counts { codes: 3, codes_rewrapped: 3, ..Default::default() });
+    assert_eq!(before.previous(), 3);
+    assert_eq!(crate::reseal::seal(&db, rotated.clone(), rotated_keys()).await.unwrap(), before);
+    let new = PepperSet::new("public new recovery fixture", None);
+    assert_eq!(
+        crate::reseal::check(&path, &new, (&Keys::new("public new recovery fixture"), None)).unwrap(),
+        Counts { codes: 3, ..Default::default() }
+    );
+    assert!(!db.use_recovery_code("u1".into(), hash("eeeeefffff"), old.current.clone()).await.unwrap(), "old key");
+    assert!(!db.use_recovery_code("u1".into(), hash("cccccddddd"), new.current.clone()).await.unwrap(), "still used");
+    assert!(db.use_recovery_code("u1".into(), hash("eeeeefffff"), new.current.clone()).await.unwrap());
+    assert_eq!(db.recovery_codes_left("u1".into()).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn damaged_recovery_code_rows_refuse_to_start() {
+    let peppers = crate::pepper::PepperSet::new("public damaged recovery fixture", None);
+    let wrong_user = peppers.current.wrap(&crate::tokens::hash_token("x"), crate::pepper::Purpose::Recovery, "u2");
+    let not_a_hash = peppers.current.wrap("not a hash", crate::pepper::Purpose::Recovery, "u1");
+    for bad in ["ABCDEF".repeat(11)[..64].to_string(), "garbage".into(), wrong_user, not_a_hash] {
+        let (db, _dir) = isolated_db();
+        let row = bad.clone();
+        db.call(move |c| {
+            c.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', '!', 'owner', 0)",
+                [],
+            )?;
+            c.execute("INSERT INTO recovery_codes (user_id, code_hash) VALUES ('u1', ?1)", [row])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let keys = (crate::seal::Keys::new("public damaged recovery fixture"), None);
+        let error = crate::reseal::seal(&db, peppers.clone(), keys).await.unwrap_err().to_string();
+        assert!(error.contains("recovery_codes row"), "{bad}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn a_recovery_code_is_used_once_by_concurrent_servers() {
+    let (db, dir) = isolated_db();
+    let pepper = crate::pepper::Pepper::new("public concurrent recovery fixture");
+    let hash = crate::tokens::hash_token("abcde23456");
+    let sealed = pepper.wrap(&hash, crate::pepper::Purpose::Recovery, "u1");
+    db.call(move |c| {
+        c.execute(
+            "INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('u1', 'ann', '!', 'owner', 0)",
+            [],
+        )?;
+        c.execute("INSERT INTO recovery_codes (user_id, code_hash) VALUES ('u1', ?1)", [sealed])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // Independent connections, so only SQLite's locking keeps the code single-use.
+    let others: Vec<Db> = (0..4).map(|_| Db::open(&dir.0.join("state.db")).unwrap()).collect();
+    let results = futures_util::future::join_all(
+        others.iter().map(|db| db.use_recovery_code("u1".into(), hash.clone(), pepper.clone())),
+    )
+    .await;
+    assert_eq!(results.into_iter().map(Result::unwrap).filter(|used| *used).count(), 1);
+    assert_eq!(db.recovery_codes_left("u1".into()).await.unwrap(), 0);
 }
