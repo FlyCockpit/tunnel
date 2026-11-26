@@ -18,7 +18,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
   "Window", "Document", "Location", "History", "Headers", "Request", "RequestInit", "RequestCredentials",
-  "Response", "Storage", "HtmlElement", "Element", "DomTokenList", "MediaQueryList", "Navigator", "Clipboard",
+  "Response", "HtmlElement", "Element", "Navigator", "Clipboard",
   "PopStateEvent", "Event",
 ] }
 serde = { version = "1", features = ["derive"] }

@@ -158,3 +158,16 @@
   --primary-foreground: oklch(0.17 0.03 292);
   --ring: oklch(0.6 0.1 292);
 }
+/* Text on a state's tinted background (--state-*-bg): the vendored --state-*
+   is too light on the light tint and --state-*-foreground is for a solid fill.
+   At least 4.5:1 on the tint over --background and --card (src/theme.rs tests). */
+:root {
+  --state-success-text: oklch(0.47 0.14 152);
+  --state-warning-text: oklch(0.45 0.1 70);
+  --state-info-text: oklch(0.49 0.15 250);
+}
+.dark {
+  --state-success-text: var(--state-success);
+  --state-warning-text: var(--state-warning);
+  --state-info-text: var(--state-info);
+}

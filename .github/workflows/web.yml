@@ -55,6 +55,10 @@ jobs:
         run: |
           nice -n 10 cargo fmt --check
           nice -n 10 cargo clippy --locked --release --target wasm32-unknown-unknown -- -D warnings
+      # The pure modules' unit tests (limits, theme: style sheet contrast) run on the host.
+      - name: Test (host)
+        working-directory: crates/web
+        run: nice -n 10 cargo test --locked
       - name: Build (size budget enforced)
         run: nice -n 10 crates/web/build.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -1153,6 +1153,19 @@ async fn the_app_shell_and_assets_are_served_from_the_binary() {
         })
         .unwrap();
         assert!(html.contains("<script type=\"module\""), "{html}");
+        // The theme is set by a blocking script ahead of the stylesheet, so the
+        // first paint is in the right theme; the CSS follows the system until then.
+        let theme = html.find("<script src=\"/assets/theme-").expect("theme script");
+        assert!(theme < html.find("<link rel=\"stylesheet\"").unwrap(), "{html}");
+        let asset_text = |prefix: &str, suffix: &str| {
+            let a = super::assets::ASSETS.iter().find(|a| a.path.starts_with(prefix) && a.path.ends_with(suffix));
+            std::str::from_utf8(a.unwrap_or_else(|| panic!("embedded {prefix}*{suffix}")).raw).unwrap()
+        };
+        assert!(asset_text("/assets/theme-", ".js").contains("\"tunnel-theme\""));
+        assert!(
+            asset_text("/assets/app-", ".css")
+                .contains("@media (prefers-color-scheme: dark) {\n:root:not(.light) {\n  --background:")
+        );
         let asset = super::assets::ASSETS.iter().find(|a| a.path.ends_with(".wasm")).expect("embedded wasm");
         let r = get(asset.path).await;
         assert_eq!(r.headers().get(header::CACHE_CONTROL).unwrap(), "public, max-age=31536000, immutable");

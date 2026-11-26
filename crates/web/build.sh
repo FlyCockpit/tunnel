@@ -41,7 +41,17 @@ cp "$out/app.js" "dist/assets/$js"
 printf 'import init from "/assets/%s";\ninit({ module_or_path: "/assets/%s" });\n' "$js" "$wasm" > "$out/boot.js"
 boot="boot-$(hash "$out/boot.js").js"
 cp "$out/boot.js" "dist/assets/$boot"
-cat style/tokens.css style/app.css > "$out/app.css"
+theme="theme-$(hash static/theme.js).js"
+cp static/theme.js "dist/assets/$theme"
+# Until theme.js has set .light or .dark (it is still loading, or scripts are
+# off), follow the system: the .dark token blocks again, under the media query.
+{
+  cat style/tokens.css
+  printf '@media (prefers-color-scheme: dark) {\n:root:not(.light) {\n'
+  awk '/^\.dark \{$/ { on = 1; next } on && /^\}$/ { on = 0; next } on' style/tokens.css
+  printf '}\n}\n'
+  cat style/app.css
+} > "$out/app.css"
 css="app-$(hash "$out/app.css").css"
 cp "$out/app.css" "dist/assets/$css"
 # Stable names: referenced from CSS and the shell; small and rarely changed.
@@ -56,6 +66,7 @@ cat > dist/index.html <<HTML
 <meta name="referrer" content="no-referrer">
 <title>Tunnel</title>
 <link rel="icon" type="image/png" href="/assets/favicon-32.png">
+<script src="/assets/$theme"></script>
 <link rel="stylesheet" href="/assets/$css">
 <link rel="modulepreload" href="/assets/$js">
 <link rel="preload" href="/assets/$wasm" as="fetch" type="application/wasm" crossorigin>
@@ -69,7 +80,7 @@ total=0
 for f in dist/index.html dist/assets/*; do
   case "$f" in *.woff2 | *.png | *.txt) ;; *) gzip -9 -n -k "$f" ;; esac
 done
-for f in dist/index.html dist/assets/$js dist/assets/$wasm dist/assets/$boot dist/assets/$css; do
+for f in dist/index.html dist/assets/$js dist/assets/$wasm dist/assets/$boot dist/assets/$theme dist/assets/$css; do
   total=$((total + $(wc -c < "$f.gz")))
 done
 total=$((total + $(wc -c < dist/assets/roboto-latin-wght-normal.woff2)))

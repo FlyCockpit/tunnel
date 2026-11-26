@@ -7,6 +7,7 @@ mod api;
 mod email;
 mod limits;
 mod pages;
+mod theme;
 mod types;
 mod ui;
 
@@ -80,7 +81,6 @@ fn App() -> impl IntoView {
         let _ = w.add_event_listener_with_callback("popstate", on_pop.as_ref().unchecked_ref());
     }
     on_pop.forget();
-    ui::apply_theme(ui::stored_theme());
 
     view! {
         <Show when=move || loaded.get() fallback=|| view! { <div class="page muted">"Loading…"</div> }>

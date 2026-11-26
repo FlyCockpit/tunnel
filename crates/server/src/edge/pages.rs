@@ -29,6 +29,15 @@ static ICON_LINKS: LazyLock<String> = LazyLock::new(|| {
 /// What every page here allows: its inline style and the inline icon.
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
 
+/// The web UI's neutral colours (crates/web/style/tokens.css: --background,
+/// --foreground, --muted-foreground, --input, --destructive). These pages are
+/// on other origins and cannot see the UI's light/dark choice, so they follow
+/// the system, native controls and scrollbars included.
+const PALETTE: &str = ":root{color-scheme:light dark;--bg:oklch(1 0 0);--fg:oklch(0.148 0.004 228.8);\
+--muted:oklch(0.54 0.021 213.5);--line:oklch(0.925 0.005 214.3);--err:oklch(0.464 0.245 27.325)}\
+@media (prefers-color-scheme:dark){:root{--bg:oklch(0.148 0.004 228.8);--fg:oklch(0.987 0.002 197.1);\
+--muted:oklch(0.723 0.014 214.4);--line:oklch(1 0 0 / 15%);--err:oklch(0.867 0.191 22.216)}}";
+
 fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>) -> Response<Body> {
     // A meta refresh lets the offline pages recover on their own once the
     // sandbox (re)connects, including inside an embedding iframe.
@@ -38,8 +47,8 @@ fn page(status: StatusCode, title: &str, message: &str, retry_after: Option<u32>
     };
     let html = format!(
         r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">{refresh}<title>{title}</title>{icon}
-<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:#1f1f1f;background:#fafafa}}main{{max-width:30rem;padding:1.5rem;text-align:center}}h1{{margin:0 0 .5rem;font-size:1.25rem}}p{{margin:0;color:#5f5f5f}}@media (prefers-color-scheme:dark){{body{{color:#ececec;background:#161616}}p{{color:#a8a8a8}}}}</style></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark">{refresh}<title>{title}</title>{icon}
+<style>{PALETTE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{max-width:30rem;padding:1.5rem;text-align:center}}h1{{margin:0 0 .5rem;font-size:1.25rem}}p{{margin:0;color:var(--muted)}}</style></head>
 <body><main><h1>{title}</h1><p>{message}</p></main></body></html>
 "#,
         icon = ICON_LINKS.as_str(),
@@ -82,8 +91,8 @@ pub fn login(status: StatusCode, target: &LoginTarget<'_>, error: Option<&str>) 
     let error = error.map(|e| format!(r#"<p class="err" role="alert">{}</p>"#, escape(e))).unwrap_or_default();
     let html = format!(
         r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Sign in</title>{icon}
-<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:#1f1f1f;background:#fafafa}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:#5f5f5f}}input{{width:100%;min-height:44px;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid #c8c8c8;border-radius:6px;background:#fff;color:inherit}}button{{margin-top:1rem;width:100%;min-height:44px;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:#1f1f1f;color:#fff;cursor:pointer}}.err{{margin:0 0 .5rem;color:#b3261e;font-size:.875rem}}@media (prefers-color-scheme:dark){{body{{color:#ececec;background:#161616}}label{{color:#a8a8a8}}input{{background:#232323;border-color:#3a3a3a}}button{{background:#ececec;color:#161616}}.err{{color:#f2b8b5}}}}</style></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark"><title>Sign in</title>{icon}
+<style>{PALETTE}body{{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}}main{{width:100%;max-width:20rem;padding:1.5rem;box-sizing:border-box}}h1{{margin:0 0 1rem;font-size:1.25rem}}label{{display:block;margin:.75rem 0 .25rem;font-size:.875rem;color:var(--muted)}}input{{width:100%;min-height:44px;box-sizing:border-box;padding:.5rem .625rem;font:inherit;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit}}button{{margin-top:1rem;width:100%;min-height:44px;padding:.55rem;font:inherit;font-weight:600;border:0;border-radius:6px;background:var(--fg);color:var(--bg);cursor:pointer}}.err{{margin:0 0 .5rem;color:var(--err);font-size:.875rem}}</style></head>
 <body><main><h1>Sign in to view this preview</h1>{error}
 <form method="post" action="/__login"><input type="hidden" name="to" value="{to}"><input type="hidden" name="next" value="{next}">
 <label for="u">Username</label><input id="u" name="username" autocomplete="username" required autofocus>
@@ -265,5 +274,25 @@ mod tests {
         }
         assert!(ICON_LINKS.contains("data:image/svg+xml;base64,"));
         assert!(ICON_LINKS.contains("data:image/png;base64,"));
+    }
+
+    /// Light and dark follow the system, in the web UI's colours.
+    #[tokio::test]
+    async fn every_page_follows_the_system_theme_in_the_ui_colours() {
+        use http_body_util::BodyExt as _;
+        let target =
+            LoginTarget { to: "3000-x", next: "/", preview_origin: "https://3000-x.t.test", frame_sources: &[] };
+        for response in [not_found(), offline(), login(StatusCode::OK, &target, None)] {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains(r#"<meta name="color-scheme" content="light dark">"#), "{html}");
+            assert!(html.contains(PALETTE), "{html}");
+        }
+        let tokens = include_str!("../../../web/style/tokens.css");
+        let colours: Vec<_> = PALETTE.split("oklch(").skip(1).map(|c| &c[..c.find(')').unwrap()]).collect();
+        assert_eq!(colours.len(), 10);
+        for c in colours {
+            assert!(tokens.contains(&format!("oklch({c})")), "oklch({c}) is not a UI token");
+        }
     }
 }

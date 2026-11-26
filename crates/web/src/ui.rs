@@ -4,6 +4,7 @@
 use leptos::prelude::*;
 
 use crate::api::ApiError;
+use crate::theme;
 use crate::{ctx, navigate, refresh_session};
 
 /// `<a>` that navigates without a reload.
@@ -77,44 +78,22 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     }
 }
 
-pub fn stored_theme() -> String {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item("tunnel-theme").ok().flatten())
-        .unwrap_or_else(|| "system".into())
-}
-
-pub fn apply_theme(theme: String) {
-    let Some(w) = web_sys::window() else { return };
-    let dark = match theme.as_str() {
-        "dark" => true,
-        "light" => false,
-        _ => w.match_media("(prefers-color-scheme: dark)").ok().flatten().is_some_and(|m| m.matches()),
-    };
-    if let Some(root) = w.document().and_then(|d| d.document_element()) {
-        let _ = if dark { root.class_list().add_1("dark") } else { root.class_list().remove_1("dark") };
-    }
-    if let Some(s) = w.local_storage().ok().flatten() {
-        let _ = s.set_item("tunnel-theme", &theme);
-    }
-}
-
 #[component]
 fn ThemeToggle() -> impl IntoView {
-    let theme = RwSignal::new(stored_theme());
+    let choice = RwSignal::new(theme::choice());
     let next = move |_| {
-        let t = match theme.get().as_str() {
+        let t = match choice.get().as_str() {
             "system" => "light",
             "light" => "dark",
             _ => "system",
         }
         .to_string();
-        apply_theme(t.clone());
-        theme.set(t);
+        theme::set(&t);
+        choice.set(t);
     };
     view! {
         <button class="btn btn-ghost btn-sm" on:click=next title="Theme: system, light or dark">
-            {move || match theme.get().as_str() { "light" => "Light", "dark" => "Dark", _ => "Auto" }}
+            {move || match choice.get().as_str() { "light" => "Light", "dark" => "Dark", _ => "Auto" }}
         </button>
     }
 }
