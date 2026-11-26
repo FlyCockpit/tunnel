@@ -39,9 +39,10 @@
 // screen while its lists load, so there every shift counts.
 // It clears the profile's stored theme choice. Screenshots of the loaded
 // pages go to <out-dir>. Needs Node 22+ (global WebSocket). Exit 0 when
-// every case passes.
+// every case passes; 2 at once, with the reason, when the profile is not
+// signed in (or not as an admin while /admin/users is checked).
 import fs from "node:fs";
-import { footerPushedBelow, judge, shiftScore } from "./reload-shell-judge.mjs";
+import { footerPushedBelow, judge, sessionProblem, shiftScore } from "./reload-shell-judge.mjs";
 
 const [, , cdp, origin, out, ...args] = process.argv;
 if (!cdp || !origin || !out) {
@@ -163,13 +164,35 @@ const { result: { sessionId: s } } = await send("Target.attachToTarget", { targe
 await send("Page.enable", {}, s);
 await send("Network.enable", {}, s);
 await send("Page.addScriptToEvaluateOnNewDocument", { source: INIT }, s);
-const evaluate = async (expression) =>
-  (await send("Runtime.evaluate", { expression, returnByValue: true }, s)).result?.result?.value;
+const evaluate = async (expression, awaitPromise = false) =>
+  (await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise }, s)).result?.result?.value;
+// A page result that is JSON-encoded in the page (a string) and parsed once
+// here; undefined when the page could not answer (navigating, or it threw).
+const evalJson = async (expression, awaitPromise = false) => {
+  const text = await evaluate(expression, awaitPromise);
+  return typeof text === "string" ? JSON.parse(text) : undefined;
+};
 const fast = async () => {
   await send("Network.setCacheDisabled", { cacheDisabled: false }, s);
   await send("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }, s);
   await send("Emulation.setCPUThrottlingRate", { rate: 1 }, s);
 };
+
+// Precondition: a signed-in profile (an admin when /admin/users is checked).
+// Every /ui/api request carries X-Tunnel-CSRF, GETs too (src/api.rs).
+await send("Page.navigate", { url: origin + "/" }, s);
+await sleep(2500);
+const session = await evalJson(
+  `fetch("/ui/api/session", { credentials: "same-origin", headers: { "X-Tunnel-CSRF": "1" }, signal: AbortSignal.timeout(15000) }).then(async (r) => JSON.stringify(r.ok ? await r.json() : { error: "HTTP " + r.status }), (e) => JSON.stringify({ error: String(e) }))`,
+  true,
+);
+const problem = sessionProblem(origin, session, PAGES.some(([path]) => path.startsWith("/admin/")));
+if (problem) {
+  console.error(`reload-shell.mjs: ${problem}`);
+  await send("Target.closeTarget", { targetId });
+  ws.close();
+  process.exit(2);
+}
 
 let failed = 0;
 const MODES = [
@@ -200,12 +223,14 @@ for (const [system, stored, expectDark] of MODES)
       let loaded = false;
       while (Date.now() < until && !(loaded = (await evaluate(done)) === true)) await sleep(250);
       await sleep(1000);
-      const recording = !navError && loaded ? JSON.parse(await evaluate(READ)) : null;
+      const recording = !navError && loaded ? await evalJson(READ) : null;
       const problems = navError
         ? [`${label}: the reload failed: ${navError}`]
         : recording
           ? judge(label, recording, expectDark, strict)
-          : [`${label}: still loading after 60s (waiting for ${ready})`];
+          : loaded
+            ? [`${label}: could not read the recording from the page`]
+            : [`${label}: still loading after 60s (waiting for ${ready})`];
       const score = recording?.final ? shiftScore(recording.shifts, recording.final) : null;
       const cls = score ? ` (CLS ${score.cls}${score.belowFold ? `, ${score.belowFold} below the fold` : ""}, all ${score.all})` : "";
       const shot = await send("Page.captureScreenshot", { format: "png" }, s);

@@ -43,6 +43,22 @@ export function shiftScore(shifts, final) {
   return { cls: sum(counted), belowFold: sum(shifts.filter((s) => !counted.includes(s))), all: sum(shifts) };
 }
 
+/**
+ * Why the browser profile cannot run the check, or null when it can.
+ * `session` is the parsed `/ui/api/session` reply as the page read it, or
+ * `{ error }` when it could not be read. The pages need a signed-in user, and
+ * /admin/users (in the default set) an admin; otherwise every case would wait
+ * out its 60 s and report "still loading".
+ */
+export function sessionProblem(origin, session, needAdmin) {
+  if (!session || session.error) return `could not read ${origin}/ui/api/session (${session?.error ?? "no reply"}); is the UI up at that origin?`;
+  const user = session.user;
+  if (!user) return `the browser profile is not signed in to ${origin}; sign in there${needAdmin ? " as an admin" : ""} first`;
+  if (needAdmin && user.role !== "owner" && user.role !== "admin")
+    return `the browser profile is signed in to ${origin} as a ${user.role}; /admin/users needs an admin (or pass the pages to check)`;
+  return null;
+}
+
 const moved = (a, b) => (!a || !b ? a !== b : a.some((v, i) => Math.abs(v - (b[i] ?? 0)) > 1));
 
 /**

@@ -135,6 +135,54 @@ mod tests {
         }
     }
 
+    /// Control edges and focus (WCAG 1.4.11 and the 2.4.13 idea): resting
+    /// input and outline-button edges are >= 3:1 on every surface a control
+    /// sits on; the focus ring is >= 3:1 there too and >= 2:1 against the
+    /// resting edge, so focus clearly differs from rest; an invalid field's
+    /// edge is opaque and >= 3:1.
+    #[test]
+    fn control_edges_and_the_focus_ring_stand_out_in_both_themes() {
+        for rule in [
+            ":focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }",
+            "border: 1px solid var(--input);",
+            ".input:focus { outline: none; border-color: var(--ring);",
+            ".input[aria-invalid=\"true\"] { border-color: var(--destructive); }",
+            // The invalid border wins over the focused one, so focus there is an opaque ring.
+            ".input[aria-invalid=\"true\"]:focus { outline: 2px solid var(--ring); outline-offset: 1px; }",
+            ".btn-outline { background: var(--background); color: var(--foreground); border-color: var(--input); }",
+        ] {
+            assert!(APP.contains(rule), "{rule}");
+        }
+        for (theme, tokens) in ["light", "dark"].iter().zip(tokens()) {
+            let token = |name: &str| resolve(&tokens, &format!("var(--{name})"));
+            for name in ["input", "ring", "destructive"] {
+                assert_eq!(token(name).1, 1.0, "--{name} is opaque in {theme}");
+            }
+            for surface in ["background", "card", "muted"] {
+                let under = token(surface).0;
+                for (edge, min) in [("input", 3.0), ("ring", 3.0), ("destructive", 3.0)] {
+                    let ratio = contrast(token(edge).0, under);
+                    assert!(ratio >= min, "--{edge} on --{surface} in {theme}: {ratio:.2}:1");
+                }
+            }
+            let ratio = contrast(token("ring").0, token("input").0);
+            assert!(ratio >= 2.0, "--ring against --input in {theme}: {ratio:.2}:1");
+        }
+    }
+
+    /// Popups (the user menu, a dialog) are opaque, so the page never shows
+    /// through them.
+    #[test]
+    fn popup_surfaces_are_opaque_in_both_themes() {
+        assert!(APP.contains("dialog { border: 1px solid var(--border); background: var(--popover);"));
+        for (theme, tokens) in ["light", "dark"].iter().zip(tokens()) {
+            for surface in ["card", "popover"] {
+                let (_, alpha) = resolve(&tokens, &format!("var(--{surface})"));
+                assert_eq!(alpha, 1.0, "--{surface} is opaque in {theme}");
+            }
+        }
+    }
+
     /// Type sizes are rem, so they follow the root's viewport scale, and none
     /// is below 12px (0.75rem) at the browser default. The one px value is
     /// the touch floor that keeps iOS from zooming into a focused input; the

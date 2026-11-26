@@ -29,11 +29,13 @@ pub fn route(path: String) -> AnyView {
         "/account" => view! { <Account /> }.into_any(),
         "/admin/users" if user.is_admin() => view! { <Users me=user.clone() /> }.into_any(),
         "/admin/status" if user.is_admin() => view! { <Status /> }.into_any(),
+        // The page's one heading is its h1, as on every other page.
         _ => view! {
-            <div class="page"><Empty title="Page not found">
+            <div class="page"><div class="empty">
+                <h1>"Page not found"</h1>
                 <p>"There is nothing at this address."</p>
                 <button class="btn btn-outline" on:click=move |_| navigate("/")>"Go to your tunnels"</button>
-            </Empty></div>
+            </div></div>
         }
         .into_any(),
     }
@@ -1797,6 +1799,54 @@ fn Status() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body of `fn <name>` in `src`, up to the next item.
+    fn body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .find_map(|head| src.find(head.as_str()))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        let rest = &src[start..];
+        &rest[..rest.find("\n}\n").expect("the item ends")]
+    }
+
+    /// Every page names itself with one real h1 (the 404 included), and no
+    /// element stands in for a heading through an ARIA role.
+    #[test]
+    fn every_page_has_one_h1() {
+        let src = include_str!("pages.rs");
+        let route = body(src, "route");
+        let pages: Vec<&str> = route
+            .match_indices("view! { <")
+            .map(|(i, _)| {
+                let name = &route[i + 9..];
+                &name[..name.find([' ', '/']).unwrap()]
+            })
+            .filter(|n| *n != "div")
+            .collect();
+        // Every view the router returns is one of these or the 404 (a new
+        // route, or one written another way, fails here until it is listed).
+        assert_eq!(
+            pages,
+            ["InvitePage", "SignIn", "Tunnels", "Machines", "Device", "Cli", "Account", "Users", "Status"]
+        );
+        let arms = route.matches(" => ").count() + route.matches("return ").count();
+        assert_eq!(arms, pages.len() + 1, "one listed page per route arm, plus the 404");
+        assert_eq!(route.matches("view! {").count(), arms, "one view per route arm");
+        for page in pages {
+            assert_eq!(body(src, page).matches("<h1>").count(), 1, "{page}");
+        }
+        let (_, not_found) = route.split_once("_ => view!").expect("route has a fallback");
+        assert_eq!(not_found.matches("<h1>").count(), 1, "the 404 page");
+        // Sign-in's other state, Forgot password, replaces the whole card.
+        assert!(body(src, "SignIn").contains("<ForgotPassword "));
+        assert_eq!(body(include_str!("email.rs"), "ForgotPassword").matches("<h1>").count(), 1, "ForgotPassword");
+        for (file, text) in
+            [("pages.rs", src), ("email.rs", include_str!("email.rs")), ("ui.rs", include_str!("ui.rs"))]
+        {
+            assert!(!text.contains(concat!("role=", "\"heading\"")), "{file}");
+        }
+    }
 
     fn row(id: &str, role: &str, traffic: u64) -> UserRow {
         serde_json::from_value(

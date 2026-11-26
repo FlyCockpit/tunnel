@@ -147,16 +147,19 @@
   --sidebar-ring: oklch(0.56 0.021 213.5);
 }
 
-/* Tunnel's primary within the suite palette (wssp blue, wmp teal; tunnel violet). */
+/* Tunnel's primary within the suite palette (wssp blue, wmp teal; tunnel violet).
+   --input and --ring: src/theme.rs has their contrast rules. */
 :root {
   --primary: oklch(0.47 0.17 292);
   --primary-foreground: oklch(0.98 0.01 292);
-  --ring: oklch(0.6 0.12 292);
+  --input: oklch(0.62 0.012 214.3);
+  --ring: oklch(0.44 0.14 292);
 }
 .dark {
   --primary: oklch(0.72 0.14 292);
   --primary-foreground: oklch(0.17 0.03 292);
-  --ring: oklch(0.6 0.1 292);
+  --input: oklch(0.56 0.012 220);
+  --ring: oklch(0.78 0.11 292);
 }
 /* Text on a state's tinted background (--state-*-bg): the vendored --state-*
    is too light on the light tint and --state-*-foreground is for a solid fill.

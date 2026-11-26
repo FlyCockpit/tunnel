@@ -1,7 +1,8 @@
 // node --test crates/web/checks/
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
-import { fits, footerPushedBelow, judge, shiftScore } from "./reload-shell-judge.mjs";
+import { fits, footerPushedBelow, judge, sessionProblem, shiftScore } from "./reload-shell-judge.mjs";
 
 const frame = (over = {}) => ({
   t: 100,
@@ -82,4 +83,21 @@ test("content that fits the viewport ends with the footer in it", () => {
   assert.deepEqual(judge("p", recording(short, []), false), []);
   // A long page may have its footer below the fold.
   assert.deepEqual(judge("p", recording(long, []), false), []);
+});
+
+test("the profile must be signed in, as an admin for /admin/users", () => {
+  const o = "https://tunnel.example";
+  assert.equal(sessionProblem(o, { user: { role: "owner" } }, true), null);
+  assert.equal(sessionProblem(o, { user: { role: "admin" } }, true), null);
+  assert.equal(sessionProblem(o, { user: { role: "member" } }, false), null);
+  assert.match(sessionProblem(o, { user: { role: "member" } }, true), /as a member; \/admin\/users needs an admin/);
+  assert.match(sessionProblem(o, { user: null, pending: true }, false), /not signed in to https:\/\/tunnel.example; sign in there first/);
+  assert.match(sessionProblem(o, { user: null }, true), /sign in there as an admin first/);
+  assert.match(sessionProblem(o, { error: "HTTP 502" }, true), /could not read .*\/ui\/api\/session \(HTTP 502\)/);
+  assert.match(sessionProblem(o, undefined, true), /\(no reply\)/);
+});
+
+test("the session probe sends the header every /ui/api request needs", () => {
+  const check = fs.readFileSync(new URL("./reload-shell.mjs", import.meta.url), "utf8");
+  assert.match(check, /fetch\("\/ui\/api\/session", \{[^}]*headers: \{ "X-Tunnel-CSRF": "1" \}/);
 });

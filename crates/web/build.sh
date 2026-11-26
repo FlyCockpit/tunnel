@@ -53,13 +53,31 @@ shell="shell-$(hash "$out/shell.js").js"
 cp "$out/shell.js" "dist/assets/$shell"
 # Until theme.js has set .light or .dark (it is still loading, or scripts are
 # off), follow the system: the .dark token blocks again, under the media query.
+# The comments stay in the sources and out of the shipped sheet (about a third
+# of its gzip bytes). CSS comments do not nest, and the sheets hold no comment
+# marks inside strings; an unclosed comment fails the build.
 {
   cat style/tokens.css
   printf '@media (prefers-color-scheme: dark) {\n:root:not(.light) {\n'
   awk '/^\.dark \{$/ { on = 1; next } on && /^\}$/ { on = 0; next } on' style/tokens.css
   printf '}\n}\n'
   cat style/app.css
-} > "$out/app.css"
+} | awk '
+  {
+    line = $0; kept = ""
+    while (line != "") {
+      if (inside) {
+        i = index(line, "*/"); if (!i) break
+        line = substr(line, i + 2); inside = 0
+      } else {
+        i = index(line, "/*"); if (!i) { kept = kept line; break }
+        kept = kept substr(line, 1, i - 1); line = substr(line, i + 2); inside = 1
+      }
+    }
+    if (kept ~ /[^ \t]/) print kept
+  }
+  END { if (inside) { print "build.sh: a style sheet has an unclosed comment" > "/dev/stderr"; exit 1 } }
+' > "$out/app.css"
 css="app-$(hash "$out/app.css").css"
 cp "$out/app.css" "dist/assets/$css"
 # Stable names: referenced from CSS and the shell; small and rarely changed.
