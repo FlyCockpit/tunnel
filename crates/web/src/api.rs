@@ -40,7 +40,7 @@ fn network<E>(_: E) -> ApiError {
     ApiError {
         status: 0,
         code: "network".into(),
-        message: "could not reach the server; check your connection and try again".into(),
+        message: "Could not reach the server; check your connection and try again.".into(),
     }
 }
 
@@ -50,8 +50,20 @@ fn unsent<E>(_: E) -> ApiError {
     ApiError {
         status: 0,
         code: "request".into(),
-        message: "this page could not send the request; reload it and try again".into(),
+        message: "This page could not send the request; reload it and try again.".into(),
     }
+}
+
+/// The API's messages are lower-case clauses (`wrong username or password`),
+/// for callers that put them in their own text. Shown on their own they end
+/// as a sentence; the error styles capitalise the first letter (app.css,
+/// `::first-letter`: cheaper than case code in the wasm).
+fn sentence(message: &str) -> String {
+    let mut out = message.trim().to_string();
+    if !out.is_empty() && !out.ends_with(['.', '?', '!']) {
+        out.push('.');
+    }
+    out
 }
 
 pub async fn call<T: DeserializeOwned>(method: &str, path: &str, body: Option<&impl Serialize>) -> Result<T, ApiError> {
@@ -81,7 +93,7 @@ pub async fn call<T: DeserializeOwned>(method: &str, path: &str, body: Option<&i
         return Err(ApiError {
             status,
             code: v["error"]["code"].as_str().unwrap_or("error").to_string(),
-            message: v["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {status}")),
+            message: v["error"]["message"].as_str().map(sentence).unwrap_or_else(|| format!("HTTP {status}")),
         });
     }
     let text = if text.trim().is_empty() { "null".to_string() } else { text };
@@ -107,6 +119,19 @@ pub async fn delete(path: &str) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_messages_end_as_sentences() {
+        assert_eq!(sentence("wrong username or password"), "wrong username or password.");
+        assert_eq!(sentence("Already a sentence."), "Already a sentence.");
+        assert_eq!(sentence("sign in again?"), "sign in again?");
+        assert_eq!(sentence("  "), "");
+        for e in [network(()), unsent(())] {
+            assert_eq!(sentence(&e.message), e.message, "the page's own messages are sentences too");
+        }
+        let css = include_str!("../style/app.css");
+        assert!(css.contains(".field-error::first-letter, .alert::first-letter { text-transform: uppercase; }"));
+    }
 
     #[test]
     fn a_failed_request_says_what_to_do_without_the_browser_error() {

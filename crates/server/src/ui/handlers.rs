@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use tunnel_protocol::CloseReason;
 
 use super::checks::{
-    INVITE_PREFIX, audit, bad_credentials, busy, changed_meanwhile, check_password, check_second_factor,
-    invalid_invite, invite_token_hash, keys, require_fresh_auth, too_many, totp_aad,
+    INVITE_PREFIX, audit, bad_sign_in, busy, changed_meanwhile, check_password, check_second_factor, invalid_invite,
+    invite_token_hash, keys, require_fresh_auth, too_many, totp_aad,
 };
 use super::email::{self, notify};
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
@@ -235,7 +235,7 @@ async fn login(
     let username = req.username.trim().to_ascii_lowercase();
     if username.is_empty() || username.len() > MAX_USERNAME || req.password.chars().count() > password::MAX_PASSWORD_LEN
     {
-        return Err(bad_credentials());
+        return Err(bad_sign_in(&state));
     }
     if !state.ui.login_user.check_key(username.clone()) {
         return Err(too_many());
@@ -250,7 +250,7 @@ async fn login(
         Verdict::Match if known => {}
         _ => {
             audit(&state, creds.as_ref().map(|c| c.user.id.as_str()), "login_failed", Some(username), &ctx).await;
-            return Err(bad_credentials());
+            return Err(bad_sign_in(&state));
         }
     }
     let creds = creds.expect("known user");

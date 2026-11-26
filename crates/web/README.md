@@ -63,6 +63,13 @@ dialogs. If one is added, it holds about six controls at most, must fit
 without inner scrolling at 1280×800 and 390×844, and gets the template's
 dialog-fits check; anything longer is a page.
 
+A one-click destructive action (Delete a tunnel, Revoke a link or an
+invite, Remove a machine) asks first with the browser's own confirm: the
+button carries the question in `data-confirm`, and `static/shell.js` asks it
+in the capture phase, before the UI's click handler, which never sees the
+click on Cancel. It lives in the shell rather than the wasm because an
+inline question cost several kilobytes of the first-load budget.
+
 ## First paint
 
 `index.html` holds a copy of the shell (`static/shell.html`: header, nav,

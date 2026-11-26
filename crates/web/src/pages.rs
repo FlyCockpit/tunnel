@@ -45,6 +45,12 @@ fn err_text(e: &ApiError) -> String {
     e.message.clone()
 }
 
+/// Under the sign-in heading, when the page asked for explains why: `/device`
+/// opened from `tunnel login` while signed out comes back to its code form.
+fn sign_in_purpose(path: &str) -> Option<&'static str> {
+    (path == "/device").then_some("Sign in to approve the machine, then enter the code from its terminal.")
+}
+
 // ------------------------------------------------------------------ sign in
 
 #[component]
@@ -90,6 +96,7 @@ fn SignIn() -> impl IntoView {
         <div class="narrow">
             <div class="card stack">
                 <h1>"Sign in"</h1>
+                {sign_in_purpose(&c.path.get_untracked()).map(|p| view! { <p class="muted">{p}</p> })}
                 <ErrorBox error=error />
                 <Show when=owner_missing>
                     <div class="alert alert-warning">
@@ -155,10 +162,14 @@ fn InvitePage() -> impl IntoView {
     let confirm = RwSignal::new(String::new());
     let revoke = RwSignal::new(false);
     let code = RwSignal::new(String::new());
+    // The server refused the link itself (not a connection problem).
+    let invalid = RwSignal::new(false);
     {
         let token = token.clone();
         run(error, busy, async move {
-            let v = api::post::<Value>("/ui/api/invite/info", &json!({ "token": token })).await?;
+            let v = api::post::<Value>("/ui/api/invite/info", &json!({ "token": token })).await.inspect_err(|e| {
+                invalid.set(e.code == "invalid_invite");
+            })?;
             info.set(Some(v));
             Ok(())
         });
@@ -167,15 +178,9 @@ fn InvitePage() -> impl IntoView {
     let is_reset = move || matches!(kind().as_str(), "owner_reset" | "account_reset" | "password_reset");
     let field = move |k: &'static str| info.get().and_then(|v| v[k].as_str().map(str::to_string));
     let needs_code = move || info.get().is_some_and(|v| v["needs_code"].as_bool() == Some(true));
-    let title = move || match kind().as_str() {
-        "owner_setup" => "Create the owner account".to_string(),
-        "owner_reset" => "Reset the owner's password".to_string(),
-        "account_reset" | "password_reset" => "Set a new password".to_string(),
-        "email_verify" => "Confirm your email address".to_string(),
-        _ => format!(
-            "Join as {}",
-            info.get().and_then(|v| v["role"].as_str().map(str::to_string)).unwrap_or_else(|| "member".into())
-        ),
+    let title = move || {
+        let info = info.get();
+        invite_title(info.as_ref().map(|v| (v["kind"].as_str().unwrap_or_default(), v["role"].as_str())), invalid.get())
     };
     // Stored, so the form's closures stay `Copy` inside nested views.
     let stored_token = StoredValue::new(token.clone());
@@ -270,6 +275,26 @@ fn InvitePage() -> impl IntoView {
             </div>
         </div>
     }
+}
+
+/// The invite page's heading: what the link does once the server has said
+/// (`(kind, role)`), else whether it was refused or is still being checked.
+/// Never a role the page cannot know yet.
+fn invite_title(info: Option<(&str, Option<&str>)>, invalid: bool) -> String {
+    match info {
+        None if invalid => "Link not valid".into(),
+        None => "Opening your link".into(),
+        Some(("owner_setup", _)) => "Create the owner account".into(),
+        Some(("owner_reset", _)) => "Reset the owner's password".into(),
+        Some(("account_reset" | "password_reset", _)) => "Set a new password".into(),
+        Some(("email_verify", _)) => "Confirm your email address".into(),
+        Some((_, role)) => format!("Join as {}", role.unwrap_or("member")),
+    }
+}
+
+/// `(name, login code)` of a headless machine the server just added.
+fn created_login(v: &Value) -> Option<(String, String)> {
+    Some((v["name"].as_str()?.to_string(), v["login_code"].as_str()?.to_string()))
 }
 
 /// Admins' switch between their own tunnels or machines and everyone's.
@@ -503,6 +528,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                     let rename_label = format!("Rename {name}");
                                     let links_label = format!("Access links of {name}");
                                     let delete_label = format!("Delete {name}");
+                                    let delete_question = format!("Delete {name}? Its links stop working.");
                                     view! {
                                         <tr>
                                             <td class="cell-main">
@@ -552,7 +578,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                                     let cur = open.get();
                                                     open.set(if cur.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) });
                                                 }>"Links"</button>
-                                                <button class="btn btn-destructive btn-sm" aria-label=delete_label on:click=move |_| delete(id2.clone())>"Delete"</button>
+                                                <button class="btn btn-destructive btn-sm" aria-label=delete_label data-confirm=delete_question on:click=move |_| delete(id2.clone())>"Delete"</button>
                                             </td>
                                         </tr>
                                         <Show when=is_open.clone()>
@@ -662,6 +688,7 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
                                 };
                                 let state = if l.kind == "owner" { format!("owner, {state}") } else { state.to_string() };
                                 let revoke_label = format!("Revoke link {}", l.id);
+                                let revoke_question = format!("Revoke link {}?", l.id);
                                 view! { <tr>
                                     <td class="cell-main">
                                         <span class="mono">{l.id.clone()}</span>
@@ -670,7 +697,7 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
                                     <td data-label="Kind">{state}</td>
                                     <td data-label="Created">{relative(l.created_at)}</td>
                                     <td data-label="Expires">{relative(l.expires_at)}</td>
-                                    <td class="actions"><button class="btn btn-destructive btn-sm" aria-label=revoke_label on:click=move |_| revoke(lid.clone())>"Revoke"</button></td>
+                                    <td class="actions"><button class="btn btn-destructive btn-sm" aria-label=revoke_label data-confirm=revoke_question on:click=move |_| revoke(lid.clone())>"Revoke"</button></td>
                                 </tr> }
                             }).collect_view()}
                             </tbody>
@@ -693,7 +720,10 @@ fn Machines(admin: bool) -> impl IntoView {
     let name = RwSignal::new(String::new());
     let code = RwSignal::new(String::new());
     let needs_code = RwSignal::new(false);
-    let login_code = RwSignal::new(None::<String>);
+    // The headless machine just added and its login code, until it is removed.
+    let login_code = RwSignal::new(None::<(String, String)>);
+    // A name the server refused, shown at the field.
+    let name_error = RwSignal::new(None::<String>);
     let ui_origin = ctx().session.get_untracked().map(|s| s.server.ui_origin).unwrap_or_default();
     let load = move || {
         let path = if all.get_untracked() { "/ui/api/machines?all=true" } else { "/ui/api/machines" };
@@ -706,21 +736,33 @@ fn Machines(admin: bool) -> impl IntoView {
     load();
     let add = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
-        let mut body = json!({ "name": name.get() });
+        let sent = name.get();
+        let mut body = json!({ "name": sent });
         if needs_code.get() {
             body["code"] = json!(code.get());
         }
         busy.set(true);
         error.set(None);
+        name_error.set(None);
+        // The answer is about `sent`: a name typed since is left alone.
+        let still = move || name.get_untracked() == sent;
         spawn_local(async move {
             match api::post::<Value>("/ui/api/machines", &body).await {
                 Ok(v) => {
-                    login_code.set(v["login_code"].as_str().map(str::to_string));
+                    login_code.set(created_login(&v));
                     needs_code.set(false);
                     code.set(String::new());
+                    // Done with this name: Enter again must not ask for it twice.
+                    if still() {
+                        name.set(String::new());
+                    }
                     load();
                 }
                 Err(e) if e.code == "code_required" => needs_code.set(true),
+                Err(e) if e.code == "client_exists" && still() => {
+                    name_error.set(Some(e.message));
+                    focus_id("machine-name");
+                }
                 Err(e) => error.set(Some(e.message)),
             }
             busy.set(false);
@@ -729,7 +771,15 @@ fn Machines(admin: bool) -> impl IntoView {
     let remove = move |n: String| {
         run(error, busy, async move {
             api::delete(&format!("/ui/api/machines/{n}")).await?;
+            // Its login code no longer works.
+            login_code.update(|c| {
+                if c.as_ref().is_some_and(|(m, _)| *m == n) {
+                    *c = None;
+                }
+            });
             load();
+            // The row is gone: the focus goes to adding one.
+            focus_id("machine-name");
             Ok(())
         });
     };
@@ -741,7 +791,15 @@ fn Machines(admin: bool) -> impl IntoView {
         let Some(old) = editing.get_untracked() else { return };
         let body = json!({ "name": new_name.get_untracked().trim() });
         run(error, busy, async move {
-            api::patch::<Value>(&format!("/ui/api/machines/{old}"), &body).await?;
+            let v = api::patch::<Value>(&format!("/ui/api/machines/{old}"), &body).await?;
+            // A shown login code follows its machine's new name.
+            if let Some(new) = v["name"].as_str() {
+                login_code.update(|c| {
+                    if let Some((m, _)) = c.as_mut().filter(|(m, _)| *m == old) {
+                        *m = new.to_string();
+                    }
+                });
+            }
             editing.set(None);
             load();
             Ok(())
@@ -771,9 +829,11 @@ fn Machines(admin: bool) -> impl IntoView {
                     <div class="row row-fill">
                         <label class="sr-only" for="machine-name">"Name"</label>
                         <input id="machine-name" class="input grow" placeholder="name, e.g. ci-runner" required
-                            prop:value=move || name.get() on:input=move |ev| name.set(value(&ev)) />
+                            aria-describedby="machine-name-error" aria-invalid=move || name_error.get().map(|_| "true")
+                            prop:value=move || name.get() on:input=move |ev| { name_error.set(None); name.set(value(&ev)) } />
                         <button class="btn" type="submit" disabled=move || busy.get()>"Create code"</button>
                     </div>
+                    <p id="machine-name-error" class="field-error" aria-live="polite">{move || name_error.get()}</p>
                     <Show when=move || needs_code.get()>
                         <div class="field">
                             <label for="machine-code">"Code from your authenticator app"</label>
@@ -781,7 +841,7 @@ fn Machines(admin: bool) -> impl IntoView {
                                 prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
                         </div>
                     </Show>
-                    {move || login_code.get().map(|c| view! {
+                    {move || login_code.get().map(|(_, c)| view! {
                         <p class="small">"On that machine run " <code>"tunnel login"</code> " and paste:"</p>
                         <Copy value=Signal::derive(move || c.clone()) label="Login code" />
                     })}
@@ -802,6 +862,7 @@ fn Machines(admin: bool) -> impl IntoView {
                             let is_editing = move || editing.get().as_deref() == Some(n_row.as_str());
                             let shown_name = m.name.clone();
                             let (rename_label, remove_label) = (format!("Rename {}", m.name), format!("Remove {}", m.name));
+                            let remove_question = format!("Remove {}? Its login and tunnels stop.", m.name);
                             view! { <tr>
                                 <td class="cell-main">{move || if is_editing() {
                                     view! {
@@ -823,7 +884,7 @@ fn Machines(admin: bool) -> impl IntoView {
                                 <td data-label="Tunnels">{m.tunnels}</td>
                                 <td class="actions">
                                     <button class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| { new_name.set(n_edit.clone()); editing.set(Some(n_edit.clone())); }>"Rename"</button>
-                                    <button class="btn btn-destructive btn-sm" aria-label=remove_label on:click=move |_| remove(n.clone())>"Remove"</button>
+                                    <button class="btn btn-destructive btn-sm" aria-label=remove_label data-confirm=remove_question on:click=move |_| remove(n.clone())>"Remove"</button>
                                 </td>
                             </tr> }
                         }).collect_view()}
@@ -1029,20 +1090,32 @@ fn Account() -> impl IntoView {
             Ok(())
         });
     };
+    // A setup request in flight: its own flag (other Account calls clear
+    // `busy`), so a late second answer can never reopen setup after Not now.
+    let starting = RwSignal::new(false);
     let start_totp = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
+        if starting.get_untracked() {
+            return;
+        }
         let body = json!({ "password": totp_pw.get() });
         notice.set(None);
-        run(error, busy, async move {
+        run(error, starting, async move {
             setup.set(Some(api::post::<Value>("/ui/api/account/totp/setup", &body).await?));
             totp_pw.set(String::new());
             Ok(())
         });
     };
+    // Turning two-factor on, in flight: its own flag (not `busy`, which every
+    // Account call clears), so Turn on and Not now wait for this answer.
+    let enabling = RwSignal::new(false);
     let confirm_totp = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
+        if enabling.get_untracked() {
+            return;
+        }
         let body = json!({ "code": totp_code.get() });
-        run(error, busy, async move {
+        run(error, enabling, async move {
             let v = api::post::<Value>("/ui/api/account/totp/enable", &body).await?;
             recovery.set(serde_json::from_value(v["recovery_codes"].clone()).ok());
             setup.set(None);
@@ -1167,7 +1240,17 @@ fn Account() -> impl IntoView {
                                             <input id="totp-code" class="input" autocomplete="one-time-code" required
                                                 prop:value=move || totp_code.get() on:input=move |ev| totp_code.set(value(&ev)) />
                                         </div>
-                                        <button class="btn" type="submit">"Turn on"</button>
+                                        <div class="row">
+                                            <button class="btn" type="submit" disabled=move || enabling.get()>"Turn on"</button>
+                                            // Not while Turn on is on its way: it could still turn it on.
+                                            <button class="btn btn-ghost" type="button" disabled=move || enabling.get() on:click=move |_| {
+                                                setup.set(None);
+                                                totp_code.set(String::new());
+                                                error.set(None);
+                                                // Its form is gone: the focus goes to the one drawn instead.
+                                                set_timeout(|| _ = focus_id("totp-pw"), std::time::Duration::ZERO);
+                                            }>"Not now"</button>
+                                        </div>
                                     </form>
                                 }.into_any()
                             }
@@ -1547,17 +1630,19 @@ fn Users(me: User) -> impl IntoView {
                             (None, true) => format!("open, expires {}", relative(i.expires_at)),
                             (None, false) => "expired".into(),
                         };
+                        let link = if i.kind == "account_reset" {
+                            format!("sign-in reset for {}", i.user.clone().unwrap_or_default())
+                        } else {
+                            format!("{} invite", i.role)
+                        };
+                        let what = i.email.as_ref().map_or_else(|| link.clone(), |e| format!("{link} for {e}"));
                         view! { <tr>
-                            <td class="cell-main">{if i.kind == "account_reset" {
-                                format!("sign-in reset for {}", i.user.clone().unwrap_or_default())
-                            } else {
-                                format!("{} invite", i.role)
-                            }}{i.email.clone().map(|e| view! { <div class="muted small break">{format!("for {e}")}</div> })}</td>
+                            <td class="cell-main">{link}{i.email.clone().map(|e| view! { <div class="muted small break">{format!("for {e}")}</div> })}</td>
                             <td data-label="By">{i.created_by.clone().unwrap_or_else(|| "—".into())}</td>
                             <td data-label="Created">{relative(i.created_at)}</td>
                             <td data-label="Status">{status}</td>
                             <td class="actions">{revocable.then(|| view! {
-                                <button class="btn btn-outline btn-sm" on:click=move |_| revoke_invite(id.clone())>"Revoke"</button>
+                                <button class="btn btn-outline btn-sm" aria-label=format!("Revoke {what}") data-confirm=format!("Revoke {what}? The link stops working.") on:click=move |_| revoke_invite(id.clone())>"Revoke"</button>
                             })}</td>
                         </tr> }
                     }).collect_view()}
@@ -1846,6 +1931,107 @@ mod tests {
         {
             assert!(!text.contains(concat!("role=", "\"heading\"")), "{file}");
         }
+    }
+
+    /// This file without its tests, so a check cannot match its own text.
+    fn source() -> &'static str {
+        include_str!("pages.rs").split("#[cfg(test)]").next().unwrap()
+    }
+
+    #[test]
+    fn signing_in_from_the_machine_approval_link_says_why() {
+        assert!(sign_in_purpose("/device").is_some_and(|p| p.contains("approve the machine") && p.contains("code")));
+        for path in ["/", "/tunnels", "/account", "/devices"] {
+            assert_eq!(sign_in_purpose(path), None, "{path}");
+        }
+        // Untracked: a new path draws the page anew.
+        assert!(source().contains("sign_in_purpose(&c.path.get_untracked())"), "the sign-in card shows it");
+    }
+
+    #[test]
+    fn the_invite_heading_never_claims_a_role_it_does_not_know() {
+        assert_eq!(invite_title(None, false), "Opening your link");
+        assert_eq!(invite_title(None, true), "Link not valid");
+        assert_eq!(invite_title(Some(("invite", Some("admin"))), false), "Join as admin");
+        assert_eq!(invite_title(Some(("invite", None)), false), "Join as member");
+        assert_eq!(invite_title(Some(("owner_setup", None)), false), "Create the owner account");
+        assert_eq!(invite_title(Some(("password_reset", None)), false), "Set a new password");
+        assert_eq!(invite_title(Some(("email_verify", None)), false), "Confirm your email address");
+    }
+
+    /// Two-factor setup can be left without turning it on.
+    #[test]
+    fn two_factor_setup_has_a_way_back() {
+        let src = source();
+        let setup = &src[src.find(r#""Turn on""#).unwrap()..];
+        let not_now = &setup[..setup.find(r#""Not now""#).expect("a Not now button")];
+        assert!(not_now.contains("setup.set(None)") && not_now.contains("totp_code.set(String::new())"));
+        assert!(not_now.contains("disabled=move || enabling.get()"), "not while Turn on is on its way");
+        assert!(src.contains(r#"type="submit" disabled=move || enabling.get()>"Turn on""#));
+        // One setup request at a time: a late second answer would reopen it.
+        let start = &src[src.find("let start_totp").unwrap()..src.find("let confirm_totp").unwrap()];
+        assert!(start.contains("if starting.get_untracked() {\n            return;"), "{start}");
+        assert!(start.contains("run(error, starting, async move {"), "its own in-flight flag");
+        assert!(not_now.contains(r#"focus_id("totp-pw")"#), "the focus is not dropped");
+        assert!(src.contains("run(error, enabling, async move {"), "its own in-flight flag");
+    }
+
+    #[test]
+    fn a_new_machines_code_belongs_to_its_name() {
+        let v = json!({ "name": "ci-runner", "login_code": "tnlc_x", "expires_at": 1 });
+        assert_eq!(created_login(&v), Some(("ci-runner".into(), "tnlc_x".into())));
+        assert_eq!(created_login(&json!({ "name": "ci" })), None);
+    }
+
+    /// Machines: a create clears the name, a taken name is flagged at the
+    /// field, and removing the machine hides its code and keeps the focus.
+    #[test]
+    fn the_machines_form_forgets_what_is_done() {
+        let src = source();
+        let machines = &src[src.find("fn Machines").unwrap()..src.find("fn Device").unwrap()];
+        // Answers are about the name sent; one typed since is left alone.
+        assert!(machines.contains("let still = move || name.get_untracked() == sent;"));
+        let ok = &machines[machines.find("login_code.set(created_login(&v))").unwrap()..];
+        let ok = &ok[..ok.find("Err(e)").unwrap()];
+        assert!(ok.contains("if still() {") && ok.contains("name.set(String::new())"), "{ok}");
+        assert!(machines.contains(r#"Err(e) if e.code == "client_exists" && still() => {"#));
+        assert!(machines.contains(r#"aria-describedby="machine-name-error" aria-invalid=move || name_error.get()"#));
+        let remove = &machines[machines.find("let remove").unwrap()..machines.find("let editing").unwrap()];
+        assert!(
+            remove.contains("*m == n")
+                && remove.contains("*c = None")
+                && remove.contains(r#"focus_id("machine-name")"#)
+        );
+        // A rename carries a shown code over to the new name.
+        let rename = &machines[machines.find("let save_name").unwrap()..];
+        assert!(rename.contains("c.as_mut().filter(|(m, _)| *m == old)") && rename.contains("*m = new.to_string()"));
+    }
+
+    /// Every one-click destructive row action asks first: `data-confirm`
+    /// holds the question, static/shell.js asks it before the click handler.
+    #[test]
+    fn destructive_row_actions_ask_first() {
+        let src = source();
+        for (label, action) in [
+            ("Delete", "delete(id2.clone())"),
+            ("Revoke", "revoke(lid.clone())"),
+            ("Remove", "remove(n.clone())"),
+            ("Revoke", "revoke_invite(id.clone())"),
+        ] {
+            let at = src.find(&format!("on:click=move |_| {action}>\"{label}\"")).unwrap_or_else(|| panic!("{action}"));
+            let start = src[..at].rfind("<button").unwrap();
+            assert!(src[start..at].contains(" data-confirm="), "{action} asks first");
+            assert_eq!(src.matches(action).count(), 1, "{action} is reachable only from that button");
+        }
+        let shell = include_str!("../static/shell.js");
+        // A click (mouse, Enter and Space all send one), on window in the
+        // capture phase, from any element inside the button.
+        assert!(shell.contains(
+            "addEventListener(\n    \"click\",\n    (ev) => {\n      const b = ev.target.closest?.(\"[data-confirm]\");"
+        ));
+        let ask = &shell[shell.find(r#"closest?.("[data-confirm]")"#).expect("shell.js asks")..];
+        let ask = &ask[..ask.find("    true,\n  );").expect("in the capture phase, ahead of the UI's handler")];
+        assert!(ask.contains("!confirm(b.dataset.confirm)") && ask.contains("ev.stopImmediatePropagation()"), "{ask}");
     }
 
     fn row(id: &str, role: &str, traffic: u64) -> UserRow {

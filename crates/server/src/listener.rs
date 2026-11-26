@@ -1263,7 +1263,38 @@ zone = "example.com"
             let body = body_text(again).await;
             match mode {
                 AccessMode::Password => assert!(body.contains(r#"action="/__login""#), "{body}"),
-                _ => assert!(body.contains("link you were given"), "{body}"),
+                // Says the link cannot be used and what to do, never which
+                // reason: a used link reads exactly as an unknown one.
+                _ => {
+                    assert!(body.contains("Link not valid") && body.contains("Ask whoever shared"), "{body}");
+                    assert!(!body.contains("link you were given"), "{body}");
+                    let unknown = path.rsplit_once('/').unwrap().0.to_string() + "/tnacc_unknown";
+                    let unknown = request(&state, "previews.example.com", &unknown, Method::GET, &document).await;
+                    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+                    assert!(!unknown.headers().contains_key(header::SET_COOKIE));
+                    assert_eq!(body_text(unknown).await, body, "used and unknown links look the same");
+                    // An expired, never used link too.
+                    let late = format!("{ACCESS_TOKEN_PREFIX}late-token");
+                    state
+                        .db
+                        .create_access_link(crate::db::NewAccessLink {
+                            id: "al_late".into(),
+                            tunnel_id: tunnel.id.clone(),
+                            token_hash: crate::tokens::hash_token(&late),
+                            single_use: true,
+                            label: None,
+                            owner_port: None,
+                            session_ttl_s: 3600,
+                            expires_at: crate::tokens::now() - 1,
+                        })
+                        .await
+                        .unwrap();
+                    let late = path.rsplit_once('/').unwrap().0.to_string() + "/" + &late;
+                    let late = request(&state, "previews.example.com", &late, Method::GET, &document).await;
+                    assert_eq!(late.status(), StatusCode::UNAUTHORIZED);
+                    assert!(!late.headers().contains_key(header::SET_COOKIE));
+                    assert_eq!(body_text(late).await, body, "expired and used links look the same");
+                }
             }
             assert_eq!(received.load(Ordering::SeqCst), 1);
         }

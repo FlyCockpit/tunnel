@@ -63,6 +63,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   is signed in, Account, the admin pages (Users, Server), the theme (Light,
   Dark, System) and Sign out, usable from the keyboard and with a screen
   reader. Signed out, a theme button opens the theme choices.
+- Every dead end in the web UI and on the preview gate says what to do next:
+  errors read as sentences, a wrong password points to the reset, a
+  signed-out machine approval says why it asks for a sign-in, an unusable
+  invite or access link says so and whom to ask, and the preview sign-in
+  form names the preview it opens. Two-factor setup can be left with
+  Not now, and deleting a tunnel, revoking a link or an invite and removing
+  a machine ask first. On Machines, a new machine's name clears once its
+  code is made, a taken name is flagged at the field, and removing that
+  machine hides its code.
 - A reload of the web UI paints its own header, nav and footer at once (from
   a non-secret "last signed in as" hint), with only the content as a
   placeholder; the Users page's limits editor has one row per limit with the

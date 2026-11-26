@@ -61,6 +61,30 @@ async fn invited(
     sign_up(state, &mail.token().unwrap(), name, ip).await
 }
 
+/// A wrong password on the sign-in page says what to do if it is forgotten:
+/// the mailed reset when there is mail, else who can reset it.
+#[tokio::test]
+async fn a_wrong_password_names_the_way_back_in() {
+    let (mail, _server) = mail_state().await;
+    let off = state();
+    for (state, mailed) in [(&mail, true), (&off, false)] {
+        let _owner = owner(state).await;
+        let r = sign_in(state, "olivia", "not-her-password", 9).await;
+        assert_eq!(
+            (r.status, r.body["error"]["code"].clone()),
+            (StatusCode::UNAUTHORIZED, json!("invalid_credentials"))
+        );
+        let message = r.body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("wrong username or password. Forgot your password?"), "{message}");
+        assert_eq!(message.contains("Forgot password? below"), mailed, "{message}");
+        assert_eq!(message.contains("Only if you are the owner: run tunnel-server admin link"), !mailed, "{message}");
+        assert!(message.contains("sk an admin of this server to reset your sign-in"), "{message}");
+        // An unknown user gets the same answer.
+        let unknown = sign_in(state, "nobody", "not-her-password", 10).await;
+        assert_eq!(unknown.body["error"]["message"], r.body["error"]["message"]);
+    }
+}
+
 #[tokio::test]
 async fn with_mail_off_there_is_no_email_anything() {
     let state = state();

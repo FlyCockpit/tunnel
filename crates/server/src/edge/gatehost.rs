@@ -116,7 +116,7 @@ async fn access(state: &Arc<AppState>, peer: SocketAddr, rest: &str, req: &Reque
     let resp = gate::redeem(state, peer.ip(), id, named_port, token, &cookies.values, &location).await;
     if resp.status() == StatusCode::UNAUTHORIZED {
         // A used or expired link still leads somewhere useful when the tunnel
-        // has another way in. Unknown and ended tunnels keep the generic 401.
+        // has another way in. Unknown and ended tunnels keep the generic "link not valid" page.
         let mode = live_tunnel(state, id).await.map(|t| t.access.mode);
         return match (mode, port) {
             (Some(AccessMode::Password), Some(p)) => login_form(state, StatusCode::UNAUTHORIZED, p, id, "/", None),

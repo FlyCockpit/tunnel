@@ -126,6 +126,28 @@ mod tests {
         }
     }
 
+    /// build.sh drops whole-line `//` comments from the first-load scripts
+    /// (budget); that is safe only while no such line sits inside a
+    /// template literal or a string that spans lines.
+    #[test]
+    fn the_first_load_scripts_ship_without_their_comment_lines() {
+        let build = include_str!("../build.sh");
+        assert!(build.contains("strip_comments() { sed '/^[[:space:]]*\\/\\//d'; }"));
+        assert!(build.contains("strip_comments < static/theme.js > \"$out/theme.js\""));
+        assert!(build.contains("static/shell.js | strip_comments > \"$out/shell.js\""));
+        for (name, js) in [("shell.js", SHELL_JS), ("theme.js", include_str!("../static/theme.js"))] {
+            let mut ticks = 0;
+            for line in js.lines() {
+                if line.trim_start().starts_with("//") {
+                    assert_eq!(ticks % 2, 0, "{name}: a comment line inside a template literal: {line}");
+                } else {
+                    ticks += line.matches('`').count();
+                }
+            }
+            assert_eq!(ticks % 2, 0, "{name}");
+        }
+    }
+
     #[test]
     fn the_menu_loads_on_first_use_outside_the_first_load_budget() {
         let build = include_str!("../build.sh");

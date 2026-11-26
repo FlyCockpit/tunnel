@@ -125,6 +125,18 @@
     ev.preventDefault();
     want(button, (m) => m.open(who, ev.key === "ArrowDown"));
   });
+  // data-confirm (src/pages.rs): ask before the UI's click handler; Cancel stops it.
+  addEventListener(
+    "click",
+    (ev) => {
+      const b = ev.target.closest?.("[data-confirm]");
+      if (b && !confirm(b.dataset.confirm)) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+      }
+    },
+    true,
+  );
   globalThis.tunnelShell = {
     // Who is signed in (src/boot.rs): role and name are kept for the next
     // first paint, the menu also shows the email.

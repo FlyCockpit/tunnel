@@ -370,7 +370,7 @@ pub async fn redeem(
     }
     if !token.starts_with(ACCESS_TOKEN_PREFIX) || token.len() > 256 {
         state.metrics.access_failed();
-        return pages::unauthorized();
+        return pages::link_not_valid();
     }
     let outcome = match state
         .db
@@ -393,7 +393,7 @@ pub async fn redeem(
     let (session_id, expires_at) = match outcome {
         Redemption::Invalid => {
             state.metrics.access_failed();
-            return pages::unauthorized();
+            return pages::link_not_valid();
         }
         Redemption::Granted { session_id, expires_at } => (session_id, expires_at),
     };
@@ -408,6 +408,9 @@ pub async fn redeem(
         .body(empty())
         .expect("valid response")
 }
+
+/// A password form that did not match: what to do next, never which field was wrong.
+const WRONG_LOGIN: &str = "Wrong username or password. Check both and try again, or ask whoever shared this preview.";
 
 /// Largest login form body accepted.
 const LOGIN_BODY_LIMIT: usize = 8 * 1024;
@@ -480,7 +483,7 @@ pub async fn login(
         crate::password::Verdict::Match => {}
         crate::password::Verdict::NoMatch => {
             state.metrics.access_failed();
-            return LoginOutcome::Retry(StatusCode::UNAUTHORIZED, "Wrong username or password.");
+            return LoginOutcome::Retry(StatusCode::UNAUTHORIZED, WRONG_LOGIN);
         }
         crate::password::Verdict::Busy => {
             return LoginOutcome::Retry(StatusCode::SERVICE_UNAVAILABLE, "The server is busy. Try again in a moment.");
@@ -492,7 +495,7 @@ pub async fn login(
     let (session_id, expires_at) = match granted {
         Ok(Some(Redemption::Granted { session_id, expires_at })) => (session_id, expires_at),
         // The password or mode changed while we were checking.
-        Ok(_) => return LoginOutcome::Retry(StatusCode::UNAUTHORIZED, "Wrong username or password."),
+        Ok(_) => return LoginOutcome::Retry(StatusCode::UNAUTHORIZED, WRONG_LOGIN),
         Err(e) => {
             tracing::error!(tunnel = %tunnel.id, error = %e, "password login failed");
             return LoginOutcome::Internal;

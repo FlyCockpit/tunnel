@@ -30,6 +30,19 @@ pub(super) fn bad_credentials() -> ApiError {
     ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", "wrong username or password")
 }
 
+/// A refused sign-in on the sign-in page, with what to do about a forgotten
+/// password: the mailed reset (its button is under the form) when the server
+/// sends mail, else whoever can reset it.
+pub(super) fn bad_sign_in(state: &AppState) -> ApiError {
+    let next = if state.ui.mail.is_some() {
+        "Forgot your password? Choose Forgot password? below, or ask an admin of this server to reset your sign-in."
+    } else {
+        "Forgot your password? Ask an admin of this server to reset your sign-in. \
+         Only if you are the owner: run tunnel-server admin link on the server."
+    };
+    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", format!("wrong username or password. {next}"))
+}
+
 pub(super) fn keys(state: &AppState) -> ApiResult<&crate::seal::Keys> {
     state.ui.keys.as_ref().ok_or_else(|| ApiError::not_found("route"))
 }
@@ -139,5 +152,9 @@ pub(super) fn invite_token_hash(token: &str) -> ApiResult<String> {
 }
 
 pub(super) fn invalid_invite() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "invalid_invite", "this link is invalid, used or expired; ask for a new one")
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "invalid_invite",
+        "this link is invalid, used or expired; ask whoever sent it for a new one",
+    )
 }

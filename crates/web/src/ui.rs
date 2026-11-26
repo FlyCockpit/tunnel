@@ -89,7 +89,8 @@ pub fn Copy(#[prop(into)] value: Signal<String>, #[prop(optional)] label: &'stat
     view! {
         <div class="copy" aria-label=label>
             <code class="secret">{move || value.get()}</code>
-            <button class="btn btn-ghost btn-sm" on:click=copy>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
+            // Not a submit: a Copy inside a form (Machines) must not send it.
+            <button class="btn btn-ghost btn-sm" type="button" on:click=copy>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
         </div>
     }
 }
@@ -267,6 +268,14 @@ pub fn value(ev: &leptos::ev::Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Copy sits inside forms (Machines' login code): it must not submit them.
+    #[test]
+    fn copy_never_submits_its_form() {
+        let src = include_str!("ui.rs").split("#[cfg(test)]").next().unwrap();
+        let copy = &src[src.find("pub fn Copy").unwrap()..src.find("pub fn ErrorBox").unwrap()];
+        assert!(copy.contains(r#"<button class="btn btn-ghost btn-sm" type="button" on:click=copy>"#), "{copy}");
+    }
 
     #[test]
     fn the_home_page_marks_tunnels_as_current() {

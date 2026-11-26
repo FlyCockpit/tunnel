@@ -41,13 +41,18 @@ cp "$out/app.js" "dist/assets/$js"
 printf 'import init from "/assets/%s";\ninit({ module_or_path: "/assets/%s" });\n' "$js" "$wasm" > "$out/boot.js"
 boot="boot-$(hash "$out/boot.js").js"
 cp "$out/boot.js" "dist/assets/$boot"
-theme="theme-$(hash static/theme.js).js"
-cp static/theme.js "dist/assets/$theme"
+# Whole-line // comments in theme.js and shell.js are for readers of
+# static/: no browser needs them, and they counted in the first-load budget.
+# (No string or template literal in either file spans lines.)
+strip_comments() { sed '/^[[:space:]]*\/\//d'; }
+strip_comments < static/theme.js > "$out/theme.js"
+theme="theme-$(hash "$out/theme.js").js"
+cp "$out/theme.js" "dist/assets/$theme"
 # The user menu loads on first use (shell.js imports it), so it is not part
 # of the first load counted below; shell.js gets its hashed name.
 menu="menu-$(hash static/menu.js).js"
 cp static/menu.js "dist/assets/$menu"
-sed "s#\"/assets/menu.js\"#\"/assets/$menu\"#" static/shell.js > "$out/shell.js"
+sed "s#\"/assets/menu.js\"#\"/assets/$menu\"#" static/shell.js | strip_comments > "$out/shell.js"
 grep -q "\"/assets/$menu\"" "$out/shell.js" || { echo "build.sh: static/shell.js does not import /assets/menu.js" >&2; exit 1; }
 shell="shell-$(hash "$out/shell.js").js"
 cp "$out/shell.js" "dist/assets/$shell"
