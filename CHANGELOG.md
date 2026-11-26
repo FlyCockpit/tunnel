@@ -59,6 +59,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   sign-in).
 - The web UI works on phones and tablets: a two-row header, tables that
   become one card per row, and 44 px touch targets.
+- One user menu in the web UI's header, as in the other FlyCockpit apps: who
+  is signed in, Account, the admin pages (Users, Server), the theme (Light,
+  Dark, System) and Sign out, usable from the keyboard and with a screen
+  reader. Signed out, a theme button opens the theme choices.
 - A reload of the web UI paints its own header, nav and footer at once (from
   a non-secret "last signed in as" hint), with only the content as a
   placeholder; the Users page's limits editor has one row per limit with the

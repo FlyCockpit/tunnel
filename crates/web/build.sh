@@ -43,8 +43,14 @@ boot="boot-$(hash "$out/boot.js").js"
 cp "$out/boot.js" "dist/assets/$boot"
 theme="theme-$(hash static/theme.js).js"
 cp static/theme.js "dist/assets/$theme"
-shell="shell-$(hash static/shell.js).js"
-cp static/shell.js "dist/assets/$shell"
+# The user menu loads on first use (shell.js imports it), so it is not part
+# of the first load counted below; shell.js gets its hashed name.
+menu="menu-$(hash static/menu.js).js"
+cp static/menu.js "dist/assets/$menu"
+sed "s#\"/assets/menu.js\"#\"/assets/$menu\"#" static/shell.js > "$out/shell.js"
+grep -q "\"/assets/$menu\"" "$out/shell.js" || { echo "build.sh: static/shell.js does not import /assets/menu.js" >&2; exit 1; }
+shell="shell-$(hash "$out/shell.js").js"
+cp "$out/shell.js" "dist/assets/$shell"
 # Until theme.js has set .light or .dark (it is still loading, or scripts are
 # off), follow the system: the .dark token blocks again, under the media query.
 {

@@ -1,10 +1,9 @@
 //! Shell and small components (ported from the template's header, page
-//! shell, empty and error states, copy field and mode toggle).
+//! shell, empty and error states and copy field).
 
 use leptos::prelude::*;
 
 use crate::api::ApiError;
-use crate::theme;
 use crate::{ctx, navigate, refresh_session};
 
 /// `<a>` that navigates without a reload.
@@ -33,36 +32,16 @@ fn is_current(path: &str, href: &str) -> bool {
     path == href || path.strip_prefix(href).is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// The header's page links: `(href, text, admins only)`. static/shell.html
-/// has the same links for the first paint (checked in src/boot.rs).
-pub const NAV: [(&str, &str, bool); 5] = [
-    ("/tunnels", "Tunnels", false),
-    ("/machines", "Machines", false),
-    ("/cli", "Get the CLI", false),
-    ("/admin/users", "Users", true),
-    ("/admin/status", "Server", true),
-];
-
-fn nav_links(admin: bool) -> impl IntoView {
-    NAV.iter()
-        .filter(move |(_, _, only_admins)| *only_admins == admin)
-        .map(|(href, text, _)| view! { <A href=*href>{*text}</A> })
-        .collect_view()
-}
+/// The header's page links: `(href, text)`. static/shell.html has the same
+/// links for the first paint (checked in src/boot.rs). The admin pages are
+/// in the user menu (static/menu.js).
+pub const NAV: [(&str, &str); 3] = [("/tunnels", "Tunnels"), ("/machines", "Machines"), ("/cli", "Get the CLI")];
 
 #[component]
 pub fn Shell(children: ChildrenFn) -> impl IntoView {
     let c = ctx();
     let user = move || c.session.get().and_then(|s| s.user);
     let signed_in = move || user().is_some();
-    let is_admin = move || user().is_some_and(|u| u.is_admin());
-    let sign_out = move |_| {
-        leptos::task::spawn_local(async move {
-            let _ = crate::api::post::<serde_json::Value>("/ui/api/logout", &serde_json::json!({})).await;
-            crate::refresh_session().await;
-            navigate("/");
-        });
-    };
     let abuse = move || c.session.get().and_then(|s| s.server.abuse_contact);
     let version = move || c.session.get().map(|s| s.server.version).unwrap_or_default();
     view! {
@@ -81,45 +60,19 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
             </a>
             <Show when=signed_in>
                 <nav class="nav" aria-label="Main">
-                    {nav_links(false)}
-                    <Show when=is_admin>{nav_links(true)}</Show>
+                    {NAV.map(|(href, text)| view! { <A href=href>{text}</A> })}
                 </nav>
             </Show>
             <div class="spacer"></div>
-            <ThemeToggle />
-            <Show when=signed_in>
-                <A href="/account" class="account-link"
-                    title=Signal::derive(move || format!("Account: {}", user().map(|u| u.username).unwrap_or_default()))>
-                    {move || user().map(|u| u.username).unwrap_or_default()}
-                </A>
-                <button class="btn btn-ghost btn-sm" on:click=sign_out>"Sign out"</button>
-            </Show>
+            // The user menu: static/shell.js draws its button here and
+            // static/menu.js the menu (src/boot.rs hands them the session).
+            <div class="menu-wrap" id="menu-wrap"></div>
         </header>
         <main class="main" id="main-content">{children()}</main>
         <footer class="footer">
             "Tunnel " {version}
             {move || abuse().map(|a| view! { " · Report abuse: " {a} })}
         </footer>
-    }
-}
-
-#[component]
-fn ThemeToggle() -> impl IntoView {
-    let choice = RwSignal::new(theme::choice());
-    let next = move |_| {
-        let t = match choice.get().as_str() {
-            "system" => "light",
-            "light" => "dark",
-            _ => "system",
-        }
-        .to_string();
-        theme::set(&t);
-        choice.set(t);
-    };
-    view! {
-        <button class="btn btn-ghost btn-sm" on:click=next title="Theme: system, light or dark">
-            {move || match choice.get().as_str() { "light" => "Light", "dark" => "Dark", _ => "Auto" }}
-        </button>
     }
 }
 

@@ -61,7 +61,7 @@ export function judge(label, { fresh, frames, final, shifts, truncated }, expect
   const first = painted[0];
   if (final.skeleton || final.loading) return [`${label}: the page never finished loading`];
   if (!final.header || !final.main) return [`${label}: the loaded page has no ${final.header ? "<main>" : "header"}`];
-  if (!final.nav.length || !final.account) return [`${label}: the loaded page has no nav or account link (not signed in?)`];
+  if (!final.nav.length || !final.account) return [`${label}: the loaded page has no nav or user menu button (not signed in?)`];
   const bad = [];
   const at = (f) => `${Math.round(f.t)}ms`;
   if (!first.header) bad.push(`${label}: the first painted frame has no header`);
@@ -79,7 +79,7 @@ export function judge(label, { fresh, frames, final, shifts, truncated }, expect
   const current = painted.find((f) => f.header && JSON.stringify(f.current) !== JSON.stringify(final.current));
   if (current) bad.push(`${label}: the current link is ${JSON.stringify(current.current)} at ${at(current)}, ${JSON.stringify(final.current)} loaded`);
   const account = painted.find((f) => f.header && moved(f.account, final.account));
-  if (account) bad.push(`${label}: the account link is ${account.account} at ${at(account)}, ${final.account} loaded`);
+  if (account) bad.push(`${label}: the user menu button is ${account.account} at ${at(account)}, ${final.account} loaded`);
   const mainTop = painted.find((f) => f.main && Math.abs(f.main[1] - final.main[1]) > 1);
   if (mainTop) bad.push(`${label}: the content starts at ${mainTop.main[1]}px at ${at(mainTop)}, ${final.main[1]}px loaded`);
   const loadedAt = painted.findIndex((f) => !f.skeleton && !f.loading);

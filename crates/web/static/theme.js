@@ -1,7 +1,7 @@
 // The one place that picks the theme: the user's choice ("light" or "dark",
 // stored under "tunnel-theme"), else the system's. index.html loads this as a
 // blocking script before the stylesheet, so the first paint is already right;
-// the wasm UI calls tunnelTheme.choice/set (src/theme.rs) for the header toggle.
+// the user menu (static/menu.js) calls tunnelTheme.choice/set for its theme choices.
 // The backgrounds are --background in style/tokens.css (src/theme.rs tests).
 (() => {
   const key = "tunnel-theme";

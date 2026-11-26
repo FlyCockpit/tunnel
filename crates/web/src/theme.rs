@@ -1,27 +1,7 @@
 //! The light/dark theme. `static/theme.js` owns it (storage key, the user's
 //! choice else the system's, following live system changes): index.html runs
-//! it before the first paint, and the header toggle calls into it here.
-
-use wasm_bindgen::prelude::{JsValue, wasm_bindgen};
-
-#[wasm_bindgen(js_namespace = tunnelTheme)]
-extern "C" {
-    #[wasm_bindgen(catch, js_name = choice)]
-    fn js_choice() -> Result<String, JsValue>;
-    #[wasm_bindgen(catch, js_name = set)]
-    fn js_set(theme: &str) -> Result<(), JsValue>;
-}
-
-/// The user's choice: "light", "dark" or "system" (also when theme.js did
-/// not load; the CSS then follows the system on its own).
-pub fn choice() -> String {
-    js_choice().unwrap_or_else(|_| "system".into())
-}
-
-/// Stores a choice and applies it.
-pub fn set(theme: &str) {
-    let _ = js_set(theme);
-}
+//! it before the first paint, and the user menu's theme choices
+//! (`static/menu.js`) call into it. Here: checks on the style sheets.
 
 #[cfg(test)]
 mod tests {
@@ -126,6 +106,33 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 7, "found only {checked} state rules in app.css");
+    }
+
+    /// The user menu (static/menu.js) is a card; its items get the muted
+    /// background on hover and focus.
+    #[test]
+    fn the_user_menu_text_is_readable_in_both_themes() {
+        for rule in [".menu {\n", ".menu-item-danger { color: var(--destructive); }", ".menu-label {", ".menu-who {"] {
+            assert!(APP.contains(rule), "{rule}");
+        }
+        assert!(APP.contains("background: var(--card); color: var(--card-foreground);"));
+        assert!(APP.contains(".menu-item:hover, .menu-item:focus { background: var(--muted); outline: none; }"));
+        for (theme, tokens) in ["light", "dark"].iter().zip(tokens()) {
+            for (text, surface, min) in [
+                ("foreground", "card", 4.5),
+                ("foreground", "muted", 4.5),
+                ("destructive", "card", 4.5),
+                ("destructive", "muted", 4.5),
+                ("muted-foreground", "card", 4.5),
+                // The separators and the menu's edge.
+                ("border", "card", 1.1),
+            ] {
+                let (fg, alpha) = resolve(&tokens, &format!("var(--{text})"));
+                let under = resolve(&tokens, &format!("var(--{surface})")).0;
+                let ratio = contrast(over((fg, alpha), under), under);
+                assert!(ratio >= min, "--{text} on --{surface} in {theme}: {ratio:.2}:1");
+            }
+        }
     }
 
     /// Type sizes are rem, so they follow the root's viewport scale, and none

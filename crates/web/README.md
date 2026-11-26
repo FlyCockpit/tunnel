@@ -44,11 +44,13 @@ Two rules decide the cases the table does not list:
 - **Fix a miss in the container**: its padding, or `--table-inset`. Never
   nudge one item with its own margin.
 
-Unlike the template, this UI has no dialogs, sheets, dropdown menus or side
-navigation, so their lines do not apply here. The account is a header link,
-not a menu. If one is added, it takes the template's lines: an account menu at
-least 224px wide (`min-w-56`) with the email truncated (full address in
-`title`), and close buttons with a 44px target on mobile.
+Unlike the template, this UI has no dialogs, sheets or side navigation, so
+their lines do not apply here. Its one dropdown is the header's user menu
+(`static/shell.js` draws its button, `static/menu.js` the menu, loaded on
+first use so it stays out of the first load's budget), on the template's lines: at least 224px wide (14rem, the
+template's `min-w-56`), its trailing edge on its button's (the header's
+trailing line), the name and email truncated (full text in `title`), and
+44px items on touch screens.
 
 ## Forms
 
@@ -64,7 +66,7 @@ dialog-fits check; anything longer is a page.
 ## First paint
 
 `index.html` holds a copy of the shell (`static/shell.html`: header, nav,
-account link, footer, and a content placeholder shaped like a page or a
+user menu button (the theme button when signed out), footer, and a content placeholder shaped like a page or a
 narrow card), so a reload never shows a page without its frame while the
 wasm loads. `static/shell.js` runs before the first paint and picks what the
 copy shows from the `tunnel-shell` hint (`<role>:<username>`, nothing
@@ -82,7 +84,7 @@ Shell loading check there: `[data-app-header]`, `#main-content`,
 dark and a stored dark over a light system, on a slow link and a 4× slower
 CPU, recording the shell on every frame. It fails when a painted frame lacks
 the header or `<main>`, is not the placeholder first, shows other nav links,
-moves the header, a nav link, the account link or the top of `<main>`, is in
+moves the header, a nav link, the user menu button or the top of `<main>`, is in
 the other theme, or when the layout shift exceeds 0.05 (pages that load
 several lists show them together, as the Users page does), or when content
 that fits the viewport ends without the footer in it. On a page whose

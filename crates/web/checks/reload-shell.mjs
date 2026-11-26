@@ -1,5 +1,5 @@
 // Shell loading check: a hard reload of a signed-in page must paint the
-// app's real shell first (header with the nav and account link, `<main>`, in
+// app's real shell first (header with the nav and user menu button, `<main>`, in
 // the right theme), with only the content area as a placeholder, and nothing
 // outside the content may move until the page has loaded.
 //
@@ -12,7 +12,7 @@
 // template's script itself cannot run here: it drives a pnpm/Vite app and
 // stores the theme under the template's key. This one adds tun's nav check:
 // every painted frame shows the loaded page's nav links, current link and
-// account link in the same places.
+// user menu button in the same places.
 //
 // <cdp-ws-url> is a Chromium's browser websocket (agent-browser: `get
 // cdp-url`) whose profile is signed in to <ui-origin> as an admin. For each
@@ -25,7 +25,7 @@
 // frame. It fails when:
 // - the first painted frame has no header or `<main>`, or is not the content
 //   placeholder; any later frame loses the header or `<main>`;
-// - the header, any nav link, the current link or the account link moves by
+// - the header, any nav link, the current link or the user menu button moves by
 //   more than 1px, or the top of `<main>` moves, between a painted frame and
 //   the loaded page; a nav link is missing or extra in any frame;
 // - a painted frame is in the other theme; the page goes back to the
@@ -79,7 +79,7 @@ const INIT = `(() => {
     const header = seen("[data-app-header]");
     const visible = (el) => !!el && !!box(el) && getComputedStyle(el).visibility === "visible";
     const links = header ? [...header.querySelectorAll(".nav a")].filter(visible) : [];
-    const account = header && header.querySelector(".account-link");
+    const account = header && header.querySelector(".user-menu-btn");
     const footer = seen("body > footer");
     const main = document.getElementById("main-content");
     // Where the content ends: the lowest visible box without children, plus
