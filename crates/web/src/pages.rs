@@ -5,7 +5,9 @@ use leptos::task::spawn_local;
 use serde_json::{Value, json};
 
 use crate::api::{self, ApiError};
+use crate::device::device_name;
 use crate::email::{AddressCard, ConfirmAddress, ForgotPassword, MailStatus};
+use crate::limits::LimitsEditor;
 use crate::types::*;
 use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, relative, run, traffic_text, value, when};
 use crate::{ctx, navigate, refresh_session};
@@ -296,144 +298,6 @@ fn used_of(used: u64, limit: Option<u64>) -> String {
     match limit {
         Some(l) => format!("{used} of {l}"),
         None => format!("{used} (unlimited)"),
-    }
-}
-
-/// One limit in the editor: Server default, a number or Unlimited.
-#[derive(Clone, Copy)]
-struct LimitField {
-    key: &'static str,
-    label: &'static str,
-    mode: RwSignal<String>,
-    /// As typed: a count, GB for traffic, an amount of `unit` for lifetimes.
-    value: RwSignal<String>,
-    unit: RwSignal<String>,
-    /// The setting the form was opened with.
-    initial: StoredValue<Value>,
-}
-
-impl LimitField {
-    fn new(key: &'static str, label: &'static str, l: &Limit) -> Self {
-        let (value, unit) = crate::limits::form_value(key, l.setting.as_u64());
-        Self {
-            key,
-            label,
-            mode: RwSignal::new(l.mode().to_string()),
-            value: RwSignal::new(value),
-            unit: RwSignal::new(unit),
-            initial: StoredValue::new(l.setting.clone()),
-        }
-    }
-
-    /// The setting to send, `Ok(None)` when unchanged, or what is wrong.
-    fn setting(&self) -> Result<Option<Value>, String> {
-        let wanted = crate::limits::wanted(
-            self.key,
-            self.label,
-            &self.mode.get_untracked(),
-            &self.value.get_untracked(),
-            &self.unit.get_untracked(),
-        )?;
-        Ok(crate::limits::changed(&self.initial.get_value(), &wanted).then_some(wanted))
-    }
-
-    /// Put the setting into a limits patch if it changed; what is wrong otherwise.
-    fn add_to(&self, body: &mut serde_json::Map<String, Value>) -> Result<(), String> {
-        if let Some(v) = self.setting()? {
-            body.insert(self.key.to_string(), v);
-        }
-        Ok(())
-    }
-
-    /// The field's controls; `default` is the server default it would follow.
-    fn view(self, id_prefix: &str, default: Option<u64>) -> impl IntoView + use<> {
-        let select_id = format!("limit-{}-{}", self.key, id_prefix);
-        let value_id = format!("{select_id}-value");
-        let default_text = match (self.key, default) {
-            (_, None) => "unlimited".to_string(),
-            ("tunnel_ttl_s", Some(s)) => duration_text(s),
-            ("traffic_bytes", Some(b)) => bytes(b),
-            (_, Some(n)) => n.to_string(),
-        };
-        view! {
-            <div class="field">
-                <label for=select_id.clone()>{self.label}</label>
-                <div class="row">
-                    <select id=select_id class="input input-sm w-auto"
-                        on:change=move |ev| self.mode.set(value(&ev))>
-                        <option value="default" selected=move || self.mode.get() == "default">{format!("Server default ({default_text})")}</option>
-                        <option value="number" selected=move || self.mode.get() == "number">"Number"</option>
-                        <option value="unlimited" selected=move || self.mode.get() == "unlimited">"Unlimited"</option>
-                    </select>
-                    <Show when=move || self.mode.get() == "number">
-                        <label class="sr-only" for=value_id.clone()>{format!("{} value", self.label)}</label>
-                        <input id=value_id.clone() class="input input-sm input-num"
-                            inputmode=if self.key == "traffic_bytes" { "decimal" } else { "numeric" }
-                            prop:value=move || self.value.get() on:input=move |ev| self.value.set(value(&ev)) />
-                        {match self.key {
-                            "traffic_bytes" => view! { <span class="muted small">"GB"</span> }.into_any(),
-                            "tunnel_ttl_s" => view! {
-                                <select class="input input-sm w-auto" aria-label="Unit"
-                                    on:change=move |ev| self.unit.set(value(&ev))>
-                                    <option value="s" selected=move || self.unit.get() == "s">"seconds"</option>
-                                    <option value="m" selected=move || self.unit.get() == "m">"minutes"</option>
-                                    <option value="h" selected=move || self.unit.get() == "h">"hours"</option>
-                                    <option value="d" selected=move || self.unit.get() == "d">"days"</option>
-                                </select>
-                            }.into_any(),
-                            _ => ().into_any(),
-                        }}
-                    </Show>
-                </div>
-            </div>
-        }
-    }
-}
-
-/// An admin's editor for a user's four limits.
-#[component]
-fn LimitsEditor<F>(
-    id: String,
-    limits: Limits,
-    busy: RwSignal<bool>,
-    error: RwSignal<Option<String>>,
-    update: F,
-) -> impl IntoView
-where
-    F: Fn(String, Value) + Copy + 'static,
-{
-    let fields = [
-        LimitField::new("tunnels", "Live tunnels (across their machines)", &limits.tunnels),
-        LimitField::new("machines", "Machines", &limits.machines),
-        LimitField::new("tunnel_ttl_s", "Longest tunnel lifetime", &limits.tunnel_ttl_s),
-        LimitField::new("traffic_bytes", "Monthly traffic", &limits.traffic_bytes),
-    ];
-    let defaults = [&limits.tunnels, &limits.machines, &limits.tunnel_ttl_s, &limits.traffic_bytes].map(|l| l.default);
-    // Control ids are unique per user: several editors may be open.
-    let id_prefix = id.clone();
-    let submit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let mut body = serde_json::Map::new();
-        for f in fields {
-            if let Err(e) = f.add_to(&mut body) {
-                error.set(Some(e));
-                return;
-            }
-        }
-        if body.is_empty() {
-            error.set(Some("Nothing changed.".into()));
-            return;
-        }
-        update(id.clone(), crate::limits::patch_body(body));
-    };
-    view! {
-        <form class="limits stack" on:submit=submit>
-            <div class="limits-grid">
-                {fields.into_iter().zip(defaults).map(|(f, default)| f.view(&id_prefix, default)).collect_view()}
-            </div>
-            <p class="muted small">"Lowering a limit never stops what already runs: existing tunnels and machines stay, new ones are refused with a message naming the limit. A lifetime limit applies to new tunnels and renewals, and the user's tunnels that would outlive it now end at most that long from now. Unlimited lifetime lets their tunnels never expire. A traffic limit applies at once. Changing the role resets all four to the server default."</p>
-            <div><button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save limits"</button></div>
-        </form>
     }
 }
 
@@ -1196,9 +1060,13 @@ fn Account() -> impl IntoView {
             Ok(())
         });
     };
-    let revoke = move |id: String| {
+    // What the last sign-out here did, said in the Sessions card itself.
+    let signed_out = RwSignal::new(None::<String>);
+    let revoke = move |id: String, what: String| {
+        signed_out.set(None);
         run(error, busy, async move {
             api::post::<Value>("/ui/api/account/sessions/revoke", &json!({ "id": id })).await?;
+            signed_out.set(Some(what));
             load_sessions();
             Ok(())
         });
@@ -1313,18 +1181,33 @@ fn Account() -> impl IntoView {
             </div>
             <div class="card card-tight table-wrap">
                 <div class="row card-head card-head-actions"><h2 class="grow">"Sessions"</h2>
-                    <button class="btn btn-outline btn-sm" on:click=move |_| revoke("others".into())>"Sign out other sessions"</button></div>
+                    <button class="btn btn-outline btn-sm" on:click=move |_| revoke("others".into(), "Signed out every other session.".into())>"Sign out other sessions"</button></div>
+                <div class="card-note" role="status">{move || signed_out.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
                 <table class="table table-stack">
-                    <thead><tr><th>"Device"</th><th>"Address"</th><th>"Last active"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
+                    <thead><tr><th>"Device"</th><th>"Address"</th><th>"Signed in"</th><th>"Last active"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
                     <tbody>
                     {move || sessions.get().into_iter().map(|s| {
                         let id = s.id.clone();
+                        let raw = s.user_agent.clone().filter(|ua| !ua.trim().is_empty());
+                        let device = device_name(raw.as_deref());
+                        let (sign_out_label, done) = (format!("Sign out {device}"), format!("Signed out {device}."));
                         view! { <tr>
-                            <td class="cell-main ua">{s.user_agent.clone().unwrap_or_default()}{s.current.then(|| view! { " " <span class="badge badge-info">"this one"</span> })}</td>
+                            <td class="cell-main">
+                                <span class="name" title=raw.clone()>{device.clone()}</span>
+                                {s.current.then(|| view! { " " <span class="badge badge-info">"this one"</span> })}
+                                {raw.map(|ua| view! {
+                                    <details class="ua-raw">
+                                        <summary class="muted small">"Browser details"</summary>
+                                        <div class="mono small break">{ua}</div>
+                                    </details>
+                                })}
+                            </td>
                             <td data-label="Address">{s.ip.clone().unwrap_or_default()}</td>
+                            <td data-label="Signed in" title=when(s.created_at)>{relative(s.created_at)}</td>
                             <td data-label="Last active">{relative(s.last_seen_at)}</td>
                             <td class="actions">{(!s.current).then(|| view! {
-                                <button class="btn btn-outline btn-sm" on:click=move |_| revoke(id.clone())>"Sign out"</button>
+                                <button class="btn btn-outline btn-sm" aria-label=sign_out_label
+                                    on:click=move |_| revoke(id.clone(), done.clone())>"Sign out"</button>
                             })}</td>
                         </tr> }
                     }).collect_view()}
@@ -1353,6 +1236,10 @@ fn Users(me: User) -> impl IntoView {
     // Open reset panels and the links made in them, by user id: kept outside
     // the rows, which every reload renders anew.
     let resets = RwSignal::new(std::collections::HashMap::<String, Option<String>>::new());
+    // What the last change in the table did ("Saved the limits of member1.").
+    let notice = RwSignal::new(None::<String>);
+    // A limits save in flight (any user's); only limits saves set or clear it.
+    let saving_limits = RwSignal::new(false);
     // Loading the lists does not disable the invite button (only a submit in flight does).
     let loading = RwSignal::new(false);
     let load = move || {
@@ -1437,6 +1324,7 @@ fn Users(me: User) -> impl IntoView {
                     <Copy value=Signal::derive(move || u.clone()) label="Invite link" />
                 })}
             </form>
+            <div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
             <div class="card card-tight table-wrap">
                 <table class="table table-stack">
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Machines"</th><th>"Tunnels"</th>
@@ -1459,6 +1347,12 @@ fn Users(me: User) -> impl IntoView {
                         let disabled = u.disabled;
                         let is_admin = u.role == "admin";
                         let limits = u.limits.clone();
+                        let saved = move |name: String| {
+                            notice.set(Some(format!("Saved the limits of {name}.")));
+                            load();
+                        };
+                        let limits_name = u.username.clone();
+                        let opener = crate::limits::opener_id(&u.id);
                         view! { <tr>
                             <td class="cell-main"><span class="name">{u.username.clone()}</span>{disabled.then(|| view! { " " <span class="badge badge-danger">"disabled"</span> })}
                                 {u.email.clone().map(|e| view! { <div class="muted small break">{e}</div> })}</td>
@@ -1482,8 +1376,8 @@ fn Users(me: User) -> impl IntoView {
                             } else { view! { "admin" }.into_any() }}</td>
                             <td data-label="2FA">{if u.totp { "on" } else { "off" }}</td>
                             <td class="actions">{editable.then(|| view! {
-                                <button class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
-                                    on:click=move |_| editing.update(|e| *e = !*e)>"Limits"</button>" "
+                                <button id=opener class="btn btn-outline btn-sm" aria-expanded=move || editing.get().to_string()
+                                    on:click=move |_| { notice.set(None); editing.update(|e| *e = !*e); }>"Limits"</button>" "
                                 {(!disabled).then(|| view! {
                                     <button class="btn btn-outline btn-sm" aria-expanded=move || resetting.get().to_string()
                                         aria-label=format!("Reset sign-in for {name2}")
@@ -1507,7 +1401,7 @@ fn Users(me: User) -> impl IntoView {
                         </tr>
                         {move || editing.get().then(|| view! {
                             <tr class="limits-row panel-row"><td colspan="8" class="links-panel">
-                                <LimitsEditor id=id5.clone() limits=limits.clone() busy=busy error=error update=update />
+                                <LimitsEditor id=id5.clone() username=limits_name.clone() limits=limits.clone() open=editing saving=saving_limits saved=saved />
                             </td></tr>
                         })}
                         {move || resetting.get().then(|| view! {

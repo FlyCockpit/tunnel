@@ -1162,6 +1162,19 @@ async fn the_app_shell_and_assets_are_served_from_the_binary() {
             std::str::from_utf8(a.unwrap_or_else(|| panic!("embedded {prefix}*{suffix}")).raw).unwrap()
         };
         assert!(asset_text("/assets/theme-", ".js").contains("\"tunnel-theme\""));
+        // A reload paints the app's own header, nav and footer first (the
+        // wasm UI replaces them): the hint script runs before the first paint.
+        let hint = html.find("<script src=\"/assets/shell-").expect("shell hint script");
+        assert!(hint < html.find("<link rel=\"stylesheet\"").unwrap(), "{html}");
+        for part in [
+            "<header class=\"header boot\"",
+            "<nav class=\"nav boot-in\"",
+            "<main class=\"main boot\"",
+            "<footer class=\"footer boot\"",
+        ] {
+            assert!(html.contains(part), "{part}: {html}");
+        }
+        assert!(asset_text("/assets/shell-", ".js").contains("\"tunnel-shell\""));
         assert!(
             asset_text("/assets/app-", ".css")
                 .contains("@media (prefers-color-scheme: dark) {\n:root:not(.light) {\n  --background:")

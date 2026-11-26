@@ -43,6 +43,8 @@ boot="boot-$(hash "$out/boot.js").js"
 cp "$out/boot.js" "dist/assets/$boot"
 theme="theme-$(hash static/theme.js).js"
 cp static/theme.js "dist/assets/$theme"
+shell="shell-$(hash static/shell.js).js"
+cp static/shell.js "dist/assets/$shell"
 # Until theme.js has set .light or .dark (it is still loading, or scripts are
 # off), follow the system: the .dark token blocks again, under the media query.
 {
@@ -67,12 +69,16 @@ cat > dist/index.html <<HTML
 <title>Tunnel</title>
 <link rel="icon" type="image/png" href="/assets/favicon-32.png">
 <script src="/assets/$theme"></script>
+<script src="/assets/$shell"></script>
+<link rel="preload" href="/assets/roboto-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/$css">
 <link rel="modulepreload" href="/assets/$js">
 <link rel="preload" href="/assets/$wasm" as="fetch" type="application/wasm" crossorigin>
 <script type="module" src="/assets/$boot"></script>
 </head>
-<body><noscript>Tunnel's web UI needs JavaScript and WebAssembly.</noscript></body>
+<body>
+$(cat static/shell.html)
+</body>
 </html>
 HTML
 
@@ -80,7 +86,7 @@ total=0
 for f in dist/index.html dist/assets/*; do
   case "$f" in *.woff2 | *.png | *.txt) ;; *) gzip -9 -n -k "$f" ;; esac
 done
-for f in dist/index.html dist/assets/$js dist/assets/$wasm dist/assets/$boot dist/assets/$theme dist/assets/$css; do
+for f in dist/index.html dist/assets/$js dist/assets/$wasm dist/assets/$boot dist/assets/$theme dist/assets/$shell dist/assets/$css; do
   total=$((total + $(wc -c < "$f.gz")))
 done
 total=$((total + $(wc -c < dist/assets/roboto-latin-wght-normal.woff2)))

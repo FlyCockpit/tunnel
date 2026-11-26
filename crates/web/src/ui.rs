@@ -28,6 +28,23 @@ pub fn A(
     }
 }
 
+/// The header's page links: `(href, text, admins only)`. static/shell.html
+/// has the same links for the first paint (checked in src/boot.rs).
+pub const NAV: [(&str, &str, bool); 5] = [
+    ("/tunnels", "Tunnels", false),
+    ("/machines", "Machines", false),
+    ("/cli", "Get the CLI", false),
+    ("/admin/users", "Users", true),
+    ("/admin/status", "Server", true),
+];
+
+fn nav_links(admin: bool) -> impl IntoView {
+    NAV.iter()
+        .filter(move |(_, _, only_admins)| *only_admins == admin)
+        .map(|(href, text, _)| view! { <A href=*href>{*text}</A> })
+        .collect_view()
+}
+
 #[component]
 pub fn Shell(children: ChildrenFn) -> impl IntoView {
     let c = ctx();
@@ -51,13 +68,8 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
             </a>
             <Show when=signed_in>
                 <nav class="nav" aria-label="Main">
-                    <A href="/tunnels">"Tunnels"</A>
-                    <A href="/machines">"Machines"</A>
-                    <A href="/cli">"Get the CLI"</A>
-                    <Show when=is_admin>
-                        <A href="/admin/users">"Users"</A>
-                        <A href="/admin/status">"Server"</A>
-                    </Show>
+                    {nav_links(false)}
+                    <Show when=is_admin>{nav_links(true)}</Show>
                 </nav>
             </Show>
             <div class="spacer"></div>

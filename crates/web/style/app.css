@@ -2,10 +2,13 @@
    strings (square corners, compact text, hairline borders), as plain CSS on
    the vendored tokens. */
 
+/* index.html preloads the font. "optional": a page that painted with the
+   fallback (a slow first visit) keeps it instead of swapping later, so text
+   never reflows under the reader; the next visit has it cached. */
 @font-face {
   font-family: "Roboto Variable";
   font-style: normal;
-  font-display: swap;
+  font-display: optional;
   font-weight: 100 900;
   src: url("/assets/roboto-latin-wght-normal.woff2") format("woff2-variations");
 }
@@ -146,14 +149,57 @@ dialog::backdrop { background: rgb(0 0 0 / 40%); }
 .qr { width: 200px; height: 200px; background: #fff; padding: 8px; }
 .table td.links-panel { background: var(--muted); padding: 12px var(--table-inset); }
 .input.w-auto { width: auto; }
-.limits-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
-.limits-grid .field + .field { margin-top: 0; }
-.limits .row { flex-wrap: wrap; }
+/* Users → Limits: one row per limit, read as a sentence ("Machines
+   [Custom] [5] machines"); the hint and the field's error sit under the
+   controls. One column on phones. */
+.limits-list { display: grid; gap: 14px; }
+.limit-row { display: grid; grid-template-columns: minmax(10rem, 15rem) minmax(0, 1fr); column-gap: 16px; align-items: center; }
+.limit-row > .limit-label { margin: 0; }
+.limit-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.limit-number { display: inline-flex; gap: 8px; align-items: center; }
+.limit-number > select.input.input-sm { width: auto; }
+.input.input-sm.limit-mode { width: 13rem; }
+.limit-unit { font-size: 13px; }
+.limit-row > .limit-hint, .limit-row > .limit-error { grid-column: 2; margin: 4px 0 0; }
+.limit-row > .limit-error:empty { display: none; }
+.field-error { color: var(--destructive); font-size: 12px; font-weight: 500; }
+.limits-actions .muted { margin-left: 4px; }
+.limits .alert { margin-bottom: 0; }
+.card-note > .alert { margin: 8px 16px 4px; }
+.ua-raw { margin-top: 2px; }
+.ua-raw > summary { cursor: pointer; width: fit-content; }
+.ua-raw > div { margin-top: 4px; }
 .input.input-sm { height: 26px; width: 14rem; padding: 0 8px; }
 .input.input-sm.input-num { width: 6rem; }
 .grow { flex: 1; }
 .card-head { padding: 16px 16px 4px; margin: 0; }
 .row.card-head > h2 { margin: 0; }
+
+/* First paint (static/shell.html, static/shell.js): the same header, nav
+   and footer as the app, from the last visit's hint; only the content is a
+   placeholder, shaped like a page or a narrow card. The wasm UI removes all
+   of it (`.boot`) when it renders the real shell. */
+html:not([data-boot-nav="member"]):not([data-boot-nav="admin"]) .boot .boot-in { display: none; }
+html:not([data-boot-nav="admin"]) .boot .boot-admin { display: none; }
+html:not([data-boot-shape="page"]) .boot .boot-page, html[data-boot-shape="page"] .boot .boot-narrow { display: none; }
+.boot .boot-account::before { content: var(--boot-user, ""); }
+.boot .boot-theme::before { content: var(--boot-theme, "Auto"); }
+html[data-boot-page="tunnels"] .boot .nav a[href="/tunnels"],
+html[data-boot-page="machines"] .boot .nav a[href="/machines"],
+html[data-boot-page="cli"] .boot .nav a[href="/cli"],
+html[data-boot-page="users"] .boot .nav a[href="/admin/users"],
+html[data-boot-page="status"] .boot .nav a[href="/admin/status"] { color: var(--foreground); box-shadow: inset 0 -2px 0 var(--primary); }
+.skel { background: var(--muted); height: 12px; margin-top: 10px; }
+.skel:first-child { margin-top: 0; }
+.skel-title { width: 9rem; height: 22px; }
+.skel-text { width: min(26rem, 80%); }
+.skel-row { height: 28px; margin-top: 14px; }
+.skel-field { height: 32px; margin-top: 16px; }
+.skel-button { width: 6rem; height: 32px; margin-top: 16px; }
+@media (prefers-reduced-motion: no-preference) {
+  .skel { animation: skel-pulse 1.6s ease-in-out infinite; }
+  @keyframes skel-pulse { 50% { opacity: 0.55; } }
+}
 
 /* Page-head controls ("Show all users", Refresh) stay together. */
 .head-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -239,10 +285,11 @@ a.btn { text-decoration: none; }
   .card-tight > .table-stack { --table-inset: 16px; }
   .table-wrap { overflow-x: visible; }
   .card-head-actions { flex-wrap: wrap; }
-  .ua { font-size: 12px; }
   .link-form > * { flex: 1 1 auto; }
-  .limits-grid { grid-template-columns: 1fr; }
-  .limits .row > select { flex: 1 1 100%; }
+  .limit-row { grid-template-columns: minmax(0, 1fr); }
+  .limit-row > .limit-label { margin-bottom: 4px; }
+  .limit-row > .limit-hint, .limit-row > .limit-error { grid-column: 1; }
+  .limit-controls > .input.limit-mode { flex: 1 1 10rem; width: auto; }
 }
 @media (max-width: 400px) {
   .brand-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

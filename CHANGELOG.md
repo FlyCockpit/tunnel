@@ -59,6 +59,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   sign-in).
 - The web UI works on phones and tablets: a two-row header, tables that
   become one card per row, and 44 px touch targets.
+- A reload of the web UI paints its own header, nav and footer at once (from
+  a non-secret "last signed in as" hint), with only the content as a
+  placeholder; the Users page's limits editor has one row per limit with the
+  unit inline and errors next to the field; Account → Sessions names devices
+  ("Chrome on Linux") with the raw user agent under Browser details.
 - `tunnel-server user invite [--role member|admin] [--hours N]` and
   `user delete <name>` for managing accounts from the server's shell.
 - Sign-in reset links for someone locked out: Reset sign-in in the Users page

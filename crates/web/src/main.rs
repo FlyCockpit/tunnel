@@ -4,6 +4,8 @@
 //! binary; it talks only to `/ui/api/*` on its own origin.
 
 mod api;
+mod boot;
+mod device;
 mod email;
 mod limits;
 mod pages;
@@ -55,9 +57,14 @@ pub async fn refresh_session() {
     match api::get::<SessionInfo>("/ui/api/session").await {
         Ok(s) => {
             api::set_csrf(s.csrf.clone());
+            boot::remember(Some(&s));
             ctx().session.set(Some(s));
         }
-        Err(_) => ctx().session.set(None),
+        // Shown as signed out, so the next first paint is too.
+        Err(_) => {
+            boot::remember(None);
+            ctx().session.set(None);
+        }
     }
 }
 
@@ -74,6 +81,8 @@ fn App() -> impl IntoView {
     leptos::task::spawn_local(async move {
         refresh_session().await;
         loaded.set(true);
+        // The real shell is rendered: drop the first paint's copy (index.html).
+        boot::remove();
     });
     // Back/forward buttons.
     let on_pop = Closure::<dyn Fn()>::new(move || c.path.set(location_path()));
@@ -83,7 +92,8 @@ fn App() -> impl IntoView {
     on_pop.forget();
 
     view! {
-        <Show when=move || loaded.get() fallback=|| view! { <div class="page muted">"Loading…"</div> }>
+        // Until the session is known, index.html's copy of the shell stays.
+        <Show when=move || loaded.get()>
             <ui::Shell>{move || {
                 // Re-route when who is signed in changes (sign-in, the TOTP
                 // step, sign-out), not on every session refresh, so pages
