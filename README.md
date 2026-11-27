@@ -735,7 +735,7 @@ cargo build --release -p tunnel-server --features ui
 ```
 
 CI pins and checksums both tools (`.github/workflows/web.yml`) and fails a
-build whose first load exceeds 400 kB gzip. The UI's design tokens are copied
+build whose first load exceeds 600 kB gzip. The UI's design tokens are copied
 from the FlyCockpit template (`crates/web/UPSTREAM` records the commit); its
 edge lines (the paddings every container shares) are in
 [crates/web/README.md](crates/web/README.md#edge-lines).

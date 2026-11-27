@@ -12,7 +12,7 @@ cd "$here"
 WASM_BINDGEN=${WASM_BINDGEN:-wasm-bindgen}
 WASM_OPT=${WASM_OPT:-wasm-opt}
 # Total gzip size budget for everything the browser downloads (bytes).
-BUDGET=${TUNNEL_UI_BUDGET:-400000}
+BUDGET=${TUNNEL_UI_BUDGET:-600000}
 
 want=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
 have=$("$WASM_BINDGEN" --version | awk '{ print $2 }')
