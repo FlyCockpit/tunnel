@@ -284,7 +284,9 @@ impl Status {
         }
         match self.state {
             ConnState::Revoked => {
-                eprintln!("the tunnel was deleted, expired, or its token rejected; create a new tunnel")
+                eprintln!(
+                    "the tunnel was deleted, expired, or its token rejected; create a new tunnel (`tunnel share` again, after `tunnel login` if this machine was removed; or a new tunnel token for `tunnel expose`)"
+                )
             }
             ConnState::Replaced => eprintln!("another client connected with this tunnel token; this daemon stopped"),
             _ => {}

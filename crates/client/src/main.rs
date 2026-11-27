@@ -86,7 +86,7 @@ enum Cmd {
     Share {
         #[arg(required = true, num_args = 1.., value_parser = clap::value_parser!(u16).range(1..))]
         ports: Vec<u16>,
-        /// Anyone with the URL can open it (servers allow this only if `allow_public_for_clients` is set).
+        /// Anyone with the URL can open it (for members only if an admin allowed public previews for them, or the server's `allow_public_for_clients` is on).
         #[arg(long, conflicts_with_all = ["password", "link"])]
         public: bool,
         /// Visitors sign in with a username and password (password from $TUNNEL_SHARE_PASSWORD or a prompt).

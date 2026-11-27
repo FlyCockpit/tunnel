@@ -88,7 +88,7 @@ async fn decode<T: DeserializeOwned>(resp: reqwest::Response, what: &str) -> any
     if status == reqwest::StatusCode::UNAUTHORIZED && what != "login" {
         bail!(
             "the server no longer accepts this machine's login (the client was deleted or logged in elsewhere); \
-             ask the admin for a new `tunnel login` command"
+             run `tunnel login` again (or ask an admin for a new login code)"
         );
     }
     if !status.is_success() {

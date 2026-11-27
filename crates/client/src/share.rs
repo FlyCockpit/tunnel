@@ -93,7 +93,7 @@ pub fn logout() -> anyhow::Result<i32> {
     let p = crate::login::path()?;
     match std::fs::remove_file(&p) {
         Ok(()) => println!(
-            "Logged out (removed {}). Ask the server admin to `client delete` this machine to revoke its token.",
+            "Logged out (removed {}). The machine's token still works until the machine is removed: Machines in the web UI, or an admin's `tunnel-server client delete`.",
             p.display()
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("Not logged in."),

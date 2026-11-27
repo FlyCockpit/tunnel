@@ -950,7 +950,7 @@ fn Device() -> impl IntoView {
             <div class="card stack">
                 <h1>"Approve a machine"</h1>
                 <ErrorBox error=error />
-                {move || done.get().map(|d| view! { <div class="alert alert-success">{d}</div> })}
+                <div role="status">{move || done.get().map(|d| view! { <div class="alert alert-success">{d}</div> })}</div>
                 <Show when=move || request.get().is_none() && done.get().is_none()>
                     <form on:submit=lookup>
                         <p class="muted">"Type the code that " <code>"tunnel login"</code> " shows in your terminal. Only approve a machine you just started a login on."</p>
@@ -1159,7 +1159,7 @@ fn Account() -> impl IntoView {
                 <p class="muted">{move || user().map(|u| format!("Signed in as {} ({}).", u.username, u.role)).unwrap_or_default()}</p>
             </div></div>
             <ErrorBox error=error />
-            {move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}
+            <div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
             {move || c.session.get().and_then(|s| s.user.map(|u| (u, s.usage.unwrap_or_default()))).map(|(u, usage)| view! {
                 <div class="card stack">
                     <h2>"Your limits"</h2>
@@ -1562,7 +1562,7 @@ fn Users(me: User) -> impl IntoView {
                                 })}</div>
                                 {move || shape.get().editable.then(|| view! {
                                     <button class="btn btn-ghost btn-sm" type="button" disabled=move || busy.get()
-                                        on:click=move |_| reset_traffic(id.get_value())>"Reset month"</button>
+                                        aria-label=format!("Reset month for {}", shape.get().name) on:click=move |_| reset_traffic(id.get_value())>"Reset month"</button>
                                 })}
                             </td>
                             <td data-label="Public previews">{move || {
@@ -1570,7 +1570,7 @@ fn Users(me: User) -> impl IntoView {
                                 if s.role != "member" {
                                     view! { "admin" }.into_any()
                                 } else if s.editable { view! {
-                                    <label class="check"><input type="checkbox" prop:checked=move || row.with(|r| r.user.can_public)
+                                    <label class="check"><input type="checkbox" aria-label=format!("Public previews allowed for {}", s.name) prop:checked=move || row.with(|r| r.user.can_public)
                                         on:change=move |ev| update(id.get_value(), json!({ "can_public": event_target_checked(&ev) })) />"allowed"</label>
                                 }.into_any() } else {
                                     view! { {move || if row.with(|r| r.user.can_public) { "allowed" } else { "no" }} }.into_any()
@@ -1595,16 +1595,17 @@ fn Users(me: User) -> impl IntoView {
                                         })>"Reset sign-in"</button>" "
                                 })}
                                 {(owner && !disabled).then(|| view! {
-                                    <button class="btn btn-outline btn-sm" on:click=move |_| update(id.get_value(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
+                                    <button class="btn btn-outline btn-sm" aria-label=if is_admin { format!("Make member {name}") } else { format!("Make admin {name}") }
+                                        on:click=move |_| update(id.get_value(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
                                         {if is_admin { "Make member" } else { "Make admin" }}
                                     </button>" "
                                 })}
                                 <button class=if disabled { "btn btn-outline btn-sm" } else { "btn btn-destructive btn-sm" }
                                     aria-label=if disabled { format!("Enable {name}") } else { format!("Disable {name}") }
+                                    data-confirm=(!disabled).then(|| format!("Disable {name}? Their sessions end, their machines are removed and their tunnels close."))
                                     on:click=move |_| update(id.get_value(), json!({ "disabled": !disabled }))>
                                     {if disabled { "Enable" } else { "Disable" }}
                                 </button>
-                                <span class="sr-only">{id.get_value()}</span>
                             })}}</td>
                         </tr>
                         // The panels take the row as it was when they opened.
@@ -1981,12 +1982,25 @@ mod tests {
         assert!(not_now[..not_now.find(r#""Not now""#).unwrap()].contains("code_error.set(None)"));
     }
 
-    /// Row buttons say whose row they act on, like "Reset sign-in for <name>".
+    /// Row buttons say whose row they act on, like "Reset sign-in for <name>",
+    /// and the row does not read out the user's internal id.
     #[test]
     fn user_row_buttons_name_the_user() {
         let src = source();
         assert!(src.contains(r#"aria-label=format!("Limits for {name}")"#));
         assert!(src.contains(r#"format!("Enable {name}") } else { format!("Disable {name}")"#));
+        assert!(src.contains(r#"format!("Make member {name}") } else { format!("Make admin {name}")"#));
+        assert!(src.contains(r#"aria-label=format!("Reset month for {}", shape.get().name)"#));
+        assert!(src.contains(r#"aria-label=format!("Public previews allowed for {}", s.name)"#));
+        assert!(!src.contains(r#"<span class="sr-only">{id.get_value()}</span>"#));
+    }
+
+    /// Notices that appear in place (Account, machine approval) are announced.
+    #[test]
+    fn in_place_notices_are_announced() {
+        let src = source();
+        assert!(src.contains(r#"<div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>"#));
+        assert!(src.contains(r#"<div role="status">{move || done.get().map(|d| view! { <div class="alert alert-success">{d}</div> })}</div>"#));
     }
 
     /// Two-factor setup can be left without turning it on.
@@ -2053,6 +2067,13 @@ mod tests {
             assert!(src[start..at].contains(" data-confirm="), "{action} asks first");
             assert_eq!(src.matches(action).count(), 1, "{action} is reachable only from that button");
         }
+        // Disabling a user ends their sessions, removes their machines and closes their tunnels.
+        let disable = &src[src.find(r#"format!("Enable {name}") } else { format!("Disable {name}")"#).unwrap()..];
+        assert!(
+            disable[..disable.find("on:click").unwrap()]
+                .contains(r#"data-confirm=(!disabled).then(|| format!("Disable {name}? "#),
+            "Disable asks first"
+        );
         let shell = include_str!("../static/shell.js");
         // A click (mouse, Enter and Space all send one), on window in the
         // capture phase, from any element inside the button.

@@ -83,7 +83,7 @@ pub fn ConfirmAddress(token: String, info: Value) -> impl IntoView {
         <ErrorBox error=error />
         {move || match done.get() {
             Some(e) => view! {
-                <div class="alert alert-success" role="status">{format!("{e} is now the address of your account.")}</div>
+                <div class="alert alert-success" role="status">{format!("Your account's address is now {e}.")}</div>
                 <div><a class="btn btn-outline" href="/account">"Go to your account"</a></div>
             }.into_any(),
             None => view! {
