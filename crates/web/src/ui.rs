@@ -68,7 +68,10 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
             // static/menu.js the menu (src/boot.rs hands them the session).
             <div class="menu-wrap" id="menu-wrap"></div>
         </header>
-        <main class="main" id="main-content">{children()}</main>
+        <main class="main" id="main-content">
+            <div role="status">{move || c.notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
+            {children()}
+        </main>
         <footer class="footer">
             "Tunnel " {version}
             {move || abuse().map(|a| view! { " · Report abuse: " {a} })}
@@ -76,9 +79,21 @@ pub fn Shell(children: ChildrenFn) -> impl IntoView {
     }
 }
 
+/// Keep this outside the routed page so signing in cannot discard it.
+pub fn recovery_notice(v: &serde_json::Value) {
+    if v["recovery_code"].as_bool() == Some(true) {
+        let left = v["recovery_codes_left"].as_u64().unwrap_or(0);
+        ctx().notice.set(Some(format!("Signed in with a recovery code; {left} left. To get new ones, turn two-factor sign-in off and on again under Account.")));
+    }
+}
+
 /// A read-only value with a copy button.
 #[component]
-pub fn Copy(#[prop(into)] value: Signal<String>, #[prop(optional)] label: &'static str) -> impl IntoView {
+pub fn Copy(
+    #[prop(into)] value: Signal<String>,
+    #[prop(optional)] label: &'static str,
+    #[prop(optional)] id: Option<String>,
+) -> impl IntoView {
     let copied = RwSignal::new(false);
     let copy = move |_| {
         if let Some(w) = web_sys::window() {
@@ -90,9 +105,45 @@ pub fn Copy(#[prop(into)] value: Signal<String>, #[prop(optional)] label: &'stat
         <div class="copy" aria-label=label>
             <code class="secret">{move || value.get()}</code>
             // Not a submit: a Copy inside a form (Machines) must not send it.
-            <button class="btn btn-ghost btn-sm" type="button" on:click=copy>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
+            <button id=id class="btn btn-ghost btn-sm" type="button" on:click=copy>{move || if copied.get() { "Copied" } else { "Copy" }}</button>
         </div>
     }
+}
+
+/// The shared two-factor field; the password variant uses the same feedback.
+#[component]
+pub fn CodeField(
+    #[prop(into)] id: String,
+    label: &'static str,
+    value: RwSignal<String>,
+    error: RwSignal<Option<String>>,
+    #[prop(optional)] password: bool,
+) -> impl IntoView {
+    let described = format!("{id}-error");
+    view! {
+        <div class="field">
+            <label for=id.clone()>{label}</label>
+            <input id=id class=if password { "input" } else { "input code-input" }
+                type=if password { "password" } else { "text" }
+                autocomplete=if password { "current-password" } else { "one-time-code" } inputmode="text" required
+                aria-describedby=described.clone() aria-invalid=move || error.get().map(|_| "true")
+                prop:value=move || value.get() on:input=move |ev| { error.set(None); value.set(event_target_value(&ev)); } />
+            <p id=described class="field-error" aria-live="polite">{move || error.get()}</p>
+        </div>
+    }
+}
+
+/// Only the named refusal belongs at this field; locked and network errors
+/// still belong in the page's error box.
+pub fn field_refused(e: &ApiError, code: &str, error: RwSignal<Option<String>>, id: &str) -> bool {
+    if e.code != code {
+        return false;
+    }
+    if !error.is_disposed() {
+        error.set(Some(e.message.clone()));
+        focus_id(id);
+    }
+    true
 }
 
 #[component]
@@ -185,6 +236,14 @@ pub fn duration_text(s: u64) -> String {
     if parts.is_empty() { "0 s".into() } else { parts.join(" ") }
 }
 
+/// A count and its limit, or the count when no limit applies.
+pub fn used_of(used: u64, limit: Option<u64>) -> String {
+    match limit {
+        Some(l) => format!("{used} of {l}"),
+        None => format!("{used} (unlimited)"),
+    }
+}
+
 /// `used of cap`, or `used (no cap)`.
 pub fn traffic_text(used: u64, cap: Option<u64>) -> String {
     match cap {
@@ -229,6 +288,23 @@ pub fn focus_id(id: &str) -> bool {
     focused
 }
 
+/// Defer focus until the new control is rendered. The id is owned, and the
+/// signal belongs to the requesting component, so leaving it cancels focus.
+pub fn focus_later(alive: RwSignal<bool>, id: String) {
+    set_timeout(
+        move || {
+            if let Some(id) = focus_target(alive, id) {
+                focus_id(&id);
+            }
+        },
+        std::time::Duration::ZERO,
+    );
+}
+
+fn focus_target(alive: RwSignal<bool>, id: String) -> Option<String> {
+    alive.try_with_untracked(|_| id)
+}
+
 /// `focus()` scrolls only an element outside the viewport; one under the
 /// sticky header counts as in view and stays hidden. Scroll it out by the
 /// overlap with the header as drawn (it wraps onto two rows on narrow
@@ -248,6 +324,30 @@ pub fn run<F>(error: RwSignal<Option<String>>, busy: RwSignal<bool>, fut: F)
 where
     F: std::future::Future<Output = Result<(), ApiError>> + 'static,
 {
+    // Share the task's state machine across pages; only boxing depends on F.
+    run_boxed(error, busy, None, Box::pin(fut));
+}
+
+/// As `run`, with only invalid_code routed to the shared code field.
+pub fn run_code<F>(
+    error: RwSignal<Option<String>>,
+    busy: RwSignal<bool>,
+    code_error: RwSignal<Option<String>>,
+    id: &'static str,
+    fut: F,
+) where
+    F: std::future::Future<Output = Result<(), ApiError>> + 'static,
+{
+    code_error.set(None);
+    run_boxed(error, busy, Some((code_error, id)), Box::pin(fut));
+}
+
+fn run_boxed(
+    error: RwSignal<Option<String>>,
+    busy: RwSignal<bool>,
+    code_field: Option<(RwSignal<Option<String>>, &'static str)>,
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ApiError>>>>,
+) {
     busy.set(true);
     error.set(None);
     leptos::task::spawn_local(async move {
@@ -255,7 +355,11 @@ where
             if e.status == 401 && e.code == "signed_out" {
                 refresh_session().await;
             }
-            error.set(Some(e.message.clone()));
+            // Writes to disposed signals are no-ops in reactive_graph 0.2;
+            // field focus must also be skipped when the page has gone.
+            if !code_field.is_some_and(|(field, id)| field_refused(&e, "invalid_code", field, id)) {
+                error.set(Some(e.message.clone()));
+            }
         }
         busy.set(false);
     });
@@ -266,15 +370,105 @@ pub fn value(ev: &leptos::ev::Event) -> String {
 }
 
 #[cfg(test)]
+/// The body of `fn <name>` in `src`, up to the next item.
+pub fn source_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let start = [format!("fn {name}("), format!("fn {name}<")]
+        .iter()
+        .find_map(|head| src.find(head.as_str()))
+        .unwrap_or_else(|| panic!("no fn {name}"));
+    let rest = &src[start..];
+    &rest[..rest.find("\n}\n").expect("the item ends")]
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_focus_and_writes_tolerate_a_disposed_owner() {
+        let owner = Owner::new();
+        let (alive, stored, error) = owner
+            .with(|| (RwSignal::new(false), StoredValue::new("copy-id".to_string()), RwSignal::new(None::<String>)));
+        let id = stored.get_value();
+        assert_eq!(focus_target(alive, id.clone()), Some(id.clone()));
+        // Simulate closing a panel or navigating before a queued callback.
+        let callback = move || focus_target(alive, id);
+        owner.cleanup();
+        assert_eq!(callback(), None);
+        assert_eq!(stored.try_get_value(), None);
+        assert_eq!(alive.try_get_untracked(), None);
+        // These are the operations used by async run(...) completions.
+        alive.set(true);
+        alive.update(|v| *v = false);
+        assert!(alive.is_disposed());
+        let refusal = ApiError { status: 400, code: "invalid_code".into(), message: "Try again.".into() };
+        // A late field error must not try to focus a control on another page.
+        assert!(field_refused(&refusal, "invalid_code", error, "code"));
+        assert!(error.is_disposed());
+    }
+
+    #[test]
+    fn deferred_callbacks_do_not_read_disposed_state() {
+        for (file, src) in [
+            ("pages", include_str!("pages.rs")),
+            ("auth", include_str!("auth.rs")),
+            ("account", include_str!("account.rs")),
+            ("limits", include_str!("limits.rs")),
+            ("email", include_str!("email.rs")),
+            ("ui", include_str!("ui.rs")),
+        ] {
+            let src = src.split("#[cfg(test)]").next().unwrap();
+            for (start, _) in src.match_indices("set_timeout(") {
+                let mut depth = 1;
+                let rest = &src[start + "set_timeout(".len()..];
+                let end = rest
+                    .char_indices()
+                    .find_map(|(i, c)| {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        (depth == 0).then_some(i)
+                    })
+                    .unwrap();
+                let callback = &rest[..end];
+                for read in [".get_value(", ".get(", ".get_untracked(", ".with_untracked("] {
+                    assert!(!callback.contains(read), "{file}: unsafe read {read} in {callback}");
+                }
+                assert!(
+                    callback.contains("is_disposed()") || callback.contains("focus_target("),
+                    "{file}: missing lifetime check in {callback}"
+                );
+            }
+        }
+        let pages = include_str!("pages.rs");
+        for page in ["Links", "ResetPanel"] {
+            let body = source_body(pages, page);
+            let create = &body[body.find("let create =").unwrap()..];
+            assert!(
+                create.find("let copy_focus = copy_id.get_value();").unwrap() < create.find("async move {").unwrap()
+            );
+        }
+        let reset = source_body(pages, "ResetPanel");
+        assert!(reset.contains("let field_focus = field_id.get_value();"));
+        assert!(reset.contains("if busy.is_disposed()"));
+        assert!(
+            !reset[reset.find("async move {").unwrap()..reset.find("let (name1").unwrap()].contains(".get_value()")
+        );
+        let users = source_body(pages, "Users");
+        assert!(users.contains("let Some(previous) = generation.try_get_value() else"));
+        let device = source_body(pages, "Device");
+        assert!(device.contains("focus_later(busy, target.into())"));
+        assert!(device.contains("if password_required"));
+    }
 
     /// Copy sits inside forms (Machines' login code): it must not submit them.
     #[test]
     fn copy_never_submits_its_form() {
         let src = include_str!("ui.rs").split("#[cfg(test)]").next().unwrap();
         let copy = &src[src.find("pub fn Copy").unwrap()..src.find("pub fn ErrorBox").unwrap()];
-        assert!(copy.contains(r#"<button class="btn btn-ghost btn-sm" type="button" on:click=copy>"#), "{copy}");
+        assert!(copy.contains(r#"<button id=id class="btn btn-ghost btn-sm" type="button" on:click=copy>"#), "{copy}");
     }
 
     #[test]

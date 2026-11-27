@@ -14,7 +14,7 @@ use tunnel_protocol::CloseReason;
 
 use super::checks::{
     INVITE_PREFIX, audit, bad_sign_in, busy, changed_meanwhile, check_password, check_second_factor, invalid_invite,
-    invite_token_hash, keys, require_fresh_auth, too_many, totp_aad,
+    invite_token_hash, keys, require_fresh_auth, require_machine_auth, too_many, totp_aad,
 };
 use super::email::{self, notify};
 use super::{AdminSigned, Ctx, REAUTH_S, Signed, clear_cookie, session_cookie, totp};
@@ -95,7 +95,7 @@ pub fn validate_username(name: &str) -> ApiResult<String> {
         Ok(name)
     } else {
         Err(ApiError::validation(format!(
-            "username: 1..={MAX_USERNAME} characters: letters, digits, '.', '_', '-', starting with a letter or digit"
+            "Username: 1..={MAX_USERNAME} characters: letters, digits, '.', '_', '-', starting with a letter or digit"
         )))
     }
 }
@@ -106,7 +106,7 @@ fn validate_password(password: &str) -> ApiResult<()> {
         Ok(())
     } else {
         Err(ApiError::validation(format!(
-            "password must be {MIN_ACCOUNT_PASSWORD}..={} characters",
+            "Password must be {MIN_ACCOUNT_PASSWORD}..={} characters",
             password::MAX_PASSWORD_LEN
         )))
     }
@@ -142,7 +142,7 @@ async fn start_session(
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "signed_out",
-            "your sign-in changed meanwhile; sign in again",
+            "Your sign-in changed meanwhile; sign in again",
         ));
     }
     let max_age = if pending { crate::accounts::PENDING_TTL_S } else { crate::accounts::SESSION_MAX_S };
@@ -197,13 +197,18 @@ async fn session(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Json
     let owner_exists = state.db.owner_exists().await? && !state.db.owner_without_password().await?;
     let server = server_summary(&state);
     Ok(Json(match &ctx.session {
-        Some((id, s)) if !s.pending => json!({
-            "user": user_json(&state, &s.user), "pending": false, "csrf": keys(&state)?.csrf_token(id),
-            "owner_exists": owner_exists, "server": server,
-            "traffic": state.traffic.view(&state.db, &s.user.id).await?,
-            "usage": usage_json(&state, &s.user.id).await?,
-            "email_pending": email::pending(&state, &s.user.id).await?,
-        }),
+        Some((id, s)) if !s.pending => {
+            let mut user = user_json(&state, &s.user);
+            user["recovery_codes_left"] =
+                json!(if s.user.totp { state.db.recovery_codes_left(s.user.id.clone()).await? } else { 0 });
+            json!({
+                "user": user, "pending": false, "csrf": keys(&state)?.csrf_token(id),
+                "owner_exists": owner_exists, "server": server,
+                "traffic": state.traffic.view(&state.db, &s.user.id).await?,
+                "usage": usage_json(&state, &s.user.id).await?,
+                "email_pending": email::pending(&state, &s.user.id).await?,
+            })
+        }
         Some((_, s)) => {
             json!({ "user": null, "pending": true, "pending_user": s.user.username, "csrf": null, "owner_exists": owner_exists, "server": server })
         }
@@ -284,20 +289,26 @@ async fn login_totp(
     ApiJson(req): ApiJson<CodeRequest>,
 ) -> ApiResult<Response> {
     let Some((id, s)) = ctx.session.as_ref().filter(|(_, s)| s.pending) else {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "sign in with your password first"));
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "Sign in with your password first"));
     };
     let user_id = s.user.id.clone();
-    if let Err(e) = check_second_factor(&state, &state.ui.login_factor, &user_id, &req.code).await {
-        audit(&state, Some(&user_id), "login_failed", Some("second factor".into()), &ctx).await;
-        return Err(e);
-    }
+    let recovery_code = match check_second_factor(&state, &state.ui.login_factor, &user_id, &req.code).await {
+        Ok(recovery_code) => recovery_code,
+        Err(e) => {
+            audit(&state, Some(&user_id), "login_failed", Some("second factor".into()), &ctx).await;
+            return Err(e);
+        }
+    };
     // Swaps the pending session for a full one only if it still exists and
     // the user's sign-in has not changed since the password was checked.
     let (cookie, csrf) =
         start_session(&state, &user_id, false, s.auth_epoch, Some(tokens::hash_token(id)), &ctx).await?;
     audit(&state, Some(&user_id), "login", None, &ctx).await;
     let left = state.db.recovery_codes_left(user_id).await?;
-    Ok(with_cookie(cookie, json!({ "status": "ok", "csrf": csrf, "recovery_codes_left": left })))
+    Ok(with_cookie(
+        cookie,
+        json!({ "status": "ok", "csrf": csrf, "recovery_codes_left": left, "recovery_code": recovery_code }),
+    ))
 }
 
 async fn logout(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Response> {
@@ -309,7 +320,7 @@ async fn logout(State(state): State<Arc<AppState>>, ctx: Ctx) -> ApiResult<Respo
                 return Err(ApiError::new(
                     StatusCode::FORBIDDEN,
                     "csrf",
-                    "missing or stale CSRF token; reload the page",
+                    "Missing or stale CSRF token; reload the page",
                 ));
             }
         }
@@ -362,9 +373,6 @@ struct AcceptRequest {
     #[serde(default)]
     username: Option<String>,
     password: String,
-    /// Resets only: also remove the account's machines (their tokens stop working).
-    #[serde(default)]
-    revoke_machines: bool,
     /// Mailed password resets of accounts with two-factor sign-in: a TOTP or recovery code.
     #[serde(default)]
     code: Option<String>,
@@ -386,6 +394,7 @@ async fn invite_accept(
     validate_password(&req.password)?;
     // Hashed first: a busy server must not cost a second factor (a recovery code is single use).
     let password_hash = password::hash(req.password).await.map_err(|_| busy())?;
+    let mut recovery_code = false;
     if invite.kind == InviteKind::PasswordReset {
         // An address is never a second factor: with TOTP on, a code is due
         // (the same lockout as at sign-in), and the reset keeps TOTP on.
@@ -393,17 +402,20 @@ async fn invite_accept(
         let (user_id, totp) = state.db.password_reset_target(hash.clone()).await?.ok_or_else(invalid_invite)?;
         if totp {
             let code = req.code.as_deref().filter(|c| !c.trim().is_empty()).ok_or_else(|| {
-                ApiError::new(StatusCode::UNAUTHORIZED, "code_required", "enter a code from your authenticator app")
+                ApiError::new(StatusCode::UNAUTHORIZED, "code_required", "Enter a code from your authenticator app")
             })?;
-            if let Err(e) = check_second_factor(&state, &state.ui.login_factor, &user_id, code).await {
-                audit(&state, Some(&user_id), "login_failed", Some("password reset code".into()), &ctx).await;
-                return Err(e);
-            }
+            recovery_code = match check_second_factor(&state, &state.ui.login_factor, &user_id, code).await {
+                Ok(used) => used,
+                Err(e) => {
+                    audit(&state, Some(&user_id), "login_failed", Some("password reset code".into()), &ctx).await;
+                    return Err(e);
+                }
+            };
         }
     }
     let acceptance =
         if matches!(invite.kind, InviteKind::OwnerReset | InviteKind::AccountReset | InviteKind::PasswordReset) {
-            Acceptance::Reset { password_hash, revoke_machines: req.revoke_machines }
+            Acceptance::Reset { password_hash }
         } else {
             let username = validate_username(req.username.as_deref().unwrap_or_default())?;
             // New users start on the server defaults for their role.
@@ -414,10 +426,18 @@ async fn invite_accept(
                 can_public: false,
             })
         };
-    let (user_id, epoch, tunnels) = match state.db.accept_invite(hash, acceptance, state.pepper.clone()).await? {
+    let accepted = state
+        .revoke_tunnels(move |state| async move {
+            Ok(match state.db.accept_invite(hash, acceptance, state.pepper.clone()).await? {
+                Ok((user_id, epoch, tunnels)) => (Ok((user_id, epoch)), tunnels),
+                Err(error) => (Err(error), Vec::new()),
+            })
+        })
+        .await?;
+    let (user_id, epoch) = match accepted {
         Ok(found) => found,
         Err(AcceptError::UsernameTaken) => {
-            return Err(ApiError::new(StatusCode::CONFLICT, "username_taken", "that username is taken"));
+            return Err(ApiError::new(StatusCode::CONFLICT, "username_taken", "That username is taken"));
         }
         Err(AcceptError::Invalid | AcceptError::OwnerState) => return Err(invalid_invite()),
     };
@@ -429,9 +449,6 @@ async fn invite_accept(
         InviteKind::PasswordReset => ("password_reset", Some(Notice::PasswordReset)),
         InviteKind::EmailVerify => ("email_verified", None),
     };
-    for t in &tunnels {
-        state.delete_tunnel(t, CloseReason::Deleted).await?;
-    }
     audit(&state, Some(&user_id), action, Some(invite.id), &ctx).await;
     if let Some(n) = notice {
         notify(&state, &user_id, n, &ctx).await;
@@ -440,7 +457,11 @@ async fn invite_accept(
         state.db.delete_ui_session(tokens::hash_token(old)).await?;
     }
     let (cookie, csrf) = start_session(&state, &user_id, false, epoch, None, &ctx).await?;
-    Ok(with_cookie(cookie, json!({ "status": "ok", "csrf": csrf })))
+    let left = state.db.recovery_codes_left(user_id).await?;
+    Ok(with_cookie(
+        cookie,
+        json!({ "status": "ok", "csrf": csrf, "recovery_codes_left": left, "recovery_code": recovery_code }),
+    ))
 }
 
 async fn cli_info(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -505,7 +526,7 @@ async fn totp_setup(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "totp_enabled",
-            "two-factor sign-in is already on; turn it off first",
+            "Two-factor sign-in is already on; turn it off first",
         ));
     }
     check_password(&state, &user.id, &req.password).await?;
@@ -527,8 +548,8 @@ async fn totp_setup(
     Ok(Json(json!({ "secret": totp::base32(&secret), "otpauth_uri": uri, "qr": data_uri })))
 }
 
-/// The codes to show once, and their sealed hashes to store (see `pepper`).
-fn new_recovery_codes(pepper: &crate::pepper::Pepper, user_id: &str) -> (Vec<String>, Vec<String>) {
+/// The codes to show once, and raw hashes sealed by the account write.
+fn new_recovery_codes() -> (Vec<String>, Vec<String>) {
     use rand::TryRng;
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut shown = Vec::new();
@@ -537,7 +558,7 @@ fn new_recovery_codes(pepper: &crate::pepper::Pepper, user_id: &str) -> (Vec<Str
         let mut bytes = [0u8; 10];
         rand::rngs::SysRng.try_fill_bytes(&mut bytes).expect("OS random source failed");
         let code: String = bytes.iter().map(|b| ALPHABET[(b & 31) as usize] as char).collect();
-        hashes.push(pepper.wrap(&tokens::hash_token(&code), crate::pepper::Purpose::Recovery, user_id));
+        hashes.push(tokens::hash_token(&code));
         shown.push(format!("{}-{}", &code[..5], &code[5..]));
     }
     (shown, hashes)
@@ -555,17 +576,21 @@ async fn totp_enable(
     let creds = state.db.credentials(None, Some(user_id.clone())).await?.ok_or_else(|| ApiError::not_found("user"))?;
     let sealed = creds
         .totp_pending_sealed
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no_setup", "start two-factor setup first"))?;
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no_setup", "Start two-factor setup first"))?;
     let secret = keys(&state)?
         .open(&sealed, &totp_aad(&user_id))
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("pending TOTP secret does not open")))?;
     let step = totp::verify(&secret, &req.code, now(), None).ok_or_else(|| {
-        ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "wrong code; check the time on your device")
+        ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "Wrong code; check the time on your device")
     })?;
-    let (shown, hashes) = new_recovery_codes(&state.pepper, &user_id);
-    if !state.db.enable_totp(user_id.clone(), sealed, step, hashes, creds.auth_epoch, s.session.id_hash.clone()).await?
+    let (shown, recovery_hashes) = new_recovery_codes();
+    let setup = crate::accounts::TotpSetup { sealed, step, recovery_hashes };
+    if !state
+        .db
+        .enable_totp(user_id.clone(), setup, creds.auth_epoch, s.session.id_hash.clone(), state.pepper.clone())
+        .await?
     {
-        return Err(ApiError::new(StatusCode::CONFLICT, "no_setup", "setup was restarted; scan the new code"));
+        return Err(ApiError::new(StatusCode::CONFLICT, "no_setup", "Setup was restarted; scan the new code"));
     }
     audit(&state, Some(&user_id), "totp_enabled", None, &s.ctx).await;
     notify(&state, &user_id, Notice::TotpEnabled, &s.ctx).await;
@@ -632,7 +657,7 @@ struct AllQuery {
 fn scope(s: &Signed, q: &AllQuery) -> ApiResult<Option<String>> {
     match q.all {
         Some(true) if s.user().role.is_admin() => Ok(None),
-        Some(true) => Err(ApiError::new(StatusCode::FORBIDDEN, "admin_only", "only admins can list everyone's")),
+        Some(true) => Err(ApiError::new(StatusCode::FORBIDDEN, "admin_only", "Only admins can list everyone's")),
         _ => Ok(Some(s.user().id.clone())),
     }
 }
@@ -649,6 +674,9 @@ struct NewMachine {
     /// TOTP or recovery code when the session's last check is stale (as for approval).
     #[serde(default)]
     code: Option<String>,
+    /// Current password for stale sessions without two-factor sign-in.
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// A login code for a machine without a browser (`tunnel login <code>`).
@@ -658,7 +686,7 @@ async fn add_machine(
     ApiJson(req): ApiJson<NewMachine>,
 ) -> ApiResult<Json<Value>> {
     let user_id = s.user().id.clone();
-    require_fresh_auth(&state, &s, req.code.as_deref()).await?;
+    require_machine_auth(&state, &s, req.code.as_deref(), req.password.as_deref()).await?;
     match clients::add(&state.db, &state.config, &req.name, &user_id, Some(s.session.id_hash.clone())).await {
         Ok(e) => {
             audit(&state, Some(&user_id), "machine_added", Some(e.name.clone()), &s.ctx).await;
@@ -667,10 +695,10 @@ async fn add_machine(
         }
         Err(clients::AddError::Invalid(m)) => Err(ApiError::validation(m)),
         Err(clients::AddError::Taken) => {
-            Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "a machine with this name exists; pick another"))
+            Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "A machine with this name exists; pick another"))
         }
         Err(clients::AddError::Quota { limit, role }) => Err(client_quota(limit, role)),
-        Err(clients::AddError::NoUser) => Err(ApiError::new(StatusCode::FORBIDDEN, "disabled", "account disabled")),
+        Err(clients::AddError::NoUser) => Err(ApiError::new(StatusCode::FORBIDDEN, "disabled", "Account disabled")),
         Err(clients::AddError::Other(e)) => Err(e.into()),
     }
 }
@@ -697,14 +725,14 @@ async fn delete_machine(
     s: Signed,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let tunnels = state
-        .db
-        .delete_client_for(name.clone(), s.user().id.clone())
+    let (deleted, actor) = (name.clone(), s.user().id.clone());
+    state
+        .revoke_tunnels(move |state| async move {
+            let tunnels = state.db.delete_client_for(deleted, actor).await?;
+            Ok((tunnels.is_some().then_some(()), tunnels.unwrap_or_default()))
+        })
         .await?
         .ok_or_else(|| ApiError::not_found("machine"))?;
-    for id in &tunnels {
-        state.delete_tunnel(id, CloseReason::Deleted).await?;
-    }
     audit(&state, Some(&s.user().id), "machine_deleted", Some(name), &s.ctx).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -731,7 +759,7 @@ async fn rename_machine(
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "client_exists",
-                "a machine with this name exists; pick another",
+                "A machine with this name exists; pick another",
             ));
         }
         Err(RenameError::SignedOut) => return Err(changed_meanwhile()),
@@ -863,7 +891,7 @@ async fn open_tunnel(
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "not_owner",
-            "only the tunnel's owner can open it without signing in; make an access link under Links instead",
+            "Only the tunnel's owner can open it without signing in; make an access link under Links instead",
         ));
     }
     if row.is_expired() {
@@ -874,7 +902,7 @@ async fn open_tunnel(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "port_not_connected",
-            "this port is not connected: start the app and the tunnel on its machine",
+            "This port is not connected: start the app and the tunnel on its machine",
         ));
     }
     let ttl = OPEN_TTL_S.min(row.expires_at - crate::tokens::now() - 5);
@@ -882,7 +910,7 @@ async fn open_tunnel(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "tunnel_ending",
-            "this tunnel ends in less than a minute; it can no longer be opened",
+            "This tunnel ends in less than a minute; it can no longer be opened",
         ));
     }
     let ui = (s.user().id.clone(), s.session.id_hash.clone());
@@ -936,7 +964,7 @@ struct UserCode {
 }
 
 fn unknown_code() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "unknown_code", "no pending login with this code; check it, or start again")
+    ApiError::new(StatusCode::NOT_FOUND, "unknown_code", "No pending login with this code; check it, or start again")
 }
 
 async fn device_lookup(
@@ -950,7 +978,8 @@ async fn device_lookup(
     let code = normalize_user_code(&req.user_code).ok_or_else(unknown_code)?;
     let found = state.db.device_request(code).await?.ok_or_else(unknown_code)?;
     let needs_code = s.user().totp && now() - s.session.auth_at > REAUTH_S;
-    Ok(Json(json!({ "request": found, "needs_code": needs_code })))
+    let needs_password = !s.user().totp && now() - s.session.auth_at > REAUTH_S;
+    Ok(Json(json!({ "request": found, "needs_code": needs_code, "needs_password": needs_password })))
 }
 
 #[derive(Deserialize)]
@@ -962,6 +991,9 @@ struct Decide {
     /// check is older than ten minutes and the user has two-factor sign-in.
     #[serde(default)]
     code: Option<String>,
+    /// Current password for stale sessions without two-factor sign-in.
+    #[serde(default)]
+    password: Option<String>,
 }
 
 async fn device_decide(
@@ -975,7 +1007,7 @@ async fn device_decide(
     let user_id = s.user().id.clone();
     let code = normalize_user_code(&req.user_code).ok_or_else(unknown_code)?;
     if req.approve {
-        require_fresh_auth(&state, &s, req.code.as_deref()).await?;
+        require_machine_auth(&state, &s, req.code.as_deref(), req.password.as_deref()).await?;
     }
     match state.db.decide_device(code, user_id.clone(), req.approve, s.session.id_hash.clone()).await? {
         Ok(name) => {
@@ -989,10 +1021,10 @@ async fn device_decide(
         Err(DecideError::NotFound) => Err(unknown_code()),
         Err(DecideError::Client(NewClientError::Quota { limit, role })) => Err(client_quota(limit, role)),
         Err(DecideError::Client(NewClientError::NoUser)) => {
-            Err(ApiError::new(StatusCode::FORBIDDEN, "disabled", "account disabled"))
+            Err(ApiError::new(StatusCode::FORBIDDEN, "disabled", "Account disabled"))
         }
         Err(DecideError::Client(NewClientError::NameTaken)) => {
-            Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "no free machine name"))
+            Err(ApiError::new(StatusCode::CONFLICT, "client_exists", "No free machine name"))
         }
     }
 }
@@ -1039,22 +1071,22 @@ async fn update_user(
     let actor = s.user().clone();
     let target = state.db.credentials(None, Some(id.clone())).await?.ok_or_else(|| ApiError::not_found("user"))?.user;
     if target.role == Role::Owner || target.id == actor.id {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you cannot change the owner or yourself here"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "You cannot change the owner or yourself here"));
     }
     if !may_manage(&state, &actor, &target.id).await? {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "only the owner can change admins"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "Only the owner can change admins"));
     }
     if req.role.is_some() && actor.role != Role::Owner {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "only the owner can change roles"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "Only the owner can change roles"));
     }
     if req.role == Some(Role::Owner) {
-        return Err(ApiError::validation("there is exactly one owner"));
+        return Err(ApiError::validation("There is exactly one owner"));
     }
     let limits = req.limits.unwrap_or_default();
     limits.validate().map_err(ApiError::validation)?;
     if req.role.is_some() && limits != crate::limits::SettingsPatch::default() {
         return Err(ApiError::validation(
-            "change the role and the limits in separate requests: a role change resets the limits to the server default",
+            "Change the role and the limits in separate requests: a role change resets the limits to the server default",
         ));
     }
     let patch = UserPatch { role: req.role, can_public: req.can_public, limits };
@@ -1071,8 +1103,26 @@ async fn update_user(
         let username = target.username.clone();
         tokio::spawn(async move {
             let changes = state.traffic.changes().await;
-            let updated = state.db.admin_update_user(actor.clone(), session, id, patch, disabled).await?;
+            let updated = state
+                .db
+                .admin_update_user(
+                    actor.clone(),
+                    session,
+                    id,
+                    patch,
+                    disabled,
+                    state.config.limits.allow_public_for_clients,
+                )
+                .await?;
             if let Ok((user, update)) = &updated {
+                for t in &update.closed {
+                    state.delete_tunnel(t, CloseReason::Deleted).await?;
+                }
+                for t in &update.restricted {
+                    state.invalidate_tunnel(t);
+                    state.registry.rotate_gate_epoch(t);
+                }
+
                 let defaults = state.db.limit_defaults();
                 // Always the committed row's cap: a role or limit change by a
                 // concurrent request may have committed just before this one.
@@ -1112,16 +1162,13 @@ async fn update_user(
         Ok(found) => found,
         Err(crate::accounts::AdminError::NotFound) => return Err(ApiError::not_found("user")),
         Err(crate::accounts::AdminError::Forbidden) => {
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you may not change this user"));
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "You may not change this user"));
         }
         Err(crate::accounts::AdminError::SignedOut) => return Err(changed_meanwhile()),
     };
-    for t in &update.closed {
-        state.delete_tunnel(t, CloseReason::Deleted).await?;
-    }
     audit(&state, Some(&actor.id), "user_updated", Some(target.username.clone()), &s.ctx).await;
     if user.role != target.role {
-        let n = Notice::RoleChanged { from: target.role.as_str().into(), to: user.role.as_str().into() };
+        let n = Notice::RoleChanged { to: user.role.as_str().into(), by: actor.username.clone() };
         notify(&state, &user.id, n, &s.ctx).await;
     }
     if let Some(disabled) = req.disabled {
@@ -1146,7 +1193,7 @@ async fn reset_user_traffic(
         Ok(_) => Ok(Json(json!({ "traffic": state.traffic.view(&state.db, &id).await? }))),
         Err(crate::accounts::AdminError::NotFound) => Err(ApiError::not_found("user")),
         Err(crate::accounts::AdminError::Forbidden) => {
-            Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "you may not change this user"))
+            Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "You may not change this user"))
         }
         Err(crate::accounts::AdminError::SignedOut) => Err(changed_meanwhile()),
     }
@@ -1189,24 +1236,24 @@ async fn create_invite(
     ApiJson(req): ApiJson<NewInvite>,
 ) -> ApiResult<Json<Value>> {
     match req.role {
-        Role::Owner => return Err(ApiError::validation("there is exactly one owner")),
+        Role::Owner => return Err(ApiError::validation("There is exactly one owner")),
         Role::Admin if s.user().role != Role::Owner => {
-            return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "only the owner can invite admins"));
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "Only the owner can invite admins"));
         }
         _ => {}
     }
     let ttl = req.ttl_s.unwrap_or(INVITE_TTL_S);
     if !(3600..=30 * 86_400).contains(&ttl) {
-        return Err(ApiError::validation("ttl_s must be within 3600..=2592000"));
+        return Err(ApiError::validation("Ttl_s must be within 3600..=2592000"));
     }
     let ui = state.config.ui_host.clone().ok_or_else(|| ApiError::not_found("route"))?;
     let email = match req.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
         None => None,
         Some(e) => {
-            email::mailer(&state).map_err(|_| ApiError::validation("this server sends no email; copy the link"))?;
+            email::mailer(&state).map_err(|_| ApiError::validation("This server sends no email; copy the link"))?;
             let e = crate::config::smtp::parse_address(e).map_err(ApiError::validation)?;
             if state.db.email_in_use(e.clone()).await? {
-                return Err(ApiError::new(StatusCode::CONFLICT, "email_taken", "an account already has this address"));
+                return Err(ApiError::new(StatusCode::CONFLICT, "email_taken", "An account already has this address"));
             }
             if !state.ui.mail_user.check_key(s.user().id.clone()) {
                 return Err(too_many());
@@ -1261,12 +1308,12 @@ fn reset_forbidden() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
         "forbidden",
-        "admins reset members and the owner resets admins; the owner uses `tunnel-server admin link`",
+        "Admins reset members and the owner resets admins; the owner uses `tunnel-server admin link`",
     )
 }
 
 fn no_email() -> ApiError {
-    ApiError::new(StatusCode::CONFLICT, "no_email", "this account has no confirmed email address; copy the link")
+    ApiError::new(StatusCode::CONFLICT, "no_email", "This account has no confirmed email address; copy the link")
 }
 
 /// One recovery mail per account per `RECOVERY_MAIL_COOLDOWN_S`; the link itself may still be handed over.
@@ -1275,7 +1322,7 @@ fn mail_cooldown(wait_s: i64) -> ApiError {
         StatusCode::TOO_MANY_REQUESTS,
         "mail_cooldown",
         format!(
-            "a reset mail was sent to this account recently; try again in {wait_s} s, or make the link without mailing it"
+            "A reset mail was sent to this account recently; try again in {wait_s} s, or make the link without mailing it"
         ),
     )
 }
@@ -1291,7 +1338,7 @@ async fn create_reset_link(
     let ttl = req.ttl_s.unwrap_or(RESET_LINK_TTL_S);
     if !RESET_LINK_TTL_RANGE.contains(&ttl) {
         return Err(ApiError::validation(format!(
-            "ttl_s must be within {}..={}",
+            "Ttl_s must be within {}..={}",
             RESET_LINK_TTL_RANGE.start(),
             RESET_LINK_TTL_RANGE.end()
         )));
@@ -1304,7 +1351,7 @@ async fn create_reset_link(
     }
     let mailer = if req.send_email {
         let mailer =
-            email::mailer(&state).map_err(|_| ApiError::validation("this server sends no email; copy the link"))?;
+            email::mailer(&state).map_err(|_| ApiError::validation("This server sends no email; copy the link"))?;
         if target.email.is_none() {
             return Err(no_email());
         }
@@ -1340,7 +1387,7 @@ async fn create_reset_link(
         Err(ResetLinkError::NotFound) => return Err(ApiError::not_found("user")),
         Err(ResetLinkError::Forbidden) => return Err(reset_forbidden()),
         Err(ResetLinkError::Disabled) => {
-            return Err(ApiError::new(StatusCode::CONFLICT, "disabled", "this account is disabled; enable it first"));
+            return Err(ApiError::new(StatusCode::CONFLICT, "disabled", "This account is disabled; enable it first"));
         }
         Err(ResetLinkError::SignedOut) => return Err(changed_meanwhile()),
         Err(ResetLinkError::NoEmail) => return Err(no_email()),

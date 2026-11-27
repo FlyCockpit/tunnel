@@ -5,8 +5,6 @@
 
 use std::cell::RefCell;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -54,10 +52,8 @@ fn unsent<E>(_: E) -> ApiError {
     }
 }
 
-/// The API's messages are lower-case clauses (`wrong username or password`),
-/// for callers that put them in their own text. Shown on their own they end
-/// as a sentence; the error styles capitalise the first letter (app.css,
-/// `::first-letter`: cheaper than case code in the wasm).
+/// The API's messages start with a capital letter. Add final punctuation
+/// when a message is a clause, so it reads as a sentence on its own.
 fn sentence(message: &str) -> String {
     let mut out = message.trim().to_string();
     if !out.is_empty() && !out.ends_with(['.', '?', '!']) {
@@ -66,7 +62,8 @@ fn sentence(message: &str) -> String {
     out
 }
 
-pub async fn call<T: DeserializeOwned>(method: &str, path: &str, body: Option<&impl Serialize>) -> Result<T, ApiError> {
+// Parse JSON once; callers decode typed fields from Value.
+async fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, ApiError> {
     let init = RequestInit::new();
     init.set_method(method);
     init.set_credentials(RequestCredentials::SameOrigin);
@@ -96,24 +93,28 @@ pub async fn call<T: DeserializeOwned>(method: &str, path: &str, body: Option<&i
             message: v["error"]["message"].as_str().map(sentence).unwrap_or_else(|| format!("HTTP {status}")),
         });
     }
-    let text = if text.trim().is_empty() { "null".to_string() } else { text };
-    serde_json::from_str(&text).map_err(|e| ApiError { status, code: "decode".into(), message: e.to_string() })
+    let text = if text.trim().is_empty() { "null" } else { &text };
+    serde_json::from_str(text).map_err(|_| ApiError {
+        status,
+        code: "decode".into(),
+        message: "The server sent an unreadable answer; reload this page and try again.".into(),
+    })
 }
 
-pub async fn get<T: DeserializeOwned>(path: &str) -> Result<T, ApiError> {
-    call::<T>("GET", path, None::<&()>).await
+pub async fn get(path: &str) -> Result<Value, ApiError> {
+    call("GET", path, None).await
 }
 
-pub async fn post<T: DeserializeOwned>(path: &str, body: &impl Serialize) -> Result<T, ApiError> {
-    call::<T>("POST", path, Some(body)).await
+pub async fn post(path: &str, body: &Value) -> Result<Value, ApiError> {
+    call("POST", path, Some(body)).await
 }
 
-pub async fn patch<T: DeserializeOwned>(path: &str, body: &impl Serialize) -> Result<T, ApiError> {
-    call::<T>("PATCH", path, Some(body)).await
+pub async fn patch(path: &str, body: &Value) -> Result<Value, ApiError> {
+    call("PATCH", path, Some(body)).await
 }
 
 pub async fn delete(path: &str) -> Result<(), ApiError> {
-    call::<Value>("DELETE", path, None::<&()>).await.map(|_| ())
+    call("DELETE", path, None).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -122,15 +123,15 @@ mod tests {
 
     #[test]
     fn api_messages_end_as_sentences() {
-        assert_eq!(sentence("wrong username or password"), "wrong username or password.");
+        assert_eq!(sentence("Wrong username or password"), "Wrong username or password.");
         assert_eq!(sentence("Already a sentence."), "Already a sentence.");
-        assert_eq!(sentence("sign in again?"), "sign in again?");
+        assert_eq!(sentence("Sign in again?"), "Sign in again?");
         assert_eq!(sentence("  "), "");
         for e in [network(()), unsent(())] {
             assert_eq!(sentence(&e.message), e.message, "the page's own messages are sentences too");
         }
         let css = include_str!("../style/app.css");
-        assert!(css.contains(".field-error::first-letter, .alert::first-letter { text-transform: uppercase; }"));
+        assert!(!css.contains(".field-error::first-letter") && !css.contains(".alert::first-letter"));
     }
 
     #[test]

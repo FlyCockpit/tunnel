@@ -15,19 +15,19 @@ pub const INVITE_PREFIX: &str = "tninv_";
 /// The user's sign-in changed (password, two-factor, reset) or this session
 /// ended while the request ran.
 pub(super) fn changed_meanwhile() -> ApiError {
-    ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "your sign-in changed meanwhile; sign in again")
+    ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "Your sign-in changed meanwhile; sign in again")
 }
 
 pub(super) fn too_many() -> ApiError {
-    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many attempts; wait a minute")
+    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Too many attempts; wait a minute")
 }
 
 pub(super) fn busy() -> ApiError {
-    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the server is busy checking passwords; try again")
+    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "The server is busy checking passwords; try again")
 }
 
 pub(super) fn bad_credentials() -> ApiError {
-    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", "wrong username or password")
+    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", "Wrong username or password")
 }
 
 /// A refused sign-in on the sign-in page, with what to do about a forgotten
@@ -40,7 +40,7 @@ pub(super) fn bad_sign_in(state: &AppState) -> ApiError {
         "Forgot your password? Ask an admin of this server to reset your sign-in. \
          Only if you are the owner: run tunnel-server admin link on the server."
     };
-    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", format!("wrong username or password. {next}"))
+    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_credentials", format!("Wrong username or password. {next}"))
 }
 
 pub(super) fn keys(state: &AppState) -> ApiResult<&crate::seal::Keys> {
@@ -59,7 +59,6 @@ pub(super) async fn audit(
     }
 }
 
-/// Check the current password of `user_id` (rate-limited per user, before Argon2).
 /// Check the current password of `user_id` (rate-limited per user, before
 /// Argon2). Returns the auth epoch it was checked at.
 pub(super) async fn check_password(state: &AppState, user_id: &str, password: &str) -> ApiResult<i64> {
@@ -78,33 +77,33 @@ pub(super) async fn check_password(state: &AppState, user_id: &str, password: &s
     {
         Verdict::Match => Ok(creds.auth_epoch),
         Verdict::NoMatch => {
-            Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_password", "the current password is wrong"))
+            Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_password", "The current password is wrong"))
         }
         Verdict::Busy => Err(busy()),
     }
 }
 
-/// Check a TOTP code or recovery code for `user_id` (single use either way).
 /// Check a TOTP code or recovery code for `user_id` (single use either
 /// way). `limiter` is the pre-session (sign-in) or in-session one. Wrong
 /// codes count towards a lockout that survives restarts: five in a row lock
-/// the second factor for 15 minutes, doubling up to a day.
+/// the second factor for 15 minutes, doubling up to a day. Returns whether
+/// the accepted code was a recovery code.
 pub(super) async fn check_second_factor(
     state: &AppState,
     limiter: &crate::ratelimit::Limiter<String>,
     user_id: &str,
     code: &str,
-) -> ApiResult<()> {
+) -> ApiResult<bool> {
     if !limiter.check_key(user_id.to_string()) {
         return Err(too_many());
     }
-    let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "wrong or already used code");
+    let wrong = || ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "Wrong or already used code");
     let creds = state.db.credentials(None, Some(user_id.to_string())).await?.ok_or_else(wrong)?;
     if let Some(until) = creds.factor_locked_until.filter(|u| *u > now()) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "locked",
-            format!("too many wrong codes; try again in {} minutes", (until - now()) / 60 + 1),
+            format!("Too many wrong codes; try again in {} minutes", (until - now()) / 60 + 1),
         ));
     }
     let sealed = creds.totp_sealed.ok_or_else(wrong)?;
@@ -124,7 +123,7 @@ pub(super) async fn check_second_factor(
     };
     if ok {
         state.db.factor_ok(user_id.to_string()).await?;
-        Ok(())
+        Ok(normalized.len() == 10)
     } else {
         if state.db.factor_failed(user_id.to_string()).await?.is_some() {
             tracing::warn!(user = %user_id, "second factor locked after repeated wrong codes");
@@ -140,9 +139,38 @@ pub(super) async fn require_fresh_auth(state: &AppState, s: &Signed, code: Optio
         return Ok(());
     }
     let code = code.ok_or_else(|| {
-        ApiError::new(StatusCode::UNAUTHORIZED, "code_required", "enter a code from your authenticator app")
+        ApiError::new(StatusCode::UNAUTHORIZED, "code_required", "Enter a code from your authenticator app")
     })?;
     check_second_factor(state, &state.ui.reauth, &s.user().id, code).await?;
+    state.db.touch_ui_auth(s.session.id_hash.clone()).await?;
+    Ok(())
+}
+
+/// Both browser approval and headless enrollment mint a permanent machine
+/// login, so stale sessions must confirm a factor even without TOTP.
+pub(super) async fn require_machine_auth(
+    state: &AppState,
+    s: &Signed,
+    code: Option<&str>,
+    password: Option<&str>,
+) -> ApiResult<()> {
+    if s.user().totp || now() - s.session.auth_at <= REAUTH_S {
+        return require_fresh_auth(state, s, code).await;
+    }
+    let password = password.ok_or_else(|| {
+        ApiError::new(StatusCode::UNAUTHORIZED, "password_required", "Enter your password to approve the machine.")
+    })?;
+    match check_password(state, &s.user().id, password).await {
+        Ok(epoch) if epoch == s.session.auth_epoch => {}
+        Ok(_) => return Err(changed_meanwhile()),
+        Err(mut e) => {
+            audit(state, Some(&s.user().id), "login_failed", Some("machine enrollment password".into()), &s.ctx).await;
+            if e.code == "invalid_password" {
+                e.message = "Wrong password.".into();
+            }
+            return Err(e);
+        }
+    }
     state.db.touch_ui_auth(s.session.id_hash.clone()).await?;
     Ok(())
 }
@@ -161,6 +189,6 @@ pub(super) fn invalid_invite() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "invalid_invite",
-        "this link is invalid, used or expired; ask whoever sent it for a new one",
+        "This link is invalid, used or expired; ask whoever sent it for a new one",
     )
 }

@@ -304,6 +304,33 @@ impl AppState {
         self.session_cache.clear();
     }
 
+    /// Commit a credential revocation and close every affected tunnel in one
+    /// detached task. Dropping the caller cannot strand live connections after
+    /// the blocking database operation commits.
+    pub async fn revoke_tunnels<T, F, Fut>(self: &Arc<Self>, transaction: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<(T, Vec<String>)>> + Send,
+    {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let (result, tunnels) = transaction(state.clone()).await?;
+            // Attempt every teardown even if one database operation fails.
+            let mut failure = None;
+            for id in tunnels {
+                if let Err(error) = state.delete_tunnel(&id, CloseReason::Deleted).await {
+                    failure.get_or_insert(error);
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            Ok(result)
+        })
+        .await?
+    }
+
     /// Stop a tunnel: DB cascade + tombstone, drop caches, close the live
     /// connection with `reason`. Used by `DELETE /v1/tunnels/{id}` (Deleted)
     /// and the purge job (Expired).

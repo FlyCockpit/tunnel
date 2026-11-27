@@ -475,7 +475,7 @@ fn owner_rules(tx: &rusqlite::Transaction<'_>, owner: &str, policy: Policy) -> a
         let role = Role::parse(&role);
         let d = policy.defaults;
         OwnerRules {
-            public: role.is_admin() || can_public || policy.allow_all_public,
+            public: role.may_public(can_public, policy.allow_all_public),
             ttl_s: d.resolve(Kind::TunnelTtl, role, Setting::from_column(ttl)),
             service_max: None,
             account: Some((role, d.resolve(Kind::Tunnels, role, Setting::from_column(tunnels)))),
@@ -484,7 +484,7 @@ fn owner_rules(tx: &rusqlite::Transaction<'_>, owner: &str, policy: Policy) -> a
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("access.password is required for password mode")]
+#[error("Access.password is required for password mode")]
 pub struct PasswordRequired;
 
 #[derive(Debug, thiserror::Error)]
@@ -1512,6 +1512,18 @@ impl Db {
             tx.execute("DELETE FROM clients WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(Some(tunnels))
+        })
+        .await
+    }
+
+    /// Delete only the authenticated machine, even if its name changed meanwhile.
+    pub async fn delete_own_client(&self, id: String) -> anyhow::Result<Vec<String>> {
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let tunnels = expire_owner_tunnels(&tx, &id)?;
+            tx.execute("DELETE FROM clients WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(tunnels)
         })
         .await
     }

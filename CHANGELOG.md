@@ -8,6 +8,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Device approval and headless enrollment ask for a fresh password after ten
+  minutes for accounts without two-factor sign-in. Session responses include remaining recovery
+  codes, and code sign-ins identify when a recovery code was used.
+- Removing public permission switches existing public tunnels to link-only
+  and ends anonymous access immediately, including existing streams.
+- `tunnel logout` revokes its own machine token via `DELETE /v1/login` and closes
+  its tunnels before removing the local login. Unconfirmed revocations
+  (offline, timeout, or unexpected server answers) still remove the local
+  login and explain that it may remain valid and how to remove it in the web UI.
+
 - Row-bound AES-256-GCM wrapping of every account and tunnel Argon2id password
   hash, using an HKDF-SHA256 key derived from `ui_secret`. A database-only leak
   no longer permits offline password guessing without the config secret.
@@ -99,14 +109,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   (admins for members, the owner for admins; a fresh code with two-factor
   sign-in on) or `tunnel-server user reset <name> [--hours N]`. Single-use,
   an hour by default; opening one sets a new password, turns two-factor
-  sign-in off and ends the account's sessions. Void after any sign-in or role
+  sign-in off, ends the account's sessions, revokes all machine logins and closes
+  their tunnels. Void after any sign-in or role
   change of the account, or once its maker may no longer reset it; audited.
 - Optional email (`[smtp]`, lettre over rustls): `setup` offers it (flags
   `--smtp-*`, password from `$SMTP_PASS`), `tunnel-server mail setup | test |
   off` changes it later; failures name the step. With it: mailed invites
   (confirming the address), a confirmed address per account (changes confirmed
   by mail, the old address told), "Forgot password?" (same answer for every
-  input, rate limited, keeps two-factor sign-in and asks for its code), sign-in
+  input, rate limited, keeps two-factor sign-in and asks for its code; revokes
+  all machine logins and ends their tunnels when accepted), sign-in
   resets mailed by admins (sharing the one-mail-per-two-minutes account limit
   with "Forgot password?"), and security notices. Without it nothing changes.
 - Traffic counters per tunnel and per user and month (request/response bodies

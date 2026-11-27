@@ -269,7 +269,7 @@ async fn the_machine_limit_names_itself_and_spares_existing_machines() {
     assert_eq!(create_tunnel(&state, &laptop, json!({ "mode": "link" })).await.status, StatusCode::CREATED);
     let r = create_tunnel(&state, &laptop, json!({ "mode": "link" })).await;
     let message = r.body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("this machine's live-tunnel limit (2, limits.max_tunnels_per_client)"), "{message}");
+    assert!(message.contains("This machine's live-tunnel limit (2, limits.max_tunnels_per_client)"), "{message}");
     // Unlimited, and the server-shell's `client add --user` sees the same rule.
     assert_eq!(set(&state, &mut p.adam, &ann, json!({ "machines": "unlimited" })).await.status, StatusCode::OK);
     let r = p.ann.call(&state, "POST", "/ui/api/machines", Some(json!({ "name": "fourth" }))).await;
@@ -591,5 +591,129 @@ fn the_fresh_schema_stores_limits_in_four_nullable_checked_columns() {
     drop(c);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn public_previews_need_an_admin_or_permission() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let ann_token = approve_machine(&state, &mut ann, "laptop").await;
+    let owner_token = approve_machine(&state, &mut owner, "server").await;
+    let r = create_tunnel(&state, &ann_token, json!({ "mode": "public" })).await;
+    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::FORBIDDEN, json!("public_not_allowed")));
+    let info = bearer(&state, "GET", "/v1/server", &ann_token, None).await;
+    assert_eq!(info.body["limits"]["public_allowed"], false);
+    assert_eq!(info.body["ui_origin"], ORIGIN);
+    assert_eq!(create_tunnel(&state, &owner_token, json!({ "mode": "public" })).await.status, StatusCode::CREATED);
+    // Password mode stays allowed for members.
+    let r = create_tunnel(&state, &ann_token, json!({ "mode": "password", "username": "u", "password": "a-password" }))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+
+    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
+    let ann_id = users.body["users"].as_array().unwrap().iter().find(|u| u["username"] == "ann").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "can_public": true }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(create_tunnel(&state, &ann_token, json!({ "mode": "public" })).await.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn removing_public_permission_restricts_existing_tunnels_and_demotions() {
+    for demote in [false, true] {
+        let state = state();
+        let mut owner = owner(&state).await;
+        let mut ann = member(&state, &mut owner, "ann", 2).await;
+        let ann_id = state.db.user_by_name("ann".into()).await.unwrap().unwrap().id;
+        let path = format!("/ui/api/users/{ann_id}");
+        let allow = if demote { json!({ "role": "admin" }) } else { json!({ "can_public": true }) };
+        assert_eq!(owner.call(&state, "PATCH", &path, Some(allow)).await.status, StatusCode::OK);
+        if demote {
+            ann.call(&state, "POST", "/ui/api/login", Some(json!({ "username": "ann", "password": "ann-password" })))
+                .await;
+        }
+        let ann_token = approve_machine(&state, &mut ann, "ann-box").await;
+        let owner_token = approve_machine(&state, &mut owner, "owner-box").await;
+        let tunnel = create_tunnel(&state, &ann_token, json!({ "mode": "public" })).await;
+        let id = tunnel.body["id"].as_str().unwrap();
+        let other = create_tunnel(&state, &owner_token, json!({ "mode": "public" })).await;
+        let other_id = other.body["id"].as_str().unwrap();
+        let _live = connect(&state, id, &[3000]);
+        let public = state.tunnel(id).await.unwrap();
+        assert!(matches!(&*public, crate::db::TunnelLookup::Live(t) if t.access.mode == crate::db::AccessMode::Public));
+        let epoch = state.registry.gate_epoch(id);
+        let remove = if demote { json!({ "role": "member" }) } else { json!({ "can_public": false }) };
+        assert_eq!(owner.call(&state, "PATCH", &path, Some(remove)).await.status, StatusCode::OK);
+        assert!(epoch.is_cancelled(), "existing anonymous streams recheck");
+        let cached = state.tunnel(id).await.unwrap();
+        assert!(matches!(&*cached, crate::db::TunnelLookup::Live(t) if t.access.mode == crate::db::AccessMode::Link));
+        let response = crate::listener::tests::request_from(
+            &state,
+            peer(90),
+            &state.preview_host(3000, id),
+            "/",
+            http::Method::GET,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            state.db.get_tunnel(other_id.into()).await.unwrap().unwrap().access.mode,
+            crate::db::AccessMode::Public
+        );
+        assert_eq!(
+            owner.call(&state, "PATCH", &path, Some(json!({ "can_public": true }))).await.status,
+            StatusCode::OK
+        );
+        assert_eq!(state.db.get_tunnel(id.into()).await.unwrap().unwrap().access.mode, crate::db::AccessMode::Link);
+    }
+}
+
+#[tokio::test]
+async fn server_public_permission_keeps_tunnels_public_after_user_permission_is_removed() {
+    for demote in [false, true] {
+        let state = state_with(|config| config.limits.allow_public_for_clients = true);
+        let mut owner = owner(&state).await;
+        let mut ann = member(&state, &mut owner, "ann", 2).await;
+        let ann_id = state.db.user_by_name("ann".into()).await.unwrap().unwrap().id;
+        let path = format!("/ui/api/users/{ann_id}");
+        let allow = if demote { json!({ "role": "admin" }) } else { json!({ "can_public": true }) };
+        assert_eq!(owner.call(&state, "PATCH", &path, Some(allow)).await.status, StatusCode::OK);
+        if demote {
+            ann.call(&state, "POST", "/ui/api/login", Some(json!({ "username": "ann", "password": "ann-password" })))
+                .await;
+        }
+        let token = approve_machine(&state, &mut ann, "ann-box").await;
+        let tunnel = create_tunnel(&state, &token, json!({ "mode": "public" })).await;
+        assert_eq!(tunnel.status, StatusCode::CREATED, "{}", tunnel.body);
+        let id = tunnel.body["id"].as_str().unwrap();
+        let _live = connect(&state, id, &[3000]);
+        let cached = state.tunnel(id).await.unwrap();
+        let epoch = state.registry.gate_epoch(id);
+        let remove = if demote { json!({ "role": "member" }) } else { json!({ "can_public": false }) };
+        let updated = owner.call(&state, "PATCH", &path, Some(remove)).await;
+        assert_eq!(updated.status, StatusCode::OK, "{}", updated.body);
+        let user = state.db.user_by_name("ann".into()).await.unwrap().unwrap();
+        assert_eq!(user.role, Role::Member);
+        assert!(!user.can_public);
+        assert!(!epoch.is_cancelled(), "anonymous streams keep serving");
+        assert!(Arc::ptr_eq(&cached, &state.tunnel(id).await.unwrap()), "the public cache stays valid");
+        assert_eq!(state.db.get_tunnel(id.into()).await.unwrap().unwrap().access.mode, crate::db::AccessMode::Public);
+        let new = create_tunnel(&state, &token, json!({ "mode": "public" })).await;
+        assert_eq!(new.status, StatusCode::CREATED, "{}", new.body);
+        let link = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
+        let patched = bearer(
+            &state,
+            "PATCH",
+            &format!("/v1/tunnels/{}", link.body["id"].as_str().unwrap()),
+            &token,
+            Some(json!({ "access": { "mode": "public" } })),
+        )
+        .await;
+        assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
     }
 }

@@ -1,15 +1,20 @@
-//! Pages. Each loads what it shows from `/ui/api/*` and keeps it in signals.
+//! Route dispatch and the tunnel, machine and administrator pages.
+//! Each page loads what it shows from `/ui/api/*` and keeps it in signals.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::{Value, json};
 
+use crate::account::Account;
 use crate::api::{self, ApiError};
-use crate::device::device_name;
-use crate::email::{AddressCard, ConfirmAddress, ForgotPassword, MailStatus};
+use crate::auth::{InvitePage, SignIn};
+use crate::email::MailStatus;
 use crate::limits::{FocusAt, LimitsEditor};
 use crate::types::*;
-use crate::ui::{Copy, Empty, ErrorBox, bytes, duration_text, focus_id, relative, run, traffic_text, value, when};
+use crate::ui::{
+    CodeField, Copy, Empty, ErrorBox, bytes, duration_text, field_refused, focus_id, focus_later, relative, run,
+    run_code, traffic_text, used_of, value, when,
+};
 use crate::{ctx, navigate, refresh_session};
 
 pub fn route(path: String) -> AnyView {
@@ -45,253 +50,6 @@ fn err_text(e: &ApiError) -> String {
     e.message.clone()
 }
 
-/// Under the sign-in heading, when the page asked for explains why: `/device`
-/// opened from `tunnel login` while signed out comes back to its code form.
-fn sign_in_purpose(path: &str) -> Option<&'static str> {
-    (path == "/device").then_some("Sign in to approve the machine, then enter the code from its terminal.")
-}
-
-// ------------------------------------------------------------------ sign in
-
-#[component]
-fn SignIn() -> impl IntoView {
-    let c = ctx();
-    let username = RwSignal::new(String::new());
-    let password = RwSignal::new(String::new());
-    let code = RwSignal::new(String::new());
-    let error = RwSignal::new(None::<String>);
-    let busy = RwSignal::new(false);
-    let pending = move || c.session.get().is_some_and(|s| s.pending);
-    let owner_missing = move || c.session.get().is_some_and(|s| !s.owner_exists);
-    let mail = move || c.session.get().is_some_and(|s| s.server.mail);
-    let forgot = RwSignal::new(false);
-    let submit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let body = json!({ "username": username.get(), "password": password.get() });
-        run(error, busy, async move {
-            api::post::<Value>("/ui/api/login", &body).await?;
-            password.set(String::new());
-            refresh_session().await;
-            Ok(())
-        });
-    };
-    let submit_code = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let body = json!({ "code": code.get() });
-        run(error, busy, async move {
-            api::post::<Value>("/ui/api/login/totp", &body).await?;
-            refresh_session().await;
-            Ok(())
-        });
-    };
-    let cancel = move |_| {
-        spawn_local(async move {
-            let _ = api::post::<Value>("/ui/api/logout", &json!({})).await;
-            refresh_session().await;
-        });
-    };
-    let back = move || forgot.set(false);
-    view! {
-        <Show when=move || !forgot.get() fallback=move || view! { <ForgotPassword back=back /> }>
-        <div class="narrow">
-            <div class="card stack">
-                <h1>"Sign in"</h1>
-                {sign_in_purpose(&c.path.get_untracked()).map(|p| view! { <p class="muted">{p}</p> })}
-                <ErrorBox error=error />
-                <Show when=owner_missing>
-                    <div class="alert alert-warning">
-                        "No owner account yet. On the server, run " <code>"tunnel-server admin link"</code>
-                        " and open the link it prints."
-                    </div>
-                </Show>
-                <Show
-                    when=pending
-                    fallback=move || view! {
-                        <form on:submit=submit>
-                            <div class="field">
-                                <label for="username">"Username"</label>
-                                <input id="username" class="input" autocomplete="username" required
-                                    prop:value=move || username.get() on:input=move |ev| username.set(value(&ev)) />
-                            </div>
-                            <div class="field">
-                                <label for="password">"Password"</label>
-                                <input id="password" class="input" type="password" autocomplete="current-password" required
-                                    prop:value=move || password.get() on:input=move |ev| password.set(value(&ev)) />
-                            </div>
-                            <div class="field row">
-                                <button class="btn" type="submit" disabled=move || busy.get()>"Sign in"</button>
-                                <Show when=mail>
-                                    <button class="btn btn-ghost" type="button" on:click=move |_| forgot.set(true)>"Forgot password?"</button>
-                                </Show>
-                            </div>
-                        </form>
-                    }
-                >
-                    <form on:submit=submit_code>
-                        <p class="muted">"Enter the 6-digit code from your authenticator app, or a recovery code."</p>
-                        <div class="field">
-                            <label for="code">"Code"</label>
-                            <input id="code" class="input code-input" autocomplete="one-time-code" inputmode="text" required
-                                prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
-                        </div>
-                        <div class="field row">
-                            <button class="btn" type="submit" disabled=move || busy.get()>"Continue"</button>
-                            <button class="btn btn-ghost" type="button" on:click=cancel>"Use another account"</button>
-                        </div>
-                    </form>
-                </Show>
-            </div>
-        </div>
-        </Show>
-    }
-}
-
-// ------------------------------------------------------------------ invite
-
-#[component]
-fn InvitePage() -> impl IntoView {
-    let token = web_sys::window()
-        .and_then(|w| w.location().hash().ok())
-        .map(|h| h.trim_start_matches('#').to_string())
-        .unwrap_or_default();
-    let info = RwSignal::new(None::<Value>);
-    let error = RwSignal::new(None::<String>);
-    let busy = RwSignal::new(false);
-    let username = RwSignal::new(String::new());
-    let password = RwSignal::new(String::new());
-    let confirm = RwSignal::new(String::new());
-    let revoke = RwSignal::new(false);
-    let code = RwSignal::new(String::new());
-    // The server refused the link itself (not a connection problem).
-    let invalid = RwSignal::new(false);
-    {
-        let token = token.clone();
-        run(error, busy, async move {
-            let v = api::post::<Value>("/ui/api/invite/info", &json!({ "token": token })).await.inspect_err(|e| {
-                invalid.set(e.code == "invalid_invite");
-            })?;
-            info.set(Some(v));
-            Ok(())
-        });
-    }
-    let kind = move || info.get().and_then(|v| v["kind"].as_str().map(str::to_string)).unwrap_or_default();
-    let is_reset = move || matches!(kind().as_str(), "owner_reset" | "account_reset" | "password_reset");
-    let field = move |k: &'static str| info.get().and_then(|v| v[k].as_str().map(str::to_string));
-    let needs_code = move || info.get().is_some_and(|v| v["needs_code"].as_bool() == Some(true));
-    let title = move || {
-        let info = info.get();
-        invite_title(info.as_ref().map(|v| (v["kind"].as_str().unwrap_or_default(), v["role"].as_str())), invalid.get())
-    };
-    // Stored, so the form's closures stay `Copy` inside nested views.
-    let stored_token = StoredValue::new(token.clone());
-    let submit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        if password.get() != confirm.get() {
-            error.set(Some("The passwords do not match.".into()));
-            return;
-        }
-        let mut body = json!({ "token": stored_token.get_value(), "password": password.get() });
-        if is_reset() {
-            body["revoke_machines"] = json!(revoke.get());
-            if needs_code() {
-                body["code"] = json!(code.get());
-            }
-        } else {
-            body["username"] = json!(username.get());
-        }
-        run(error, busy, async move {
-            api::post::<Value>("/ui/api/invite/accept", &body).await?;
-            // Drop the token from the address bar and history.
-            if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
-                let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/account"));
-            }
-            refresh_session().await;
-            navigate("/account");
-            Ok(())
-        });
-    };
-    view! {
-        <div class="narrow">
-            <div class="card stack">
-                <h1>{title}</h1>
-                <ErrorBox error=error />
-                <Show when=move || info.get().is_some() fallback=move || view! {
-                    <Show when=move || error.get().is_none()><p class="muted">"Checking the link…"</p></Show>
-                }>
-                    <Show when=move || kind() != "email_verify" fallback=move || view! {
-                        <ConfirmAddress token=stored_token.get_value() info=info.get().unwrap_or_default() />
-                    }>
-                    <form on:submit=submit>
-                        <Show when=is_reset fallback=move || view! {
-                            <div class="field">
-                                <label for="new-username">"Username"</label>
-                                <input id="new-username" class="input" autocomplete="username" required maxlength="32"
-                                    prop:value=move || username.get() on:input=move |ev| username.set(value(&ev)) />
-                                <p class="muted small">"Letters, digits, '.', '_' and '-'."</p>
-                            </div>
-                            {move || field("email").map(|e| view! {
-                                <p class="muted small">{format!("Signing up confirms {e} as your account's email address.")}</p>
-                            })}
-                        }>
-                            <p class="muted">
-                                "Signing in as " <strong>{move || field("username").unwrap_or_default()}</strong>
-                                {move || if kind() == "password_reset" {
-                                    ". Every session of this account ends. Two-factor sign-in stays as it is."
-                                } else {
-                                    ". Two-factor sign-in and the recovery codes are turned off and every session of this account ends; turn two-factor sign-in on again afterwards."
-                                }}
-                            </p>
-                            <Show when=needs_code>
-                                <div class="field">
-                                    <label for="reset-code">"Code from your authenticator app (or a recovery code)"</label>
-                                    <input id="reset-code" class="input code-input" autocomplete="one-time-code" inputmode="text" required
-                                        prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
-                                </div>
-                            </Show>
-                            <label class="check">
-                                <input type="checkbox" prop:checked=move || revoke.get() on:change=move |ev| revoke.set(event_target_checked(&ev)) />
-                                {move || if kind() == "owner_reset" {
-                                    "Also remove all of the owner's machines (their logins stop working)"
-                                } else {
-                                    "Also remove all of this account's machines (their logins stop working)"
-                                }}
-                            </label>
-                        </Show>
-                        <div class="field">
-                            <label for="new-password">"Password"</label>
-                            <input id="new-password" class="input" type="password" autocomplete="new-password" required minlength="10"
-                                prop:value=move || password.get() on:input=move |ev| password.set(value(&ev)) />
-                            <p class="muted small">"At least 10 characters."</p>
-                        </div>
-                        <div class="field">
-                            <label for="confirm-password">"Repeat the password"</label>
-                            <input id="confirm-password" class="input" type="password" autocomplete="new-password" required
-                                prop:value=move || confirm.get() on:input=move |ev| confirm.set(value(&ev)) />
-                        </div>
-                        <div class="field"><button class="btn" type="submit" disabled=move || busy.get()>"Continue"</button></div>
-                    </form>
-                    </Show>
-                </Show>
-            </div>
-        </div>
-    }
-}
-
-/// The invite page's heading: what the link does once the server has said
-/// (`(kind, role)`), else whether it was refused or is still being checked.
-/// Never a role the page cannot know yet.
-fn invite_title(info: Option<(&str, Option<&str>)>, invalid: bool) -> String {
-    match info {
-        None if invalid => "Link not valid".into(),
-        None => "Opening your link".into(),
-        Some(("owner_setup", _)) => "Create the owner account".into(),
-        Some(("owner_reset", _)) => "Reset the owner's password".into(),
-        Some(("account_reset" | "password_reset", _)) => "Set a new password".into(),
-        Some(("email_verify", _)) => "Confirm your email address".into(),
-        Some((_, role)) => format!("Join as {}", role.unwrap_or("member")),
-    }
-}
-
 /// `(name, login code)` of a headless machine the server just added.
 fn created_login(v: &Value) -> Option<(String, String)> {
     Some((v["name"].as_str()?.to_string(), v["login_code"].as_str()?.to_string()))
@@ -317,14 +75,6 @@ where
             "Show all users"
             <span id=hint_id class="sr-only">{hint}</span>
         </label>
-    }
-}
-
-/// `3 of 10`, or `3 (unlimited)`.
-fn used_of(used: u64, limit: Option<u64>) -> String {
-    match limit {
-        Some(l) => format!("{used} of {l}"),
-        None => format!("{used} (unlimited)"),
     }
 }
 
@@ -360,7 +110,7 @@ fn open_preview(tunnel: String, port: u16, error: RwSignal<Option<String>>) {
     let _ = tab.set_opener(&wasm_bindgen::JsValue::NULL);
     error.set(None);
     spawn_local(async move {
-        let url = api::post::<Value>(&format!("/ui/api/tunnels/{tunnel}/open"), &json!({ "port": port }))
+        let url = api::post(&format!("/ui/api/tunnels/{tunnel}/open"), &json!({ "port": port }))
             .await
             .map(|v| v["url"].as_str().map(str::to_string));
         match url {
@@ -434,12 +184,30 @@ fn Tunnels(admin: bool) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let open = RwSignal::new(None::<String>);
+    let focus_after = RwSignal::new(None::<String>);
     let load = move || {
+        if busy.is_disposed() {
+            return;
+        }
         let path = if all.get_untracked() { "/ui/api/tunnels?all=true" } else { "/ui/api/tunnels" };
         run(error, busy, async move {
-            let v = api::get::<Value>(path).await?;
+            let v = api::get(path).await?;
             let list: Vec<Tunnel> = serde_json::from_value(v["tunnels"].clone()).unwrap_or_default();
             tunnels.set(Some(list));
+            if let Some(id) = focus_after.try_get_untracked().flatten() {
+                focus_after.set(None);
+                set_timeout(
+                    move || {
+                        if busy.is_disposed() {
+                            return;
+                        }
+                        if !focus_id(&id) {
+                            focus_id("tunnels-title");
+                        }
+                    },
+                    std::time::Duration::ZERO,
+                );
+            }
             Ok(())
         });
     };
@@ -447,6 +215,18 @@ fn Tunnels(admin: bool) -> impl IntoView {
     let delete = move |id: String| {
         run(error, busy, async move {
             api::delete(&format!("/ui/api/tunnels/{id}")).await?;
+            let next = tunnels
+                .try_with_untracked(|list| {
+                    list.as_ref().and_then(|list| {
+                        let at = list.iter().position(|t| t.id == id)?;
+                        list.get(at + 1)
+                            .or_else(|| list.iter().find(|t| t.id != id))
+                            .map(|t| format!("rename-tunnel-{}", t.id))
+                    })
+                })
+                .flatten()
+                .unwrap_or_else(|| "tunnels-title".into());
+            focus_after.set(Some(next));
             load();
             Ok(())
         });
@@ -454,6 +234,12 @@ fn Tunnels(admin: bool) -> impl IntoView {
     // The tunnel being renamed, and the name typed so far.
     let editing = RwSignal::new(None::<String>);
     let new_name = RwSignal::new(String::new());
+    let cancel_rename = move || {
+        if let Some(id) = editing.get_untracked() {
+            editing.set(None);
+            focus_later(busy, format!("rename-tunnel-{id}"));
+        }
+    };
     let save_name = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let Some(id) = editing.get_untracked() else { return };
@@ -464,8 +250,9 @@ fn Tunnels(admin: bool) -> impl IntoView {
         }
         let body = json!({ "name": new_name.get_untracked() });
         run(error, busy, async move {
-            api::patch::<Value>(&format!("/ui/api/tunnels/{id}"), &body).await?;
+            api::patch(&format!("/ui/api/tunnels/{id}"), &body).await?;
             editing.set(None);
+            focus_after.set(Some(format!("rename-tunnel-{id}")));
             load();
             Ok(())
         });
@@ -474,7 +261,7 @@ fn Tunnels(admin: bool) -> impl IntoView {
         <div class="page">
             <div class="page-head">
                 <div>
-                    <h1>"Tunnels"</h1>
+                    <h1 id="tunnels-title" tabindex="-1">"Tunnels"</h1>
                     <p class="muted">"Live tunnels from your machines. Open your own signed in; share them with access links, which work once unless you make them reusable."</p>
                 </div>
                 <div class="head-actions">
@@ -534,13 +321,15 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                             <td class="cell-main">
                                                 {move || if is_editing() {
                                                     view! {
-                                                        <form class="row" on:submit=save_name>
+                                                        <form class="row" on:submit=save_name on:keydown=move |ev| {
+                                            if ev.key() == "Escape" { ev.prevent_default(); cancel_rename(); }
+                                        }>
                                                             <label class="sr-only" for="rename-tunnel">"Name"</label>
                                                             <input id="rename-tunnel" class="input input-sm grow"
                                                                 placeholder="e.g. Checkout redesign" autocomplete="off"
                                                                 prop:value=move || new_name.get() on:input=move |ev| new_name.set(value(&ev)) />
                                                             <button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save"</button>
-                                                            <button class="btn btn-ghost btn-sm" type="button" on:click=move |_| editing.set(None)>"Cancel"</button>
+                                                            <button class="btn btn-ghost btn-sm" type="button" on:click=move |_| cancel_rename()>"Cancel"</button>
                                                         </form>
                                                         <p class="muted small">"A label only: links and URLs stay the same. Empty removes the name."</p>
                                                     }.into_any()
@@ -569,9 +358,10 @@ fn Tunnels(admin: bool) -> impl IntoView {
                                             }}
                                             <td class="actions">
                                                 {open_buttons(&t, error)}
-                                                <button class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| {
+                                                <button id=format!("rename-tunnel-{}", t.id) class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| {
                                                     new_name.set(current_name.clone());
                                                     editing.set(Some(id_edit.clone()));
+                                                    focus_later(busy, "rename-tunnel".into());
                                                 }>"Rename"</button>
                                                 <button class="btn btn-outline btn-sm" aria-label=links_label
                                                     aria-expanded=move || expanded().to_string() on:click=move |_| {
@@ -604,13 +394,14 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
     let ttl = RwSignal::new("600".to_string());
     let reusable = RwSignal::new(false);
     let port = RwSignal::new(tunnel.ports.first().map(|p| p.port.to_string()).unwrap_or_default());
+    let copy_id = StoredValue::new(format!("link-copy-{}", tunnel.id));
     let id = tunnel.id.clone();
     let load = {
         let id = id.clone();
         move || {
             let id = id.clone();
             run(error, busy, async move {
-                let v = api::get::<Value>(&format!("/ui/api/tunnels/{id}/links")).await?;
+                let v = api::get(&format!("/ui/api/tunnels/{id}/links")).await?;
                 links.set(serde_json::from_value(v["links"].clone()).unwrap_or_default());
                 Ok(())
             });
@@ -628,9 +419,11 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
             if let Ok(p) = port.get().parse::<u16>() {
                 body["port"] = json!(p);
             }
+            let copy_focus = copy_id.get_value();
             run(error, busy, async move {
-                let v = api::post::<Value>(&format!("/ui/api/tunnels/{id}/links"), &body).await?;
+                let v = api::post(&format!("/ui/api/tunnels/{id}/links"), &body).await?;
                 minted.set(v["url"].as_str().map(str::to_string));
+                focus_later(busy, copy_focus);
                 load();
                 Ok(())
             });
@@ -666,7 +459,7 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
             {move || minted.get().map(|url| view! {
                 <div class="stack">
                     <p class="small">"Give this link only to the person it is for. It is shown once."</p>
-                    <Copy value=Signal::derive(move || url.clone()) label="Access link" />
+                    <Copy value=Signal::derive(move || url.clone()) label="Access link" id=copy_id.get_value() />
                 </div>
             })}
             {move || {
@@ -715,21 +508,43 @@ fn Links(tunnel: Tunnel) -> impl IntoView {
 fn Machines(admin: bool) -> impl IntoView {
     let all = RwSignal::new(false);
     let machines = RwSignal::new(None::<Vec<Machine>>);
+    let code_error = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let name = RwSignal::new(String::new());
     let code = RwSignal::new(String::new());
     let needs_code = RwSignal::new(false);
+    let password = RwSignal::new(String::new());
+    let password_error = RwSignal::new(None::<String>);
+    let needs_password = RwSignal::new(false);
     // The headless machine just added and its login code, until it is removed.
     let login_code = RwSignal::new(None::<(String, String)>);
     // A name the server refused, shown at the field.
     let name_error = RwSignal::new(None::<String>);
     let ui_origin = ctx().session.get_untracked().map(|s| s.server.ui_origin).unwrap_or_default();
+    let focus_after = RwSignal::new(None::<String>);
     let load = move || {
+        if busy.is_disposed() {
+            return;
+        }
         let path = if all.get_untracked() { "/ui/api/machines?all=true" } else { "/ui/api/machines" };
         run(error, busy, async move {
-            let v = api::get::<Value>(path).await?;
+            let v = api::get(path).await?;
             machines.set(Some(serde_json::from_value(v["machines"].clone()).unwrap_or_default()));
+            if let Some(id) = focus_after.try_get_untracked().flatten() {
+                focus_after.set(None);
+                set_timeout(
+                    move || {
+                        if busy.is_disposed() {
+                            return;
+                        }
+                        if !focus_id(&id) {
+                            focus_id("machine-name");
+                        }
+                    },
+                    std::time::Duration::ZERO,
+                );
+            }
             Ok(())
         });
     };
@@ -741,17 +556,28 @@ fn Machines(admin: bool) -> impl IntoView {
         if needs_code.get() {
             body["code"] = json!(code.get());
         }
+        if needs_password.get() {
+            body["password"] = json!(password.get());
+        }
         busy.set(true);
         error.set(None);
         name_error.set(None);
+        code_error.set(None);
+        password_error.set(None);
         // The answer is about `sent`: a name typed since is left alone.
-        let still = move || name.get_untracked() == sent;
+        let still = move || name.try_get_untracked().is_some_and(|name| name == sent);
         spawn_local(async move {
-            match api::post::<Value>("/ui/api/machines", &body).await {
+            let response = api::post("/ui/api/machines", &body).await;
+            if busy.is_disposed() {
+                return;
+            }
+            match response {
                 Ok(v) => {
                     login_code.set(created_login(&v));
                     needs_code.set(false);
                     code.set(String::new());
+                    needs_password.set(false);
+                    password.set(String::new());
                     // Done with this name: Enter again must not ask for it twice.
                     if still() {
                         name.set(String::new());
@@ -759,10 +585,16 @@ fn Machines(admin: bool) -> impl IntoView {
                     load();
                 }
                 Err(e) if e.code == "code_required" => needs_code.set(true),
+                Err(e) if e.code == "password_required" => {
+                    needs_password.set(true);
+                    focus_later(busy, "machine-password".into());
+                }
                 Err(e) if e.code == "client_exists" && still() => {
                     name_error.set(Some(e.message));
                     focus_id("machine-name");
                 }
+                Err(e) if field_refused(&e, "invalid_code", code_error, "machine-code") => {}
+                Err(e) if field_refused(&e, "invalid_password", password_error, "machine-password") => {}
                 Err(e) => error.set(Some(e.message)),
             }
             busy.set(false);
@@ -779,19 +611,27 @@ fn Machines(admin: bool) -> impl IntoView {
             });
             load();
             // The row is gone: the focus goes to adding one.
-            focus_id("machine-name");
+            if !busy.is_disposed() {
+                focus_id("machine-name");
+            }
             Ok(())
         });
     };
     // The machine being renamed, and the name typed so far.
     let editing = RwSignal::new(None::<String>);
     let new_name = RwSignal::new(String::new());
+    let cancel_rename = move || {
+        if let Some(id) = editing.get_untracked() {
+            editing.set(None);
+            focus_later(busy, format!("rename-machine-{id}"));
+        }
+    };
     let save_name = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let Some(old) = editing.get_untracked() else { return };
         let body = json!({ "name": new_name.get_untracked().trim() });
         run(error, busy, async move {
-            let v = api::patch::<Value>(&format!("/ui/api/machines/{old}"), &body).await?;
+            let v = api::patch(&format!("/ui/api/machines/{old}"), &body).await?;
             // A shown login code follows its machine's new name.
             if let Some(new) = v["name"].as_str() {
                 login_code.update(|c| {
@@ -801,6 +641,7 @@ fn Machines(admin: bool) -> impl IntoView {
                 });
             }
             editing.set(None);
+            focus_after.set(Some(format!("rename-machine-{}", v["name"].as_str().unwrap_or(&old))));
             load();
             Ok(())
         });
@@ -835,11 +676,10 @@ fn Machines(admin: bool) -> impl IntoView {
                     </div>
                     <p id="machine-name-error" class="field-error" aria-live="polite">{move || name_error.get()}</p>
                     <Show when=move || needs_code.get()>
-                        <div class="field">
-                            <label for="machine-code">"Code from your authenticator app"</label>
-                            <input id="machine-code" class="input" autocomplete="one-time-code"
-                                prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
-                        </div>
+                        <CodeField id="machine-code" label="Code from your authenticator app (or a recovery code)" value=code error=code_error />
+                    </Show>
+                    <Show when=move || needs_password.get()>
+                        <CodeField id="machine-password" label="Your password" value=password error=password_error password=true />
                     </Show>
                     {move || login_code.get().map(|(_, c)| view! {
                         <p class="small">"On that machine run " <code>"tunnel login"</code> " and paste:"</p>
@@ -866,13 +706,15 @@ fn Machines(admin: bool) -> impl IntoView {
                             view! { <tr>
                                 <td class="cell-main">{move || if is_editing() {
                                     view! {
-                                        <form class="row" on:submit=save_name>
+                                        <form class="row" on:submit=save_name on:keydown=move |ev| {
+                                            if ev.key() == "Escape" { ev.prevent_default(); cancel_rename(); }
+                                        }>
                                             <label class="sr-only" for="rename-machine">"New name"</label>
                                             <input id="rename-machine" class="input input-sm grow" required maxlength="64"
                                                 pattern="[A-Za-z0-9._\\-]+" title="letters, digits, '.', '_', '-'"
                                                 prop:value=move || new_name.get() on:input=move |ev| new_name.set(value(&ev)) />
                                             <button class="btn btn-sm" type="submit" disabled=move || busy.get()>"Save"</button>
-                                            <button class="btn btn-ghost btn-sm" type="button" on:click=move |_| editing.set(None)>"Cancel"</button>
+                                            <button class="btn btn-ghost btn-sm" type="button" on:click=move |_| cancel_rename()>"Cancel"</button>
                                         </form>
                                     }.into_any()
                                 } else {
@@ -883,7 +725,7 @@ fn Machines(admin: bool) -> impl IntoView {
                                 <td data-label="Last used">{m.last_used_at.map(relative).unwrap_or_else(|| "never".into())}</td>
                                 <td data-label="Tunnels">{m.tunnels}</td>
                                 <td class="actions">
-                                    <button class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| { new_name.set(n_edit.clone()); editing.set(Some(n_edit.clone())); }>"Rename"</button>
+                                    <button id=format!("rename-machine-{}", m.name) class="btn btn-outline btn-sm" aria-label=rename_label on:click=move |_| { new_name.set(n_edit.clone()); editing.set(Some(n_edit.clone())); focus_later(busy, "rename-machine".into()); }>"Rename"</button>
                                     <button class="btn btn-destructive btn-sm" aria-label=remove_label data-confirm=remove_question on:click=move |_| remove(n.clone())>"Remove"</button>
                                 </td>
                             </tr> }
@@ -901,19 +743,34 @@ fn Machines(admin: bool) -> impl IntoView {
 #[component]
 fn Device() -> impl IntoView {
     let code = RwSignal::new(String::new());
+    let password = RwSignal::new(String::new());
+    let password_error = RwSignal::new(None::<String>);
+    let needs_password = RwSignal::new(false);
     let totp = RwSignal::new(String::new());
     let request = RwSignal::new(None::<DeviceRequest>);
     let needs_code = RwSignal::new(false);
     let done = RwSignal::new(None::<String>);
+    let code_error = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let lookup = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let body = json!({ "user_code": code.get() });
         run(error, busy, async move {
-            let v = api::post::<Value>("/ui/api/device/lookup", &body).await?;
+            let v = api::post("/ui/api/device/lookup", &body).await?;
             request.set(serde_json::from_value(v["request"].clone()).ok());
-            needs_code.set(v["needs_code"].as_bool().unwrap_or(false));
+            let code_required = v["needs_code"].as_bool().unwrap_or(false);
+            let password_required = v["needs_password"].as_bool().unwrap_or(false);
+            needs_code.set(code_required);
+            needs_password.set(password_required);
+            let target = if password_required {
+                "approve-password"
+            } else if code_required {
+                "approve-code"
+            } else {
+                "approve"
+            };
+            focus_later(busy, target.into());
             Ok(())
         });
     };
@@ -923,14 +780,25 @@ fn Device() -> impl IntoView {
         if approve && needs_code.get() {
             body["code"] = json!(totp.get());
         }
-        run(error, busy, async move {
-            let v = match api::post::<Value>("/ui/api/device/decide", &body).await {
+        if approve && needs_password.get() {
+            body["password"] = json!(password.get());
+        }
+        password_error.set(None);
+        run_code(error, busy, code_error, "approve-code", async move {
+            let v = match api::post("/ui/api/device/decide", &body).await {
                 Ok(v) => v,
                 // The last check went stale while the page was open: ask for a code.
                 Err(e) if e.code == "code_required" => {
                     needs_code.set(true);
+                    focus_later(busy, "approve-code".into());
                     return Err(e);
                 }
+                Err(e) if e.code == "password_required" => {
+                    needs_password.set(true);
+                    focus_later(busy, "approve-password".into());
+                    return Err(e);
+                }
+                Err(e) if field_refused(&e, "invalid_password", password_error, "approve-password") => return Ok(()),
                 Err(e) => return Err(e),
             };
             done.set(Some(if approve {
@@ -941,6 +809,8 @@ fn Device() -> impl IntoView {
             } else {
                 "Denied. The machine was not signed in.".to_string()
             }));
+            password.set(String::new());
+            totp.set(String::new());
             request.set(None);
             Ok(())
         });
@@ -972,14 +842,13 @@ fn Device() -> impl IntoView {
                         </table>
                         <p class="muted small">"If you did not start this login, deny it."</p>
                         <Show when=move || needs_code.get()>
-                            <div class="field">
-                                <label for="approve-code">"Code from your authenticator app"</label>
-                                <input id="approve-code" class="input" autocomplete="one-time-code"
-                                    prop:value=move || totp.get() on:input=move |ev| totp.set(value(&ev)) />
-                            </div>
+                            <CodeField id="approve-code" label="Code from your authenticator app (or a recovery code)" value=totp error=code_error />
+                        </Show>
+                        <Show when=move || needs_password.get()>
+                            <CodeField id="approve-password" label="Your password" value=password error=password_error password=true />
                         </Show>
                         <div class="row">
-                            <button class="btn" disabled=move || busy.get() on:click=move |_| decide(true)>"Approve"</button>
+                            <button id="approve" class="btn" disabled=move || busy.get() on:click=move |_| decide(true)>"Approve"</button>
                             <button class="btn btn-outline" disabled=move || busy.get() on:click=move |_| decide(false)>"Deny"</button>
                         </div>
                     </div>
@@ -997,7 +866,7 @@ fn Cli() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     run(error, busy, async move {
-        info.set(Some(api::get::<Value>("/ui/api/cli").await?));
+        info.set(Some(api::get("/ui/api/cli").await?));
         Ok(())
     });
     let s = move |k: &'static str| {
@@ -1046,267 +915,6 @@ fn Cli() -> impl IntoView {
                 <p class="small"><code>"tunnel share 3000"</code> " prints a one-time link to your local port 3000. "
                     <code>"tunnel link"</code> " makes another, " <code>"tunnel unshare"</code> " ends sharing. "
                     "Agents can follow " <code>"tunnel help agent"</code> "."</p>
-            </div>
-        </div>
-    }
-}
-
-// ------------------------------------------------------------------ account
-
-#[component]
-fn Account() -> impl IntoView {
-    let c = ctx();
-    let user = move || c.session.get().and_then(|s| s.user);
-    let error = RwSignal::new(None::<String>);
-    let notice = RwSignal::new(None::<String>);
-    let busy = RwSignal::new(false);
-    let current = RwSignal::new(String::new());
-    let new_pw = RwSignal::new(String::new());
-    let totp_pw = RwSignal::new(String::new());
-    let totp_code = RwSignal::new(String::new());
-    // A refused code is said at the code field, not at the top of the page.
-    let code_error = RwSignal::new(None::<String>);
-    let setup = RwSignal::new(None::<Value>);
-    let recovery = RwSignal::new(None::<Vec<String>>);
-    let sessions = RwSignal::new(Vec::<SessionRow>::new());
-    // The session carries this month's traffic: fetch it fresh on every visit.
-    spawn_local(async move { refresh_session().await });
-    let load_sessions = move || {
-        spawn_local(async move {
-            if let Ok(v) = api::get::<Value>("/ui/api/account/sessions").await {
-                sessions.set(serde_json::from_value(v["sessions"].clone()).unwrap_or_default());
-            }
-        });
-    };
-    load_sessions();
-    let change_password = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let body = json!({ "current": current.get(), "new": new_pw.get() });
-        run(error, busy, async move {
-            api::post::<Value>("/ui/api/account/password", &body).await?;
-            current.set(String::new());
-            new_pw.set(String::new());
-            refresh_session().await;
-            notice.set(Some("Password changed. Your other sessions were signed out.".into()));
-            load_sessions();
-            Ok(())
-        });
-    };
-    // A setup request in flight: its own flag (other Account calls clear
-    // `busy`), so a late second answer can never reopen setup after Not now.
-    let starting = RwSignal::new(false);
-    let start_totp = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        if starting.get_untracked() {
-            return;
-        }
-        let body = json!({ "password": totp_pw.get() });
-        notice.set(None);
-        run(error, starting, async move {
-            setup.set(Some(api::post::<Value>("/ui/api/account/totp/setup", &body).await?));
-            totp_pw.set(String::new());
-            Ok(())
-        });
-    };
-    // Turning two-factor on, in flight: its own flag (not `busy`, which every
-    // Account call clears), so Turn on and Not now wait for this answer.
-    let enabling = RwSignal::new(false);
-    let confirm_totp = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        if enabling.get_untracked() {
-            return;
-        }
-        let body = json!({ "code": totp_code.get() });
-        run(code_error, enabling, async move {
-            let v = api::post::<Value>("/ui/api/account/totp/enable", &body).await?;
-            recovery.set(serde_json::from_value(v["recovery_codes"].clone()).ok());
-            setup.set(None);
-            totp_code.set(String::new());
-            refresh_session().await;
-            load_sessions();
-            Ok(())
-        });
-    };
-    let disable_totp = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let body = json!({ "password": totp_pw.get() });
-        run(error, busy, async move {
-            api::post::<Value>("/ui/api/account/totp/disable", &body).await?;
-            totp_pw.set(String::new());
-            // The recovery codes shown after turning it on no longer work.
-            recovery.set(None);
-            setup.set(None);
-            refresh_session().await;
-            notice.set(Some("Two-factor sign-in is off.".into()));
-            Ok(())
-        });
-    };
-    // What the last sign-out here did, said in the Sessions card itself.
-    let signed_out = RwSignal::new(None::<String>);
-    let revoke = move |id: String, what: String| {
-        signed_out.set(None);
-        run(error, busy, async move {
-            api::post::<Value>("/ui/api/account/sessions/revoke", &json!({ "id": id })).await?;
-            signed_out.set(Some(what));
-            load_sessions();
-            Ok(())
-        });
-    };
-    view! {
-        <div class="page">
-            <div class="page-head"><div>
-                <h1>"Account"</h1>
-                <p class="muted">{move || user().map(|u| format!("Signed in as {} ({}).", u.username, u.role)).unwrap_or_default()}</p>
-            </div></div>
-            <ErrorBox error=error />
-            <div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
-            {move || c.session.get().and_then(|s| s.user.map(|u| (u, s.usage.unwrap_or_default()))).map(|(u, usage)| view! {
-                <div class="card stack">
-                    <h2>"Your limits"</h2>
-                    {if u.role == "owner" {
-                        view! { <p>"You are the server's owner: no limits apply to you."</p> }.into_any()
-                    } else {
-                        let l = u.limits.clone();
-                        view! {
-                            <table class="table table-kv">
-                                <tbody>
-                                    <tr><th>"Live tunnels (across your machines)"</th><td>{used_of(usage.tunnels, l.tunnels.effective)}</td></tr>
-                                    <tr><th>"Machines"</th><td>{used_of(usage.machines, l.machines.effective)}</td></tr>
-                                    <tr><th>"Longest tunnel lifetime"</th><td>{l.tunnel_ttl_s.effective.map(duration_text)
-                                        .unwrap_or_else(|| "unlimited (tunnels may never expire: tunnel share --ttl never)".into())}</td></tr>
-                                    <tr><th>"Monthly traffic"</th><td>{l.traffic_bytes.effective.map(bytes).unwrap_or_else(|| "unlimited".into())}</td></tr>
-                                </tbody>
-                            </table>
-                            <p class="muted small">{format!(
-                                "Set by {}. At a limit, new tunnels or machines are refused and longer lifetimes are refused; what already runs keeps running.",
-                                if u.role == "admin" { "the server's owner" } else { "an admin" })}</p>
-                        }.into_any()
-                    }}
-                </div>
-            })}
-            {move || c.session.get().and_then(|s| s.traffic).map(|t| view! {
-                <div class="card stack">
-                    <h2>"Traffic this month"</h2>
-                    <p>{traffic_text(t.used_bytes, t.cap_bytes)}" in " {t.month.clone()} " (UTC)."</p>
-                    {t.limited.then(|| view! {
-                        <div class="alert alert-warning">"Your monthly traffic limit is reached: visitors of your tunnels see \"Traffic limit reached\" until next month or until an admin raises the limit."</div>
-                    })}
-                    <p class="muted small">"Counts what your tunnels relay in both directions (request and response bodies, WebSocket messages)."</p>
-                </div>
-            })}
-            <Show when=move || c.session.get().is_some_and(|s| s.server.mail)><AddressCard /></Show>
-            <div class="grid2">
-                <form class="card stack" on:submit=change_password>
-                    <h2>"Password"</h2>
-                    <div class="field">
-                        <label for="cur-pw">"Current password"</label>
-                        <input id="cur-pw" class="input" type="password" autocomplete="current-password" required
-                            prop:value=move || current.get() on:input=move |ev| current.set(value(&ev)) />
-                    </div>
-                    <div class="field">
-                        <label for="new-pw">"New password"</label>
-                        <input id="new-pw" class="input" type="password" autocomplete="new-password" required minlength="10"
-                            prop:value=move || new_pw.get() on:input=move |ev| new_pw.set(value(&ev)) />
-                    </div>
-                    <div class="field"><button class="btn" type="submit" disabled=move || busy.get()>"Change password"</button></div>
-                </form>
-                <div class="card stack">
-                    <h2>"Two-factor sign-in"</h2>
-                    {move || recovery.get().map(|codes| view! {
-                        <div class="alert alert-warning">"Save these recovery codes now; each works once and they are not shown again."</div>
-                        <div class="codes">{codes.into_iter().map(|c| view! { <span>{c}</span> }).collect_view()}</div>
-                    })}
-                    <Show when=move || user().is_some_and(|u| u.totp) fallback=move || view! {
-                        {move || match setup.get() {
-                            None => view! {
-                                <form on:submit=start_totp>
-                                    <p class="muted small">"Use an authenticator app for a code at every sign-in."</p>
-                                    <div class="field">
-                                        <label for="totp-pw">"Password"</label>
-                                        <input id="totp-pw" class="input" type="password" autocomplete="current-password" required
-                                            prop:value=move || totp_pw.get() on:input=move |ev| totp_pw.set(value(&ev)) />
-                                    </div>
-                                    <div class="field"><button class="btn" type="submit">"Set up"</button></div>
-                                </form>
-                            }.into_any(),
-                            Some(v) => {
-                                let qr = v["qr"].as_str().unwrap_or_default().to_string();
-                                let secret = v["secret"].as_str().unwrap_or_default().to_string();
-                                view! {
-                                    <form class="stack" on:submit=confirm_totp>
-                                        <p class="small">"Scan this with your authenticator app, or enter the key by hand."</p>
-                                        <img class="qr" src=qr alt="QR code for the authenticator app" />
-                                        <Copy value=Signal::derive(move || secret.clone()) label="Setup key" />
-                                        <div class="field">
-                                            <label for="totp-code">"Code from the app"</label>
-                                            <input id="totp-code" class="input" autocomplete="one-time-code" required
-                                                aria-describedby="totp-code-error" aria-invalid=move || code_error.get().map(|_| "true")
-                                                prop:value=move || totp_code.get() on:input=move |ev| { code_error.set(None); totp_code.set(value(&ev)) } />
-                                            <p id="totp-code-error" class="field-error" aria-live="polite">{move || code_error.get()}</p>
-                                        </div>
-                                        <div class="row">
-                                            <button class="btn" type="submit" disabled=move || enabling.get()>"Turn on"</button>
-                                            // Not while Turn on is on its way: it could still turn it on.
-                                            <button class="btn btn-ghost" type="button" disabled=move || enabling.get() on:click=move |_| {
-                                                setup.set(None);
-                                                totp_code.set(String::new());
-                                                error.set(None);
-                                                code_error.set(None);
-                                                // Its form is gone: the focus goes to the one drawn instead.
-                                                set_timeout(|| _ = focus_id("totp-pw"), std::time::Duration::ZERO);
-                                            }>"Not now"</button>
-                                        </div>
-                                    </form>
-                                }.into_any()
-                            }
-                        }}
-                    }>
-                        <form on:submit=disable_totp>
-                            <p><span class="badge badge-success">"On"</span></p>
-                            <div class="field">
-                                <label for="totp-off-pw">"Password, to turn it off"</label>
-                                <input id="totp-off-pw" class="input" type="password" autocomplete="current-password" required
-                                    prop:value=move || totp_pw.get() on:input=move |ev| totp_pw.set(value(&ev)) />
-                            </div>
-                            <div class="field"><button class="btn btn-destructive" type="submit">"Turn off"</button></div>
-                        </form>
-                    </Show>
-                </div>
-            </div>
-            <div class="card card-tight table-wrap">
-                <div class="row card-head card-head-actions"><h2 class="grow">"Sessions"</h2>
-                    <button class="btn btn-outline btn-sm" on:click=move |_| revoke("others".into(), "Signed out every other session.".into())>"Sign out other sessions"</button></div>
-                <div class="card-note" role="status">{move || signed_out.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>
-                <table class="table table-stack">
-                    <thead><tr><th>"Device"</th><th>"Address"</th><th>"Signed in"</th><th>"Last active"</th><th><span class="sr-only">"Actions"</span></th></tr></thead>
-                    <tbody>
-                    {move || sessions.get().into_iter().map(|s| {
-                        let id = s.id.clone();
-                        let raw = s.user_agent.clone().filter(|ua| !ua.trim().is_empty());
-                        let device = device_name(raw.as_deref());
-                        let (sign_out_label, done) = (format!("Sign out {device}"), format!("Signed out {device}."));
-                        view! { <tr>
-                            <td class="cell-main">
-                                <span class="name" title=raw.clone()>{device.clone()}</span>
-                                {s.current.then(|| view! { " " <span class="badge badge-info">"this one"</span> })}
-                                {raw.map(|ua| view! {
-                                    <details class="ua-raw">
-                                        <summary class="muted small">"Browser details"</summary>
-                                        <div class="mono small break">{ua}</div>
-                                    </details>
-                                })}
-                            </td>
-                            <td data-label="Address">{s.ip.clone().unwrap_or_default()}</td>
-                            <td data-label="Signed in" title=when(s.created_at)>{relative(s.created_at)}</td>
-                            <td data-label="Last active">{relative(s.last_seen_at)}</td>
-                            <td class="actions">{(!s.current).then(|| view! {
-                                <button class="btn btn-outline btn-sm" aria-label=sign_out_label
-                                    on:click=move |_| revoke(id.clone(), done.clone())>"Sign out"</button>
-                            })}</td>
-                        </tr> }
-                    }).collect_view()}
-                    </tbody>
-                </table>
             </div>
         </div>
     }
@@ -1377,12 +985,13 @@ fn Users(me: User) -> impl IntoView {
     // would put back what a newer change (a limits save) already replaced.
     let generation = StoredValue::new(0u64);
     let load = move || {
-        let this = generation.get_value() + 1;
+        let Some(previous) = generation.try_get_value() else { return };
+        let this = previous + 1;
         generation.set_value(this);
         run(error, loading, async move {
-            let u = api::get::<Value>("/ui/api/users").await;
-            let i = api::get::<Value>("/ui/api/invites").await;
-            let s = api::get::<Value>("/ui/api/services").await;
+            let u = api::get("/ui/api/users").await;
+            let i = api::get("/ui/api/invites").await;
+            let s = api::get("/ui/api/services").await;
             if generation.try_get_value() != Some(this) {
                 return Ok(());
             }
@@ -1411,7 +1020,7 @@ fn Users(me: User) -> impl IntoView {
             body["email"] = json!(to);
         }
         run(error, busy, async move {
-            let v = api::post::<Value>("/ui/api/invites", &body).await?;
+            let v = api::post("/ui/api/invites", &body).await?;
             new_url.set(v["url"].as_str().map(str::to_string));
             mailed_to.set((v["mailed"].as_bool() == Some(true)).then_some(to));
             invite_email.set(String::new());
@@ -1421,14 +1030,19 @@ fn Users(me: User) -> impl IntoView {
     };
     let update = move |id: String, body: Value| {
         run(error, busy, async move {
-            api::patch::<Value>(&format!("/ui/api/users/{id}"), &body).await?;
+            let v = api::patch(&format!("/ui/api/users/{id}"), &body).await?;
+            if body.get("role").is_some() {
+                let name = v["user"]["username"].as_str().unwrap_or_default();
+                let role = if v["user"]["role"] == "admin" { "an admin" } else { "a member" };
+                notice.set(Some(format!("{name} is now {role}.")));
+            }
             load();
             Ok(())
         });
     };
     let reset_traffic = move |id: String| {
         run(error, busy, async move {
-            api::post::<Value>(&format!("/ui/api/users/{id}/traffic/reset"), &json!({})).await?;
+            api::post(&format!("/ui/api/users/{id}/traffic/reset"), &json!({})).await?;
             load();
             Ok(())
         });
@@ -1509,6 +1123,7 @@ fn Users(me: User) -> impl IntoView {
                         // lost), goes to the row's Limits button (the row stays, so it is
                         // still there), else to the notice. The row may be gone already.
                         let close = move |focus: FocusAt| {
+                            if notice.is_disposed() { return; }
                             editing.try_set(false);
                             if focus.needs_a_place() && !opener.try_with_value(|o| focus_id(o)).unwrap_or(false) {
                                 focus_id(NOTICE_ID);
@@ -1519,6 +1134,7 @@ fn Users(me: User) -> impl IntoView {
                         // saved user at once, so the editor opens on them even before
                         // the reload is back.
                         let saved = move |name: String, user: Option<User>, focus: FocusAt| {
+                            if notice.is_disposed() { return; }
                             notice.set(Some(format!("Saved the limits of {name}.")));
                             close(focus);
                             if let Some(user) = user {
@@ -1596,6 +1212,7 @@ fn Users(me: User) -> impl IntoView {
                                 })}
                                 {(owner && !disabled).then(|| view! {
                                     <button class="btn btn-outline btn-sm" aria-label=if is_admin { format!("Make member {name}") } else { format!("Make admin {name}") }
+                                        data-confirm=role_question(&name, is_admin, mail)
                                         on:click=move |_| update(id.get_value(), json!({ "role": if is_admin { "member" } else { "admin" } }))>
                                         {if is_admin { "Make member" } else { "Make admin" }}
                                     </button>" "
@@ -1679,6 +1296,24 @@ fn Users(me: User) -> impl IntoView {
     }
 }
 
+fn role_question(name: &str, was_admin: bool, mail: bool) -> String {
+    let role = if was_admin { "a member" } else { "an admin" };
+    let defaults = if was_admin { "member" } else { "admin" };
+    let mut question = format!(
+        "Make {name} {role}? Their sessions end and their limits reset to the {defaults} defaults. Tunnels beyond the new lifetime limit end sooner."
+    );
+    if was_admin {
+        question.push_str(" Their public-preview permission and unused invites are removed; public tunnels require access links unless the server allows public previews for everyone.");
+    }
+    if !was_admin {
+        question.push_str(" They can invite and manage members, see every tunnel and allow public previews.");
+    }
+    if mail {
+        question.push_str(" A notice is mailed to their confirmed email address, if they have one.");
+    }
+    question
+}
+
 /// Users: make a sign-in reset link for one account and show it once. Which
 /// panels are open, and their links, live in `resets` (by user id); the rows
 /// are keyed, so other rows' changes leave this panel (and its form) alone.
@@ -1694,11 +1329,13 @@ fn ResetPanel<F>(
 where
     F: Fn() + Copy + Send + Sync + 'static,
 {
+    let code_error = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let needs_code = RwSignal::new(false);
     let code = RwSignal::new(String::new());
     let code_id = format!("reset-code-{id}");
+    let copy_id = StoredValue::new(format!("reset-copy-{id}"));
     let send = RwSignal::new(email.is_some());
     let mailed = RwSignal::new(None::<String>);
     let email2 = email.clone();
@@ -1714,6 +1351,7 @@ where
             })
         }
     };
+    let field_id = StoredValue::new(code_id.clone());
     let create = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let mut body = json!({});
@@ -1728,8 +1366,16 @@ where
         let id = id.clone();
         busy.set(true);
         error.set(None);
+        code_error.set(None);
+        let copy_focus = copy_id.get_value();
+        let field_focus = field_id.get_value();
         spawn_local(async move {
-            match api::post::<Value>(&path, &body).await {
+            let response = api::post(&path, &body).await;
+            // Cancel may dispose this panel while its request is in flight.
+            if busy.is_disposed() {
+                return;
+            }
+            match response {
                 Ok(v) => {
                     let made = v["url"].as_str().map(str::to_string);
                     mailed.set(to.filter(|_| v["mailed"].as_bool() == Some(true)));
@@ -1739,11 +1385,13 @@ where
                     needs_code.set(false);
                     code.set(String::new());
                     reload();
+                    focus_later(busy, copy_focus);
                 }
                 Err(e) if e.code == "code_required" => {
                     needs_code.set(true);
                     error.set(Some(e.message));
                 }
+                Err(e) if field_refused(&e, "invalid_code", code_error, &field_focus) => {}
                 Err(e) => error.set(Some(e.message)),
             }
             busy.set(false);
@@ -1759,7 +1407,7 @@ where
                         Some(to) => format!("Mailed to {to}. You can also hand it over: it works once, within an hour, and is a credential."),
                         None => format!("Send this link to {name1}; it works once, within an hour, and is a credential."),
                     }}</p>
-                    <Copy value=Signal::derive(move || u.clone()) label="Reset link" />
+                    <Copy value=Signal::derive(move || u.clone()) label="Reset link" id=copy_id.get_value() />
                     <div><button class="btn btn-outline btn-sm" type="button" on:click={
                         let close = close.clone();
                         move |_| close()
@@ -1770,7 +1418,7 @@ where
                     view! {
                         <form class="stack" on:submit=create.clone()>
                             <p class="small">{format!(
-                                "A single-use link lets {name2} choose a new password. Their two-factor sign-in and recovery codes are turned off and all their sessions end; their machines stay unless they choose otherwise. It works for one hour; hand it over as you would an invite."
+                                "A single-use link lets {name2} choose a new password. Their two-factor sign-in and recovery codes are turned off and all their sessions end; all their machines are signed out and their tunnels end. Sign machines in again with tunnel login. It works for one hour; hand it over as you would an invite."
                             )}</p>
                             {email2.clone().map(|e| view! {
                                 <label class="check">
@@ -1781,11 +1429,7 @@ where
                             {move || needs_code.get().then(|| {
                                 let code_id = code_id.clone();
                                 view! {
-                                    <div class="field">
-                                        <label for=code_id.clone()>"Code from your authenticator app (or a recovery code)"</label>
-                                        <input id=code_id class="input w-auto" autocomplete="one-time-code" inputmode="text" required
-                                            prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
-                                    </div>
+                                    <CodeField id=code_id label="Code from your authenticator app (or a recovery code)" value=code error=code_error />
                                 }
                             })}
                             <div class="row">
@@ -1810,8 +1454,8 @@ fn Status() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     run(error, busy, async move {
-        status.set(Some(api::get::<Value>("/ui/api/status").await?));
-        let a = api::get::<Value>("/ui/api/audit").await?;
+        status.set(Some(api::get("/ui/api/status").await?));
+        let a = api::get("/ui/api/audit").await?;
         audit.set(serde_json::from_value(a["entries"].clone()).unwrap_or_default());
         Ok(())
     });
@@ -1824,6 +1468,7 @@ fn Status() -> impl IntoView {
             match v {
                 Value::String(s) => s,
                 Value::Null => "—".into(),
+                Value::Bool(on) => if on { "On" } else { "Off" }.into(),
                 other => other.to_string(),
             }
         }
@@ -1893,15 +1538,7 @@ fn Status() -> impl IntoView {
 mod tests {
     use super::*;
 
-    /// The body of `fn <name>` in `src`, up to the next item.
-    fn body<'a>(src: &'a str, name: &str) -> &'a str {
-        let start = [format!("fn {name}("), format!("fn {name}<")]
-            .iter()
-            .find_map(|head| src.find(head.as_str()))
-            .unwrap_or_else(|| panic!("no fn {name}"));
-        let rest = &src[start..];
-        &rest[..rest.find("\n}\n").expect("the item ends")]
-    }
+    use crate::ui::source_body as body;
 
     /// Every page names itself with one real h1 (the 404 included), and no
     /// element stands in for a heading through an ARIA role.
@@ -1927,12 +1564,17 @@ mod tests {
         assert_eq!(arms, pages.len() + 1, "one listed page per route arm, plus the 404");
         assert_eq!(route.matches("view! {").count(), arms, "one view per route arm");
         for page in pages {
-            assert_eq!(body(src, page).matches("<h1>").count(), 1, "{page}");
+            let source = match page {
+                "InvitePage" | "SignIn" => include_str!("auth.rs"),
+                "Account" => include_str!("account.rs"),
+                _ => src,
+            };
+            assert_eq!(body(source, page).matches("<h1").count(), 1, "{page}");
         }
         let (_, not_found) = route.split_once("_ => view!").expect("route has a fallback");
         assert_eq!(not_found.matches("<h1>").count(), 1, "the 404 page");
         // Sign-in's other state, Forgot password, replaces the whole card.
-        assert!(body(src, "SignIn").contains("<ForgotPassword "));
+        assert!(body(include_str!("auth.rs"), "SignIn").contains("<ForgotPassword "));
         assert_eq!(body(include_str!("email.rs"), "ForgotPassword").matches("<h1>").count(), 1, "ForgotPassword");
         for (file, text) in
             [("pages.rs", src), ("email.rs", include_str!("email.rs")), ("ui.rs", include_str!("ui.rs"))]
@@ -1946,44 +1588,38 @@ mod tests {
         include_str!("pages.rs").split("#[cfg(test)]").next().unwrap()
     }
 
-    #[test]
-    fn signing_in_from_the_machine_approval_link_says_why() {
-        assert!(sign_in_purpose("/device").is_some_and(|p| p.contains("approve the machine") && p.contains("code")));
-        for path in ["/", "/tunnels", "/account", "/devices"] {
-            assert_eq!(sign_in_purpose(path), None, "{path}");
-        }
-        // Untracked: a new path draws the page anew.
-        assert!(source().contains("sign_in_purpose(&c.path.get_untracked())"), "the sign-in card shows it");
-    }
-
-    #[test]
-    fn the_invite_heading_never_claims_a_role_it_does_not_know() {
-        assert_eq!(invite_title(None, false), "Opening your link");
-        assert_eq!(invite_title(None, true), "Link not valid");
-        assert_eq!(invite_title(Some(("invite", Some("admin"))), false), "Join as admin");
-        assert_eq!(invite_title(Some(("invite", None)), false), "Join as member");
-        assert_eq!(invite_title(Some(("owner_setup", None)), false), "Create the owner account");
-        assert_eq!(invite_title(Some(("password_reset", None)), false), "Set a new password");
-        assert_eq!(invite_title(Some(("email_verify", None)), false), "Confirm your email address");
-    }
-
     /// A refused two-factor code is said at the code field (next to Turn on),
     /// not in the page's error box at the top; typing or Not now clears it.
     #[test]
     fn a_refused_two_factor_code_is_said_at_the_field() {
-        let src = source();
-        let confirm = &src[src.find("let confirm_totp").unwrap()..];
-        let confirm = &confirm[..confirm.find("};").unwrap()];
-        assert!(confirm.contains("run(code_error, enabling,"), "{confirm}");
-        assert!(src.contains(r#"aria-describedby="totp-code-error" aria-invalid=move || code_error.get()"#));
-        assert!(src.contains(r#"on:input=move |ev| { code_error.set(None); totp_code.set(value(&ev)) }"#));
-        assert!(src.contains(r#"<p id="totp-code-error" class="field-error" aria-live="polite">"#));
-        let not_now = &src[src.find(r#""Turn on""#).unwrap()..];
+        for (page, id, busy) in
+            [("SignIn", "code", "busy"), ("InvitePage", "reset-code", "busy"), ("Account", "totp-code", "enabling")]
+        {
+            let source = if page == "Account" { include_str!("account.rs") } else { include_str!("auth.rs") };
+            let page = body(source, page);
+            assert!(page.contains(&format!("run_code(error, {busy}, code_error, \"{id}\"")));
+            assert!(page.contains(&format!("<CodeField id=\"{id}\"")));
+        }
+        let ui = include_str!("ui.rs");
+        assert!(ui.contains("aria-describedby=described.clone() aria-invalid=move || error.get().map(|_| \"true\")"));
+        assert!(ui.contains("error.set(None); value.set(event_target_value(&ev))"));
+        assert!(ui.contains("class=\"field-error\" aria-live=\"polite\""));
+        assert!(ui.contains(r#"let described = format!("{id}-error")"#));
+        assert!(ui.contains("field_refused(&e, \"invalid_code\", field, id)"));
+        let account = include_str!("account.rs");
+        let not_now = &account[account.find(r#""Turn on""#).unwrap()..];
         assert!(not_now[..not_now.find(r#""Not now""#).unwrap()].contains("code_error.set(None)"));
     }
 
-    /// Row buttons say whose row they act on, like "Reset sign-in for <name>",
-    /// and the row does not read out the user's internal id.
+    #[test]
+    fn admin_reset_panel_explains_machine_sign_out() {
+        let panel = body(source(), "ResetPanel");
+        assert!(panel.contains("all their machines are signed out and their tunnels end."));
+        assert!(panel.contains("Sign machines in again with tunnel login."));
+        assert!(!panel.contains("machines stay"));
+    }
+
+    /// Row buttons name their user without reading out the internal id.
     #[test]
     fn user_row_buttons_name_the_user() {
         let src = source();
@@ -1999,25 +1635,138 @@ mod tests {
     #[test]
     fn in_place_notices_are_announced() {
         let src = source();
-        assert!(src.contains(r#"<div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>"#));
+        assert!(include_str!("account.rs").contains(r#"<div role="status">{move || notice.get().map(|n| view! { <div class="alert alert-success">{n}</div> })}</div>"#));
         assert!(src.contains(r#"<div role="status">{move || done.get().map(|d| view! { <div class="alert alert-success">{d}</div> })}</div>"#));
     }
 
     /// Two-factor setup can be left without turning it on.
+
     #[test]
-    fn two_factor_setup_has_a_way_back() {
+    fn in_place_steps_leave_focus_on_the_next_control() {
         let src = source();
-        let setup = &src[src.find(r#""Turn on""#).unwrap()..];
-        let not_now = &setup[..setup.find(r#""Not now""#).expect("a Not now button")];
-        assert!(not_now.contains("setup.set(None)") && not_now.contains("totp_code.set(String::new())"));
-        assert!(not_now.contains("disabled=move || enabling.get()"), "not while Turn on is on its way");
-        assert!(src.contains(r#"type="submit" disabled=move || enabling.get()>"Turn on""#));
-        // One setup request at a time: a late second answer would reopen it.
-        let start = &src[src.find("let start_totp").unwrap()..src.find("let confirm_totp").unwrap()];
-        assert!(start.contains("if starting.get_untracked() {\n            return;"), "{start}");
-        assert!(start.contains("run(error, starting, async move {"), "its own in-flight flag");
-        assert!(not_now.contains(r#"focus_id("totp-pw")"#), "the focus is not dropped");
-        assert!(src.contains("run(code_error, enabling, async move {"), "its own in-flight flag");
+        let account = body(include_str!("account.rs"), "Account");
+        let start = &account[account.find("let start_totp").unwrap()..account.find("let confirm_totp").unwrap()];
+        assert!(start.contains(r#"focus_later(starting, "totp-code".into())"#));
+        for page in ["Links", "ResetPanel"] {
+            let page = body(src, page);
+            assert!(page.contains("let copy_focus = copy_id.get_value();"));
+            assert!(page.contains("focus_later(busy, copy_focus)"));
+            assert!(page.contains("id=copy_id.get_value()"));
+        }
+        let tunnels = body(src, "Tunnels");
+        let delete = &tunnels[tunnels.find("let delete").unwrap()..tunnels.find("let editing").unwrap()];
+        assert!(delete.contains("list.get(at + 1)"));
+        assert!(delete.contains("focus_after.set(Some(next))"));
+        assert!(delete.contains(r#"unwrap_or_else(|| "tunnels-title".into())"#));
+        assert!(tunnels.contains(r#"<h1 id="tunnels-title" tabindex="-1">"#));
+        assert!(tunnels.contains("if !focus_id(&id)"));
+        let device = body(src, "Device");
+        for id in ["approve-password", "approve-code", "approve"] {
+            assert!(device.contains(&format!(r#""{id}""#)));
+        }
+        assert!(device.contains("focus_later(busy, target.into())"));
+        assert!(device.contains(r#"<button id="approve""#));
+        let machines = body(src, "Machines");
+        assert!(
+            machines
+                .contains(r#"focus_after.set(Some(format!("rename-machine-{}", v["name"].as_str().unwrap_or(&old))))"#)
+        );
+        let load = &machines[machines.find("let load").unwrap()..machines.find("let add").unwrap()];
+        assert!(load.find("machines.set(Some(").unwrap() < load.find("focus_id(&id)").unwrap());
+        assert!(load.contains("set_timeout("));
+    }
+
+    #[test]
+    fn in_place_focus_uses_owners_that_survive_the_step_or_list_change() {
+        // Only an identity/role/pending change replaces a routed page.
+        // In particular, refreshing Account's usage does not replace it.
+        let app = body(include_str!("main.rs"), "App");
+        let auth = &app[app.find("let auth = Memo::new").unwrap()..app.find("leptos::task::spawn_local").unwrap()];
+        assert!(auth.contains("s.user.as_ref().map(|u| (u.id.clone(), u.role.clone())), s.pending"));
+        assert!(app.contains("let _ = auth.get();"));
+        assert!(body(source(), "route").contains("ctx().session.get_untracked()"));
+
+        let account = body(include_str!("account.rs"), "Account");
+        let start = &account[account.find("let start_totp").unwrap()..account.find("let confirm_totp").unwrap()];
+        assert!(account.find("let starting = RwSignal::new(false)").unwrap() < account.find("let start_totp").unwrap());
+        assert!(start.contains(r#"focus_later(starting, "totp-code".into())"#));
+        assert!(!start.contains("refresh_session(") && !start.contains("navigate("));
+
+        // Their busy signals belong to the page/panel, outside the step or
+        // row that disappears. None of these successes changes the route.
+        for (page, handler) in [
+            ("Device", "let lookup"),
+            ("Links", "let create"),
+            ("Tunnels", "let delete"),
+            ("ResetPanel", "let create"),
+            ("Machines", "let save_name"),
+        ] {
+            let page = body(source(), page);
+            let handlers = &page[..page.find("\n    view! {").unwrap()];
+            assert!(handlers.find("let busy = RwSignal::new(false)").unwrap() < handlers.find(handler).unwrap());
+            assert!(!handlers.contains("refresh_session(") && !handlers.contains("navigate("), "{handler}");
+        }
+        // A reset reload updates the keyed user row without replacing its
+        // ResetPanel; publishing a URL keeps resetting=true in its memo.
+        let users = body(source(), "Users");
+        assert!(users.contains("key=|row: &UserRow| row.user.id.clone()"));
+        assert!(users.contains("resets.with(|r| r.contains_key(&id))"));
+        assert!(users.contains("resetting.get().then(|| row.with_untracked("));
+    }
+
+    #[test]
+    fn rename_opens_at_the_field_and_escape_or_cancel_returns_to_rename() {
+        for (page, kind) in [("Machines", "machine"), ("Tunnels", "tunnel")] {
+            let page = body(source(), page);
+            assert!(page.contains(&format!(r#"focus_later(busy, "rename-{kind}".into())"#)));
+            assert!(page.contains(&format!(r#"focus_later(busy, format!("rename-{kind}-{{id}}"))"#)));
+            assert!(page.contains(r#"ev.key() == "Escape" { ev.prevent_default(); cancel_rename(); }"#));
+            assert!(page.contains(r#"on:click=move |_| cancel_rename()>"Cancel""#));
+            let field = page.find(&format!(r#"<input id="rename-{kind}""#)).unwrap();
+            let form = &page[field..];
+            assert!(form.find(r#">"Save""#).unwrap() < form.find(r#">"Cancel""#).unwrap());
+        }
+    }
+
+    #[test]
+    fn device_approval_asks_for_and_checks_the_password_at_its_field() {
+        let device = body(source(), "Device");
+        for expected in [
+            r#"v["needs_password"].as_bool()"#,
+            r#"body["password"] = json!(password.get())"#,
+            r#"e.code == "password_required""#,
+            r#"field_refused(&e, "invalid_password", password_error, "approve-password")"#,
+            r#"<CodeField id="approve-password" label="Your password" value=password error=password_error password=true"#,
+            "password.set(String::new())",
+        ] {
+            assert!(device.contains(expected), "{expected}");
+        }
+        let ui = include_str!("ui.rs");
+        assert!(ui.contains(r#"type=if password { "password" } else { "text" }"#));
+        assert!(ui.contains(r#"autocomplete=if password { "current-password" } else { "one-time-code" }"#));
+    }
+
+    #[test]
+    fn headless_enrollment_reuses_the_approval_password_field_and_feedback() {
+        let machines = body(source(), "Machines");
+        for expected in [
+            r#"body["password"] = json!(password.get())"#,
+            r#"e.code == "password_required""#,
+            "needs_password.set(true)",
+            r#"focus_later(busy, "machine-password".into())"#,
+            r#"field_refused(&e, "invalid_password", password_error, "machine-password")"#,
+            r#"<CodeField id="machine-password" label="Your password" value=password error=password_error password=true"#,
+            "password_error.set(None)",
+            "needs_password.set(false)",
+            "password.set(String::new())",
+        ] {
+            assert!(machines.contains(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn server_booleans_are_words() {
+        assert!(body(source(), "Status").contains(r#"Value::Bool(on) => if on { "On" } else { "Off" }.into()"#));
     }
 
     #[test]
@@ -2034,7 +1783,7 @@ mod tests {
         let src = source();
         let machines = &src[src.find("fn Machines").unwrap()..src.find("fn Device").unwrap()];
         // Answers are about the name sent; one typed since is left alone.
-        assert!(machines.contains("let still = move || name.get_untracked() == sent;"));
+        assert!(machines.contains("let still = move || name.try_get_untracked().is_some_and(|name| name == sent);"));
         let ok = &machines[machines.find("login_code.set(created_login(&v))").unwrap()..];
         let ok = &ok[..ok.find("Err(e)").unwrap()];
         assert!(ok.contains("if still() {") && ok.contains("name.set(String::new())"), "{ok}");
@@ -2074,6 +1823,17 @@ mod tests {
                 .contains(r#"data-confirm=(!disabled).then(|| format!("Disable {name}? "#),
             "Disable asks first"
         );
+        let role = &src[src.find(r#"format!("Make member {name}") } else { format!("Make admin {name}")"#).unwrap()..];
+        assert!(role[..role.find("on:click").unwrap()].contains("data-confirm=role_question(&name, is_admin, mail)"));
+        assert!(body(src, "Users").contains(r#"notice.set(Some(format!("{name} is now {role}.")))"#));
+        let admin = role_question("alex", false, true);
+        assert!(admin.starts_with("Make alex an admin?"));
+        assert!(admin.contains("admin defaults") && admin.contains("sessions end") && admin.contains("end sooner"));
+        assert!(admin.contains("confirmed email address, if they have one"));
+        let member = role_question("alex", true, false);
+        assert!(member.starts_with("Make alex a member?"));
+        assert!(member.contains("member defaults") && member.contains("public tunnels require access links unless"));
+        assert!(member.contains("unused invites are removed") && !member.contains("mailed"));
         let shell = include_str!("../static/shell.js");
         // A click (mouse, Enter and Space all send one), on window in the
         // capture phase, from any element inside the button.

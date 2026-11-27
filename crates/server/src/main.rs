@@ -179,7 +179,7 @@ enum UserCmd {
     },
     /// Print a one-time link that sets a new password for an account (not the
     /// owner: `admin link`) and turns its two-factor sign-in off, for someone
-    /// locked out. Its sessions end; its machines stay unless the page is told otherwise.
+    /// locked out. Its sessions end; all its machine logins are revoked and their tunnels end.
     Reset {
         username: String,
         /// Hours the link works (1..=24).

@@ -284,8 +284,8 @@ access-link redemption on the preview zone stays a cross-site top-level GET.
 **Accounts.** `tunnel-server admin link` prints a one-time link (15 minutes)
 to create the owner account; run on a server that has an owner, it resets the
 owner's password and turns two-factor sign-in off (the recovery path; the
-page can also remove all of the owner's machines). Machines added before
-anyone signed up (`client add` or `POST /v1/clients` without a user) belong to
+reset also revokes all of the owner's machine logins and ends their tunnels).
+Machines added before anyone signed up (`client add` or `POST /v1/clients` without a user) belong to
 an owner account without a password, which the setup link later claims.
 Accounts are owner, admin or member. Admins invite people with single-use,
 expiring links (`https://<ui_host>/invite#…`, 7 days by default; the token
@@ -294,7 +294,10 @@ only the owner invites or changes admins. Members see and manage only their
 own machines, tunnels and links, within their limits (below). Members
 cannot create public previews unless an admin allows it for them
 (`can_public`) or `limits.allow_public_for_clients` is on; access links and
-password mode always work. Disabling a user ends their sessions, removes their
+password mode always work. Removing public permission (including demoting an admin
+to member without it) switches their existing public tunnels to link-only
+and ends anonymous access immediately; allowing it again keeps those tunnels
+link-only. Disabling a user ends their sessions, removes their
 machines and closes their tunnels. Sign-in is username and password
 (Argon2id) with optional TOTP and ten single-use recovery codes; changing the
 password or the second factor ends the user's other sessions, and a sign-in
@@ -303,7 +306,9 @@ limited per address (`limits.login_rate_per_min`, default 10) and per username
 (three times that, so one address cannot lock anyone out) before any password
 is hashed; five wrong codes in a row lock the second factor for 15 minutes,
 doubling up to a day. Users with two-factor sign-in confirm approving or
-adding a machine with a code when their last check is older than ten minutes. The UI keeps an audit log (90 days).
+adding a machine with a code when their last check is older than ten minutes.
+Approving or adding a machine without two-factor sign-in asks for the current
+password after ten minutes. The UI keeps an audit log (90 days).
 Someone locked out (a forgotten password, or a lost authenticator and
 recovery codes) gets a sign-in reset link: **Reset sign-in** in the Users
 page (admins for members, the owner for admins) or `tunnel-server user reset
@@ -311,7 +316,7 @@ page (admins for members, the owner for admins) or `tunnel-server user reset
 fragment, and handed over by whoever made it; it lasts an hour by default
 (15 minutes to a day). Opening it sets a new password, turns two-factor
 sign-in off, deletes the recovery codes and ends every session of the
-account (optionally removing its machines too). It stops working once the
+account, revokes all its machine logins and ends their tunnels. It stops working once the
 account signs in differently (a new password or second factor), changes role
 or is disabled, or once its maker's own sign-in, role or status changes (so
 recovering from a stolen admin session also voids the links it made); a newer
@@ -438,7 +443,9 @@ With mail on:
   stops working when the account's sign-in or address changes. With
   two-factor sign-in on, the page also asks for a code or recovery code, and
   the reset keeps two-factor sign-in on: an email address is never a second
-  factor. A lost authenticator still needs an admin's **Reset sign-in**,
+  factor. Every accepted reset ends all sessions, revokes all machine logins
+  and ends their tunnels. A signed-in password change keeps machine logins.
+  A lost authenticator still needs an admin's **Reset sign-in**,
   which can now also be mailed. Mailed resets of either kind share the
   per-account limit: an admin asking within two minutes of the last one is
   told how long to wait, and can still hand the link over instead.
@@ -676,8 +683,13 @@ any caller where things live (API, control, gate and UI origins, the preview
 host template) and its own limits, including whether it may create public
 previews. `GET /v1/tunnels/{id}/access-links` lists a tunnel's links (the URLs
 themselves are never stored). `client list` shows enrolled machines; `client delete <name>`
-revokes the token, cancels pending codes and stops its tunnels. `logout` only
-forgets the local login.
+revokes the token, cancels pending codes and stops its tunnels. `tunnel logout`
+revokes its own machine login and ends its tunnels via `DELETE /v1/login`,
+then removes the local login. A 204 confirms revocation; a 401 means the login
+was already invalid. If the server is offline, times out (within ten seconds),
+or gives another answer, logout still removes the local login and says:
+"The server did not confirm the revocation; the machine's login may still be
+valid: remove it under Machines in the web UI", including the UI URL when known.
 
 ### Service credentials
 

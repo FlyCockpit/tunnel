@@ -338,6 +338,7 @@ fn openapi_keeps_management_paths() {
         ("/v1/clients", vec!["get", "post"]),
         ("/v1/clients/{name}", vec!["patch", "delete"]),
         ("/v1/clients/enroll", vec!["post"]),
+        ("/v1/login", vec!["delete"]),
         ("/v1/tunnels/{id}/token", vec!["post"]),
         ("/v1/services", vec!["get", "post"]),
         ("/v1/services/{name}", vec!["patch", "delete"]),
@@ -461,7 +462,11 @@ async fn service_owns_only_its_tunnels_within_its_quota() {
     ] {
         let body = matches!(method, "POST" | "PATCH").then(|| serde_json::json!({"name": "x", "max_tunnels": 9}));
         let (status, _) = request(&state, method, uri, Some(&svc), body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        assert_eq!(
+            status,
+            if uri == "/v1/openapi.json" { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED },
+            "{method} {uri}"
+        );
     }
 
     // The admin raises the quota; the listing shows it and the usage.

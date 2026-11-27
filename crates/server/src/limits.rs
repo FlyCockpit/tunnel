@@ -73,7 +73,7 @@ impl<'de> Deserialize<'de> for Setting {
             Raw::Word(w) if w == "default" => Ok(Self::Default),
             Raw::Word(w) if w == "unlimited" => Ok(Self::Unlimited),
             Raw::Word(_) => {
-                Err(serde::de::Error::custom("a limit is \"default\", \"unlimited\" or a non-negative whole number"))
+                Err(serde::de::Error::custom("A limit is \"default\", \"unlimited\" or a non-negative whole number"))
             }
         }
     }
@@ -139,7 +139,7 @@ impl SettingsPatch {
                 let (min, max) = kind.range();
                 if !(min..=max).contains(&n) {
                     return Err(format!(
-                        "limits.{} must be \"default\", \"unlimited\" or within {min}..={max}{}",
+                        "The limits.{} value must be \"default\", \"unlimited\" or within {min}..={max}{}",
                         kind.key(),
                         kind.unit_hint()
                     ));
@@ -323,7 +323,7 @@ pub fn raiser(role: Role) -> &'static str {
 /// A refused new machine.
 pub fn machine_limit_message(limit: u64, role: Role) -> String {
     format!(
-        "this account's machine limit ({limit}) is reached; remove a machine on the Machines page, \
+        "This account's machine limit ({limit}) is reached; remove a machine on the Machines page, \
          or ask {} to raise the limit",
         raiser(role)
     )
@@ -332,7 +332,7 @@ pub fn machine_limit_message(limit: u64, role: Role) -> String {
 /// A refused new tunnel (the user's limit across all their machines).
 pub fn tunnel_limit_message(limit: u64, role: Role) -> String {
     format!(
-        "this account's live-tunnel limit ({limit}, across all its machines) is reached; delete a tunnel \
+        "This account's live-tunnel limit ({limit}, across all its machines) is reached; delete a tunnel \
          (`tunnel unshare`, or the Tunnels page), or ask {} to raise the limit",
         raiser(role)
     )
@@ -341,13 +341,13 @@ pub fn tunnel_limit_message(limit: u64, role: Role) -> String {
 /// A refused lifetime: too long, or "never expires" while a limit applies.
 /// `account`: the machine's user's role (`None`: a service or the admin token).
 pub fn ttl_limit_message(limit: u64, account: Option<Role>, never: bool) -> String {
-    let whose = if account.is_some() { "this account's" } else { "this caller's" };
+    let whose = if account.is_some() { "account's" } else { "caller's" };
     let asked = if never { "a tunnel that never expires" } else { "a lifetime that long" };
     let raise = match account {
         Some(role) => format!("; ask {} to raise the limit", raiser(role)),
         None => " (limits.max_tunnel_ttl_s)".to_string(),
     };
-    format!("{whose} tunnel lifetime limit is {}, so {asked} is not allowed{raise}", duration_text(limit))
+    format!("The {whose} tunnel lifetime limit is {}, so {asked} is not allowed{raise}", duration_text(limit))
 }
 
 /// `90s`, `30m`, `8h`, `7d`, or a combination (`1d 12h`).

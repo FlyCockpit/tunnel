@@ -89,17 +89,31 @@ pub async fn login(arg: Option<&str>, name: Option<&str>, open_browser: bool) ->
     Ok(0)
 }
 
-pub fn logout() -> anyhow::Result<i32> {
-    let p = crate::login::path()?;
-    match std::fs::remove_file(&p) {
-        Ok(()) => println!(
-            "Logged out (removed {}). The machine's token still works until the machine is removed: Machines in the web UI, or an admin's `tunnel-server client delete`.",
-            p.display()
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("Not logged in."),
-        Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
+pub async fn logout() -> anyhow::Result<i32> {
+    match logout_at(&crate::login::path()?).await? {
+        Some(message) => println!("{message}"),
+        None => println!("Not logged in."),
     }
     Ok(0)
+}
+
+async fn logout_at(p: &std::path::Path) -> anyhow::Result<Option<String>> {
+    let (outcome, ui) = match Login::load_at(p) {
+        Ok(None) => return Ok(None),
+        Ok(Some(login)) => match Api::new(&login) {
+            Ok(api) => api.revoke_login().await,
+            Err(_) => (crate::login::LogoutOutcome::Unconfirmed, None),
+        },
+        // A damaged or unreadable login cannot identify the server credential.
+        // Still try to remove it, and report that revocation was not confirmed.
+        Err(_) => (crate::login::LogoutOutcome::Unconfirmed, None),
+    };
+    match std::fs::remove_file(p) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
+    }
+    Ok(Some(crate::login::logout_message(outcome, ui.as_deref())))
 }
 
 /// Requested access for `share`; `None` fields mean "not given".
@@ -974,6 +988,27 @@ mod tests {
             lock_file: dir.join("daemon.lock"),
             dir,
         }
+    }
+
+    #[tokio::test]
+    async fn logout_removes_a_malformed_login_without_claiming_revocation() {
+        let paths = test_paths("logout-malformed");
+        let login = paths.dir.join("login.json");
+        for bytes in [b"{broken".as_slice(), b"{}", b"null"] {
+            std::fs::write(&login, bytes).unwrap();
+            assert!(Login::load_at(&login).is_err());
+            let message = logout_at(&login).await.unwrap().unwrap();
+            assert!(!login.exists());
+            assert!(message.contains("local login was removed"));
+            assert!(message.contains("did not confirm the revocation"));
+            assert!(message.contains("machine's login may still be valid"));
+            assert!(message.contains("remove it under Machines in the web UI"));
+        }
+        assert!(logout_at(&login).await.unwrap().is_none());
+        // Removal failures must still be reported.
+        std::fs::create_dir(&login).unwrap();
+        assert!(logout_at(&login).await.is_err());
+        std::fs::remove_dir_all(&paths.dir).unwrap();
     }
 
     #[test]

@@ -95,6 +95,18 @@ impl Mailer {
         Texts::new(&self.ui_host)
     }
 
+    /// Notify a confirmed address from either API without depending on its routes.
+    pub async fn notify_user(self: &Arc<Self>, db: &crate::db::Db, user_id: &str, notice: &Notice, ip: Option<&str>) {
+        match db.contact(user_id.to_string()).await {
+            Ok(Some((username, email))) => {
+                let mail = self.texts().notice(notice, &username, crate::tokens::now(), ip);
+                self.send_notice_later(email, mail);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "looking up an address for a notice failed"),
+        }
+    }
+
     /// Send `mail` to `to` in the background. `kind` names it in the log.
     /// `false` if the queue was full and it was dropped.
     #[must_use = "say whether it was mailed (or ignore a drop on purpose)"]

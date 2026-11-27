@@ -131,10 +131,12 @@ pub fn is_loopback(host: &str) -> bool {
 pub fn parse_address(input: &str) -> Result<String, String> {
     let s = input.trim();
     if !s.is_ascii() {
-        return Err(format!("{s:?}: only ASCII addresses are supported (international domains in their xn-- form)"));
+        return Err(format!(
+            "The address {s:?} must use ASCII characters (write international domains in their xn-- form)"
+        ));
     }
     let ok = s.len() <= 254 && s.parse::<lettre::Address>().is_ok();
-    if ok { Ok(s.to_ascii_lowercase()) } else { Err(format!("{s:?} is not an email address")) }
+    if ok { Ok(s.to_ascii_lowercase()) } else { Err(format!("The address {s:?} is not an email address")) }
 }
 
 #[cfg(test)]

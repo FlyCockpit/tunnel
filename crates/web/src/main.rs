@@ -3,7 +3,9 @@
 //! Client-side rendered with Leptos and served by tunnel-server from its
 //! binary; it talks only to `/ui/api/*` on its own origin.
 
+mod account;
 mod api;
+mod auth;
 mod boot;
 mod device;
 mod email;
@@ -23,6 +25,7 @@ use wasm_bindgen::prelude::Closure;
 pub struct Ctx {
     pub session: RwSignal<Option<SessionInfo>>,
     pub path: RwSignal<String>,
+    pub notice: RwSignal<Option<String>>,
 }
 
 thread_local! {
@@ -41,6 +44,7 @@ fn location_path() -> String {
 
 /// Client-side navigation (history API).
 pub fn navigate(to: &str) {
+    ctx().notice.set(None);
     if let Some(w) = web_sys::window()
         && let Ok(h) = w.history()
     {
@@ -54,14 +58,15 @@ pub fn navigate(to: &str) {
 
 /// Re-read `/ui/api/session` (after sign-in, sign-out, role changes).
 pub async fn refresh_session() {
-    match api::get::<SessionInfo>("/ui/api/session").await {
-        Ok(s) => {
+    let session = api::get("/ui/api/session").await.ok().and_then(|v| serde_json::from_value::<SessionInfo>(v).ok());
+    match session {
+        Some(s) => {
             api::set_csrf(s.csrf.clone());
             boot::remember(Some(&s));
             ctx().session.set(Some(s));
         }
         // Shown as signed out, so the next first paint is too.
-        Err(_) => {
+        None => {
             boot::remember(None);
             ctx().session.set(None);
         }
@@ -70,7 +75,7 @@ pub async fn refresh_session() {
 
 #[component]
 fn App() -> impl IntoView {
-    let c = Ctx { session: RwSignal::new(None), path: RwSignal::new(location_path()) };
+    let c = Ctx { session: RwSignal::new(None), path: RwSignal::new(location_path()), notice: RwSignal::new(None) };
     CTX.with(|cell| {
         let _ = cell.set(c);
     });
@@ -85,7 +90,10 @@ fn App() -> impl IntoView {
         boot::remove();
     });
     // Back/forward buttons.
-    let on_pop = Closure::<dyn Fn()>::new(move || c.path.set(location_path()));
+    let on_pop = Closure::<dyn Fn()>::new(move || {
+        c.notice.set(None);
+        c.path.set(location_path());
+    });
     if let Some(w) = web_sys::window() {
         let _ = w.add_event_listener_with_callback("popstate", on_pop.as_ref().unchecked_ref());
     }
@@ -108,6 +116,7 @@ fn App() -> impl IntoView {
 }
 
 fn main() {
+    #[cfg(debug_assertions)]
     console_error_panic_hook::set_once();
     leptos::mount::mount_to_body(App);
 }

@@ -106,7 +106,14 @@ every port of its tunnel. Each client token may own at most
 `limits.max_tunnels_per_client` live tunnels (default 20). Creating another
 returns HTTP 429 with `error.code: "tunnel_quota"`; admin tokens are exempt.
 Deleting the client revokes
-its token and deletes its tunnels. `logout` only removes the local login.
+its token and deletes its tunnels. `tunnel logout` revokes the machine's login
+on the server (`DELETE /v1/login`), ending its tunnels, then removes the local
+login. A 204 confirms revocation; a 401 means it was already invalid. If the
+server is offline, times out (within ten seconds), or gives another answer,
+the local login is still removed. Logout says "The server did not confirm the
+revocation; the machine's login may still be valid: remove it under Machines
+in the web UI" and includes the UI URL when known. Remove that machine under
+Machines to ensure the server login is revoked.
 `expose` also uses the logged-in server when `TUNNEL_SERVER` is unset.
 
 New shares live for 8 hours by default (`share --ttl 30m|8h|2d` overrides this,

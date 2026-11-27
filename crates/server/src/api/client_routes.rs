@@ -96,7 +96,9 @@ pub(super) async fn create_client(
     match clients::add(&state.db, &state.config, &req.name, &user_id, None).await {
         Ok(e) => {
             // The account's owner hears of it, as when it is added in the web UI.
-            crate::ui::notify_user(&state, &user_id, crate::mail::Notice::MachineAdded(e.name.clone()), None).await;
+            if let Some(mailer) = state.ui.mail.as_ref() {
+                mailer.notify_user(&state.db, &user_id, &crate::mail::Notice::MachineAdded(e.name.clone()), None).await;
+            }
             Ok((
                 StatusCode::CREATED,
                 Json(CreateClientResponse {
@@ -156,11 +158,16 @@ pub(super) async fn delete_client(
     _admin: Admin,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let tunnels = state.db.delete_client(name.clone()).await?.ok_or_else(|| ApiError::not_found("client"))?;
-    for id in &tunnels {
-        state.delete_tunnel(id, CloseReason::Deleted).await?;
-    }
-    tracing::info!(client = %name, tunnels = tunnels.len(), "client deleted");
+    let deleted = name.clone();
+    let count = state
+        .revoke_tunnels(move |state| async move {
+            let tunnels = state.db.delete_client(deleted).await?;
+            let count = tunnels.as_ref().map(Vec::len);
+            Ok((count, tunnels.unwrap_or_default()))
+        })
+        .await?
+        .ok_or_else(|| ApiError::not_found("client"))?;
+    tracing::info!(client = %name, tunnels = count, "client deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -242,4 +249,18 @@ pub(super) async fn enroll_client(
         }
         None => Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_code", "invalid, used, or expired login code")),
     }
+}
+
+/// Machine tokens can revoke only the machine they authenticate as.
+#[utoipa::path(
+    delete, path = "/v1/login",
+    responses((status = 204, description = "Machine login revoked; its tunnels closed"),
+              (status = 401, body = ErrorBody), (status = 403, body = ErrorBody))
+)]
+pub(super) async fn revoke_login(State(state): State<Arc<AppState>>, caller: super::Caller) -> ApiResult<StatusCode> {
+    let super::Caller::Client { id, .. } = caller else {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", "this endpoint needs a machine token"));
+    };
+    state.revoke_tunnels(move |state| async move { Ok(((), state.db.delete_own_client(id).await?)) }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

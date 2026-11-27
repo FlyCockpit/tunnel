@@ -635,7 +635,7 @@ pub async fn admin_link(config_path: &Path, first_run: bool) -> anyhow::Result<(
     match owner.filter(|_| !unclaimed) {
         Some(o) => println!(
             "Open this link within {} minutes to set a new password for the owner {} \
-             (two-factor sign-in is turned off; turn it on again afterwards). It works once:\n",
+             (two-factor sign-in is turned off; turn it on again afterwards). All sessions and machine logins end, and their tunnels close. It works once:\n",
             ttl / 60,
             o.username
         ),
@@ -763,7 +763,7 @@ pub async fn user_reset(config_path: &Path, username: &str, hours: u32) -> anyho
     }
     println!(
         "Send this link to {username}; it works once, within {hours} hour(s), and is a credential.\n\
-         It sets a new password, turns two-factor sign-in off and ends {username}'s sessions:\n"
+         It sets a new password, turns two-factor sign-in off, ends {username}'s sessions and revokes all machine logins and their tunnels:\n"
     );
     println!("  https://{ui}/invite#{token}\n");
     println!("Withdraw it in the web UI (Users → Invites) if it is not needed any more.");

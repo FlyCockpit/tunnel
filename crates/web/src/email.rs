@@ -6,7 +6,7 @@ use leptos::prelude::*;
 use serde_json::{Value, json};
 
 use crate::api;
-use crate::ui::{Copy, ErrorBox, run, value};
+use crate::ui::{CodeField, Copy, ErrorBox, field_refused, run, value};
 use crate::{ctx, refresh_session};
 
 /// The sign-in page's "Forgot password?" form. The answer never says
@@ -24,7 +24,7 @@ where
         ev.prevent_default();
         let body = json!({ "login": login.get() });
         run(error, busy, async move {
-            api::post::<Value>("/ui/api/password/forgot", &body).await?;
+            api::post("/ui/api/password/forgot", &body).await?;
             sent.set(true);
             Ok(())
         });
@@ -70,7 +70,7 @@ pub fn ConfirmAddress(token: String, info: Value) -> impl IntoView {
     let confirm = move |_| {
         let body = json!({ "token": token.clone() });
         run(error, busy, async move {
-            let v = api::post::<Value>("/ui/api/email/verify", &body).await?;
+            let v = api::post("/ui/api/email/verify", &body).await?;
             if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
                 let _ = h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/invite"));
             }
@@ -102,6 +102,7 @@ pub fn AddressCard() -> impl IntoView {
     let c = ctx();
     let email = move || c.session.get().and_then(|s| s.user).and_then(|u| u.email);
     let pending = move || c.session.get().and_then(|s| s.email_pending);
+    let code_error = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let notice = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -119,8 +120,9 @@ pub fn AddressCard() -> impl IntoView {
         busy.set(true);
         error.set(None);
         notice.set(None);
+        code_error.set(None);
         leptos::task::spawn_local(async move {
-            match api::post::<Value>("/ui/api/account/email", &body).await {
+            match api::post("/ui/api/account/email", &body).await {
                 Ok(v) => {
                     password.set(String::new());
                     new_email.set(String::new());
@@ -137,6 +139,7 @@ pub fn AddressCard() -> impl IntoView {
                     needs_code.set(true);
                     error.set(Some(e.message));
                 }
+                Err(e) if field_refused(&e, "invalid_code", code_error, "email-code") => {}
                 Err(e) => error.set(Some(e.message)),
             }
             busy.set(false);
@@ -146,7 +149,7 @@ pub fn AddressCard() -> impl IntoView {
         ev.prevent_default();
         let body = json!({ "password": remove_pw.get() });
         run(error, busy, async move {
-            api::post::<Value>("/ui/api/account/email/remove", &body).await?;
+            api::post("/ui/api/account/email/remove", &body).await?;
             remove_pw.set(String::new());
             notice.set(Some("The address was removed; a notice went to it.".into()));
             refresh_session().await;
@@ -177,11 +180,7 @@ pub fn AddressCard() -> impl IntoView {
                         prop:value=move || password.get() on:input=move |ev| password.set(value(&ev)) />
                 </div>
                 <Show when=move || needs_code.get()>
-                    <div class="field">
-                        <label for="email-code">"Code from your authenticator app (or a recovery code)"</label>
-                        <input id="email-code" class="input code-input" autocomplete="one-time-code" inputmode="text" required
-                            prop:value=move || code.get() on:input=move |ev| code.set(value(&ev)) />
-                    </div>
+                    <CodeField id="email-code" label="Code from your authenticator app (or a recovery code)" value=code error=code_error />
                 </Show>
                 <div class="field"><button class="btn" type="submit" disabled=move || busy.get()>"Send confirmation link"</button></div>
             </form>

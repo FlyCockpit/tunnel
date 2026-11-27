@@ -79,7 +79,7 @@ enum Cmd {
         #[arg(long)]
         no_browser: bool,
     },
-    /// Forget this machine's login.
+    /// Revoke this machine's server login and remove the local login (also when offline).
     Logout,
     /// Share local ports from a logged-in machine. Default access: a one-time link per port.
     #[command(after_long_help = SHARE_NOTES)]
@@ -264,7 +264,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<i32> {
         Cmd::Ice { format, fresh, exec: _, command } => commands::ice(format, fresh, command).await,
         Cmd::Stop => commands::stop().await,
         Cmd::Login { code, name, no_browser } => share::login(code.as_deref(), name.as_deref(), !no_browser).await,
-        Cmd::Logout => share::logout(),
+        Cmd::Logout => share::logout().await,
         Cmd::Share { ports, public, password, link, username, ttl, for_s, label, name, target, json } => {
             let access = share::ShareAccess { public, password, link, username };
             let foreground = for_s.map(|duration_s| share::Foreground { duration_s });

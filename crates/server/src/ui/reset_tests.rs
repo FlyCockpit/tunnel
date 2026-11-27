@@ -286,26 +286,21 @@ async fn making_a_reset_link_needs_a_fresh_code_and_can_be_revoked() {
 }
 
 #[tokio::test]
-async fn a_reset_can_also_remove_the_accounts_machines() {
+async fn an_account_reset_revokes_machines_and_closes_their_tunnels() {
     let state = state();
     let mut p = people(&state).await;
     let ann_id = p.ids["ann"].clone();
     let machine = approve_machine(&state, &mut p.ann, "laptop").await;
-    let keep = token_of(&reset(&state, &mut p.adam, &ann_id, json!({})).await);
-    assert_eq!(redeem(&state, &keep, "ann-new-password", 62).await.1.status, StatusCode::OK);
-    assert_eq!(bearer(&state, "GET", "/v1/tunnels", &machine, None).await.status, StatusCode::OK, "kept");
-    let drop = token_of(&reset(&state, &mut p.adam, &ann_id, json!({})).await);
-    let r = Browser::new(63)
-        .call(
-            &state,
-            "POST",
-            "/ui/api/invite/accept",
-            Some(json!({ "token": drop, "password": "ann-newer-password", "revoke_machines": true })),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let tunnel = create_tunnel(&state, &machine, json!({ "mode": "link" })).await;
+    let id = tunnel.body["id"].as_str().unwrap();
+    let _live = connect(&state, id, &[3000]);
+    let ended = state.registry.get(id).unwrap().cancel.clone();
+    let token = token_of(&reset(&state, &mut p.adam, &ann_id, json!({})).await);
+    assert_eq!(redeem(&state, &token, "ann-new-password", 62).await.1.status, StatusCode::OK);
     assert_eq!(bearer(&state, "GET", "/v1/tunnels", &machine, None).await.status, StatusCode::UNAUTHORIZED);
-    let _ = (&mut p.amy, &mut p.bob, &mut p.owner);
+    assert!(state.registry.get(id).is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), ended.cancelled()).await.unwrap();
+    assert!(matches!(state.db.lookup_tunnel(id.into()).await.unwrap(), crate::db::TunnelLookup::Tombstoned));
 }
 
 #[tokio::test]

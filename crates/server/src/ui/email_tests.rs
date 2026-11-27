@@ -75,7 +75,7 @@ async fn a_wrong_password_names_the_way_back_in() {
             (StatusCode::UNAUTHORIZED, json!("invalid_credentials"))
         );
         let message = r.body["error"]["message"].as_str().unwrap();
-        assert!(message.starts_with("wrong username or password. Forgot your password?"), "{message}");
+        assert!(message.starts_with("Wrong username or password. Forgot your password?"), "{message}");
         assert_eq!(message.contains("Forgot password? below"), mailed, "{message}");
         assert_eq!(message.contains("Only if you are the owner: run tunnel-server admin link"), !mailed, "{message}");
         assert!(message.contains("sk an admin of this server to reset your sign-in"), "{message}");
@@ -194,6 +194,12 @@ async fn forgot_password_answers_the_same_for_everyone_and_mails_only_confirmed_
     settle(&state).await;
     assert_eq!(server.to("ann@example.com").len(), 2, "the invite and one reset");
 
+    let mut ann = ann;
+    let machine = approve_machine(&state, &mut ann, "laptop").await;
+    let tunnel = create_tunnel(&state, &machine, json!({ "mode": "link" })).await;
+    let id = tunnel.body["id"].as_str().unwrap();
+    let _live = connect(&state, id, &[3000]);
+    let ended = state.registry.get(id).unwrap().cancel.clone();
     // The link sets a new password, ends sessions, and is single use.
     let token = mail.token().unwrap();
     let info = Browser::new(61).call(&state, "POST", "/ui/api/invite/info", Some(json!({ "token": token }))).await;
@@ -203,7 +209,10 @@ async fn forgot_password_answers_the_same_for_everyone_and_mails_only_confirmed_
         .call(&state, "POST", "/ui/api/invite/accept", Some(json!({ "token": token, "password": "ann-new-password" })))
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    let mut ann = ann;
+    assert_eq!(bearer(&state, "GET", "/v1/tunnels", &machine, None).await.status, StatusCode::UNAUTHORIZED);
+    assert!(state.registry.get(id).is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), ended.cancelled()).await.unwrap();
+    assert!(matches!(state.db.lookup_tunnel(id.into()).await.unwrap(), crate::db::TunnelLookup::Tombstoned));
     assert!(ann.call(&state, "GET", "/ui/api/session", None).await.body["user"].is_null(), "old sessions end");
     assert_eq!(sign_in(&state, "ann", "ann-password", 63).await.status, StatusCode::UNAUTHORIZED);
     assert_eq!(sign_in(&state, "ann", "ann-new-password", 64).await.body["status"], "ok");
@@ -253,6 +262,8 @@ async fn a_mailed_reset_keeps_two_factor_and_asks_for_a_code() {
     let r = Browser::new(44).call(&state, "POST", "/ui/api/invite/accept", Some(accept(Some(codes.next())))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 
+    assert_eq!(r.body["recovery_code"], false);
+    assert_eq!(r.body["recovery_codes_left"], 10);
     // Two-factor sign-in and the recovery codes stay.
     assert_eq!(sign_in(&state, "ann", "ann-new-password", 45).await.body["status"], "totp_required");
     assert_eq!(state.db.recovery_codes_left(ann_id).await.unwrap(), 10);
@@ -412,8 +423,12 @@ async fn security_notices_and_the_admin_reset_go_by_mail() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     settle(&state).await;
     let texts: Vec<String> = server.to("ann@example.com")[n0..].iter().map(Received::text).collect();
-    for want in ["Two-factor sign-in was turned on", "new machine, laptop", "new machine, desk", "from member to admin"]
-    {
+    for want in [
+        "Two-factor sign-in was turned on",
+        "new machine, laptop",
+        "new machine, desk",
+        "Admin olivia changed your account's role to admin",
+    ] {
         assert!(texts.iter().any(|t| t.contains(want)), "{want:?} not in {texts:#?}");
     }
     for t in &texts {
@@ -702,6 +717,8 @@ async fn a_busy_server_does_not_use_up_a_recovery_code() {
     assert_eq!(state.db.recovery_codes_left(ann_id.clone()).await.unwrap(), 11, "the code is still there");
     let r = Browser::new(42).call(&state, "POST", "/ui/api/invite/accept", Some(body)).await;
     assert_eq!(r.status, StatusCode::OK, "it works once the server has room: {}", r.body);
+    assert_eq!(r.body["recovery_code"], true);
+    assert_eq!(r.body["recovery_codes_left"], 10);
     assert_eq!(state.db.recovery_codes_left(ann_id).await.unwrap(), 10);
 }
 
@@ -731,7 +748,7 @@ fn assert_cooldown(r: &Resp) {
     assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::TOO_MANY_REQUESTS, json!("mail_cooldown")));
     let message = r.body["error"]["message"].as_str().unwrap();
     let wait = message
-        .strip_prefix("a reset mail was sent to this account recently; try again in ")
+        .strip_prefix("A reset mail was sent to this account recently; try again in ")
         .and_then(|m| m.split_once(" s")?.0.parse::<i64>().ok())
         .unwrap_or_else(|| panic!("says how long to wait: {message}"));
     assert!((1..=crate::addresses::RECOVERY_MAIL_COOLDOWN_S).contains(&wait), "{message}");

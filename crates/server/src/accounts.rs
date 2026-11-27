@@ -93,6 +93,15 @@ pub struct AdminUpdate {
     pub limits: Vec<LimitChange>,
     /// Tunnels whose expiry moved earlier to fit a lower lifetime limit.
     pub shortened: Vec<String>,
+    /// Public tunnels switched to link-only after public permission was removed.
+    pub restricted: Vec<String>,
+}
+
+/// The checked pending factor and the raw hashes to seal when it is enabled.
+pub struct TotpSetup {
+    pub sealed: String,
+    pub step: i64,
+    pub recovery_hashes: Vec<String>,
 }
 
 /// A signed-in (or half signed-in) UI session.
@@ -178,12 +187,9 @@ pub struct Invite {
 /// What redeeming an invite needs: a new account, or a reset.
 pub enum Acceptance {
     NewUser(NewUser),
-    /// Owner or account reset: new password; TOTP, recovery codes, sessions
-    /// and pending machine logins are cleared, and with `revoke_machines` the
-    /// account's machines too.
+    /// Every reset revokes machines and sessions; owner/account resets also clear TOTP.
     Reset {
         password_hash: String,
-        revoke_machines: bool,
     },
 }
 
@@ -409,9 +415,11 @@ impl Db {
     /// owner or an admin, the target must not be the owner or the actor, an
     /// admin may change members only, and only the owner changes roles.
     /// A role change ends the user's sessions and resets the four limits to
-    /// the server default; becoming a member also resets public previews and
-    /// drops the unused invites they made. A lower lifetime limit (a changed
-    /// lifetime or role) moves the expiry of the user's tunnels that would
+    /// the server default; becoming a member clears per-user public permission
+    /// and drops the unused invites they made. Public tunnels become link-only
+    /// only when public permission, including the server-wide setting, is lost.
+    /// A lower lifetime limit (a changed lifetime or role) moves the expiry of
+    /// the user's tunnels that would
     /// outlive it to that long from now. Disabling ends sessions and logins
     /// and deletes machines; the tunnels in `closed` must be closed by the
     /// caller.
@@ -422,6 +430,7 @@ impl Db {
         id: String,
         patch: UserPatch,
         disabled: Option<bool>,
+        allow_all_public: bool,
     ) -> anyhow::Result<Result<(User, AdminUpdate), AdminError>> {
         let defaults = self.limit_defaults();
         self.call(move |c| {
@@ -530,6 +539,16 @@ impl Db {
                 params![id],
                 user_from_row,
             )?;
+            if before.role.may_public(before.can_public, allow_all_public)
+                && !user.role.may_public(user.can_public, allow_all_public)
+            {
+                let mut stmt = tx.prepare(
+                    "UPDATE tunnels SET access_mode = 'link'
+                     WHERE access_mode = 'public' AND client_id IN (SELECT id FROM clients WHERE user_id = ?1)
+                     RETURNING id",
+                )?;
+                update.restricted = stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            }
             tx.commit()?;
             update.closed = tunnels;
             Ok(Ok((user, update)))
@@ -617,11 +636,10 @@ impl Db {
     pub async fn enable_totp(
         &self,
         user_id: String,
-        sealed: String,
-        step: i64,
-        recovery_hashes: Vec<String>,
+        setup: TotpSetup,
         epoch: i64,
         keep: String,
+        pepper: Pepper,
     ) -> anyhow::Result<bool> {
         self.call(move |c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -632,16 +650,22 @@ impl Db {
                 "UPDATE users SET totp_secret_sealed = totp_pending_sealed, totp_pending_sealed = NULL, totp_last_step = ?3,
                         auth_epoch = auth_epoch + 1, factor_failures = 0, factor_locked_until = NULL
                  WHERE id = ?1 AND totp_pending_sealed = ?2",
-                params![user_id, sealed, step],
+                params![user_id, setup.sealed, setup.step],
             )?;
             if n != 1 {
                 return Ok(false);
             }
             tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1 AND id_hash != ?2", params![user_id, keep])?;
-            tx.execute("UPDATE ui_sessions SET auth_at = ?2 WHERE id_hash = ?1", params![keep, now()])?;
+            tx.execute(
+                "UPDATE ui_sessions SET auth_at = ?2, auth_epoch = ?3 WHERE id_hash = ?1",
+                params![keep, now(), epoch + 1],
+            )?;
             tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user_id])?;
-            for h in recovery_hashes {
-                tx.execute("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?1, ?2)", params![user_id, h])?;
+            for h in setup.recovery_hashes {
+                tx.execute(
+                    "INSERT INTO recovery_codes (user_id, code_hash) VALUES (?1, ?2)",
+                    params![user_id, pepper.wrap(&h, Purpose::Recovery, &user_id)],
+                )?;
             }
             tx.commit()?;
             Ok(true)
@@ -663,6 +687,10 @@ impl Db {
                 params![user_id],
             )?;
             tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1 AND id_hash != ?2", params![user_id, keep])?;
+            tx.execute(
+                "UPDATE ui_sessions SET auth_at = ?2, auth_epoch = ?3 WHERE id_hash = ?1",
+                params![keep, now(), epoch + 1],
+            )?;
             tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user_id])?;
             tx.commit()?;
             Ok(true)
@@ -1231,15 +1259,15 @@ impl Db {
                 .optional()?;
             let mut tunnels = Vec::new();
             let user_id = match (kind, acceptance) {
-                (InviteKind::OwnerReset, Acceptance::Reset { password_hash, revoke_machines }) => {
+                (InviteKind::OwnerReset, Acceptance::Reset { password_hash }) => {
                     let Some((owner, _)) = owner else {
                         return Ok(Err(AcceptError::OwnerState));
                     };
                     tx.execute("UPDATE users SET disabled_at = NULL WHERE id = ?1", params![owner])?;
-                    reset_sign_in(&tx, &owner, &pepper.wrap(&password_hash, Purpose::User, &owner), revoke_machines, &mut tunnels)?;
+                    reset_sign_in(&tx, &owner, &pepper.wrap(&password_hash, Purpose::User, &owner), &mut tunnels)?;
                     owner
                 }
-                (InviteKind::AccountReset, Acceptance::Reset { password_hash, revoke_machines }) => {
+                (InviteKind::AccountReset, Acceptance::Reset { password_hash }) => {
                     let Some(target) = reset.target else {
                         return Ok(Err(AcceptError::Invalid));
                     };
@@ -1250,10 +1278,10 @@ impl Db {
                     if !addresses::still_at_address(&tx, &target, reset.email.as_deref())? {
                         return Ok(Err(AcceptError::Invalid));
                     }
-                    reset_sign_in(&tx, &target, &pepper.wrap(&password_hash, Purpose::User, &target), revoke_machines, &mut tunnels)?;
+                    reset_sign_in(&tx, &target, &pepper.wrap(&password_hash, Purpose::User, &target), &mut tunnels)?;
                     target
                 }
-                (InviteKind::PasswordReset, Acceptance::Reset { password_hash, revoke_machines }) => {
+                (InviteKind::PasswordReset, Acceptance::Reset { password_hash }) => {
                     let found = addresses::redeem_password_reset(
                         &tx,
                         reset.target,
@@ -1261,7 +1289,6 @@ impl Db {
                         reset.email,
                         &password_hash,
                         &pepper,
-                        revoke_machines,
                         &mut tunnels,
                     )?;
                     match found {
@@ -1802,13 +1829,12 @@ fn reset_still_allowed(
 
 /// A new password for `user_id`; its second factor, recovery codes, factor
 /// lockout, sessions and pending machine logins go, and its auth epoch moves
-/// on (voiding anything issued for the old sign-in). With `revoke_machines`
-/// its machines go too; their tunnels are added to `tunnels`.
+/// on (voiding anything issued for the old sign-in). All machines are revoked
+/// and their tunnels are added to `tunnels`.
 fn reset_sign_in(
     tx: &rusqlite::Transaction<'_>,
     user_id: &str,
     password_hash: &str,
-    revoke_machines: bool,
     tunnels: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     tx.execute(
@@ -1821,9 +1847,7 @@ fn reset_sign_in(
     tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![user_id])?;
     // Logins approved before the reset (maybe by whoever forced it) are not honoured.
     tx.execute("DELETE FROM device_logins WHERE user_id = ?1", params![user_id])?;
-    if revoke_machines {
-        crate::db::revoke_machines(tx, user_id, tunnels)?;
-    }
+    crate::db::revoke_machines(tx, user_id, tunnels)?;
     Ok(())
 }
 

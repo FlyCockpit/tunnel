@@ -316,7 +316,6 @@ impl Db {
 /// Redeem a "Forgot password?" link for `target`: only for the sign-in
 /// (`epoch`) and the address (`email`) it was mailed for, and an enabled
 /// account. Returns the account, `None` if the link no longer applies.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn redeem_password_reset(
     tx: &rusqlite::Transaction<'_>,
     target: Option<String>,
@@ -324,7 +323,6 @@ pub(crate) fn redeem_password_reset(
     email: Option<String>,
     password_hash: &str,
     pepper: &crate::pepper::Pepper,
-    revoke_machines: bool,
     tunnels: &mut Vec<String>,
 ) -> anyhow::Result<Option<String>> {
     let (Some(target), Some(email)) = (target, email) else {
@@ -338,13 +336,7 @@ pub(crate) fn redeem_password_reset(
     if !current {
         return Ok(None);
     }
-    new_password(
-        tx,
-        &target,
-        &pepper.wrap(password_hash, crate::pepper::Purpose::User, &target),
-        revoke_machines,
-        tunnels,
-    )?;
+    new_password(tx, &target, &pepper.wrap(password_hash, crate::pepper::Purpose::User, &target), tunnels)?;
     Ok(Some(target))
 }
 
@@ -379,13 +371,11 @@ pub(crate) fn still_at_address(c: &rusqlite::Connection, target: &str, email: Op
 
 /// A new password for `user_id` that keeps its second factor and recovery
 /// codes (a mailed reset: the address is not a second factor). Sessions and
-/// pending machine logins end and the auth epoch moves on; with
-/// `revoke_machines` its machines go too.
+/// all machine logins end and the auth epoch moves on. Machine tunnels end too.
 fn new_password(
     tx: &rusqlite::Transaction<'_>,
     user_id: &str,
     password_hash: &str,
-    revoke_machines: bool,
     tunnels: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     tx.execute(
@@ -394,9 +384,7 @@ fn new_password(
     )?;
     tx.execute("DELETE FROM ui_sessions WHERE user_id = ?1", params![user_id])?;
     tx.execute("DELETE FROM device_logins WHERE user_id = ?1", params![user_id])?;
-    if revoke_machines {
-        crate::db::revoke_machines(tx, user_id, tunnels)?;
-    }
+    crate::db::revoke_machines(tx, user_id, tunnels)?;
     Ok(())
 }
 

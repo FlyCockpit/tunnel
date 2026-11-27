@@ -48,16 +48,8 @@ pub fn link(state: &AppState, token: &str) -> String {
 
 /// Mail `notice` to the account's confirmed address, if it has one.
 pub async fn notify(state: &AppState, user_id: &str, notice: Notice, ctx: &Ctx) {
-    notify_user(state, user_id, notice, ctx.ip_string().as_deref()).await;
-}
-
-/// As `notify`, for requests outside the web UI (the admin API); `ip` is shown when known.
-pub async fn notify_user(state: &AppState, user_id: &str, notice: Notice, ip: Option<&str>) {
-    let Some(mailer) = state.ui.mail.as_ref() else { return };
-    match state.db.contact(user_id.to_string()).await {
-        Ok(Some((username, email))) => notify_address(mailer, &username, email, &notice, ip),
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %format!("{e:#}"), "looking up an address for a notice failed"),
+    if let Some(mailer) = state.ui.mail.as_ref() {
+        mailer.notify_user(&state.db, user_id, &notice, ctx.ip_string().as_deref()).await;
     }
 }
 
@@ -91,7 +83,7 @@ pub async fn forgot_password(
     }
     let login = req.login.trim().to_ascii_lowercase();
     if login.is_empty() || login.len() > 254 {
-        return Err(ApiError::validation("enter your username or email address"));
+        return Err(ApiError::validation("Enter your username or email address"));
     }
     let (worker, ip) = (state.clone(), peer.map(|ip| ip.to_string()));
     mailer.clone().run_later(async move {
@@ -189,7 +181,7 @@ pub async fn set_email(
         Ok(EmailChange::Taken) => {}
         Err(EmailError::SignedOut) => return Err(changed_meanwhile()),
         Err(EmailError::Unchanged) => {
-            return Err(ApiError::new(StatusCode::CONFLICT, "unchanged", "this is already your address"));
+            return Err(ApiError::new(StatusCode::CONFLICT, "unchanged", "This is already your address"));
         }
     }
     audit(&state, Some(&user_id), "email_change_requested", None, &s.ctx).await;
@@ -247,7 +239,7 @@ pub async fn verify_email(
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "email_taken",
-                "another account uses this address now; add a different one",
+                "Another account uses this address now; add a different one",
             ));
         }
         Err(_) => return Err(invalid_invite()),

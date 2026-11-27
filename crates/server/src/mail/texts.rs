@@ -17,8 +17,8 @@ pub enum Notice {
     MachineAdded(String),
     MachineApproved(String),
     RoleChanged {
-        from: String,
         to: String,
+        by: String,
     },
     /// Sent to the old address.
     AddressChanged {
@@ -33,19 +33,26 @@ impl Notice {
             Self::PasswordChanged => "The password of your account was changed.".into(),
             Self::PasswordReset => {
                 "The password of your account was reset with a link sent to this address. Two-factor sign-in, if \
-                 it was on, is still on."
+                 it was on, is still on. All machine logins were revoked and their tunnels ended."
                     .into()
             }
             Self::SignInReset => {
                 "Your account's sign-in was reset with a link from an admin: it has a new password and two-factor \
-                 sign-in is off."
+                 sign-in is off. All machine logins were revoked and their tunnels ended."
                     .into()
             }
             Self::TotpEnabled => "Two-factor sign-in was turned on for your account.".into(),
             Self::TotpDisabled => "Two-factor sign-in was turned off for your account.".into(),
             Self::MachineAdded(name) => format!("A login code for a new machine, {name}, was made for your account."),
             Self::MachineApproved(name) => format!("A new machine, {name}, was approved to use your account."),
-            Self::RoleChanged { from, to } => format!("Your account's role changed from {from} to {to}."),
+            Self::RoleChanged { to, by } => {
+                let access = if to == "admin" {
+                    "You can now invite members, manage members and see every tunnel."
+                } else {
+                    "You can manage your own machines, tunnels and links within your account's limits."
+                };
+                format!("Admin {by} changed your account's role to {to}. {access}")
+            }
             Self::AddressChanged { new } => {
                 format!("Your account's email address was changed from this address to {}.", mask(new))
             }
@@ -138,7 +145,7 @@ impl<'a> Texts<'a> {
             "Reset your Tunnel password".into(),
             format!(
                 "Someone (hopefully you) asked to reset the password of the account {username} at https://{ui}/.\n\n\
-                 Choose a new password here (the link works once, for {ttl}):\n\n  {url}{factor}\n\nIf this was \
+                 Choose a new password here (the link works once, for {ttl}):\n\n  {url}{factor}\n\nUsing this link ends all sessions and revokes all machine logins and their tunnels.\n\nIf this was \
                  not you, ignore this mail: your password stays as it is.",
                 ui = self.ui,
                 ttl = minutes(ttl_s),
@@ -165,7 +172,7 @@ impl<'a> Texts<'a> {
             "Reset your Tunnel sign-in".into(),
             format!(
                 "{by} made a link that resets the sign-in of your account {username} at https://{ui}/: it sets a \
-                 new password, turns two-factor sign-in off and ends your sessions. It works once, for {ttl}:\n\n  \
+                 new password, turns two-factor sign-in off, ends your sessions and revokes all machine logins and their tunnels. It works once, for {ttl}:\n\n  \
                  {url}\n\nIf you did not ask for this, ignore this mail and tell {by}.",
                 ui = self.ui,
                 ttl = minutes(ttl_s),
@@ -177,11 +184,15 @@ impl<'a> Texts<'a> {
     /// A security notice; `ip` is the address the change came from, if known.
     pub fn notice(&self, n: &Notice, username: &str, at: i64, ip: Option<&str>) -> Mail {
         let from = ip.map(|ip| format!(" from {ip}")).unwrap_or_default();
+        let next = if matches!(n, Notice::RoleChanged { .. }) {
+            "Ask an admin of this server if you have questions about your role."
+        } else {
+            "If this was not you, sign in and change your password, or ask an admin of this server for help."
+        };
         self.mail(
             n.subject().into(),
             format!(
-                "Account {username} at https://{ui}/:\n\n{what}\n\nWhen: {when}{from}\n\nIf this was not you, sign \
-                 in and change your password, or ask an admin of this server for help.",
+                "Account {username} at https://{ui}/:\n\n{what}\n\nWhen: {when}{from}\n\n{next}",
                 ui = self.ui,
                 what = n.what(),
                 when = when(at),
@@ -215,6 +226,21 @@ mod tests {
     }
 
     #[test]
+    fn role_notice_attributes_the_admin_and_explains_permissions() {
+        for (role, access) in [("admin", "invite members"), ("member", "your own machines")] {
+            let mail = Texts::new("ui.example.com").notice(
+                &Notice::RoleChanged { to: role.into(), by: "olivia".into() },
+                "ann",
+                0,
+                None,
+            );
+            assert!(mail.body.contains(&format!("Admin olivia changed your account's role to {role}")));
+            assert!(mail.body.contains(access));
+            assert!(!mail.body.contains("If this was not you"));
+        }
+    }
+
+    #[test]
     fn every_notice_names_the_account_and_the_server() {
         let t = Texts::new("ui.example.com");
         for n in [
@@ -225,7 +251,7 @@ mod tests {
             Notice::TotpDisabled,
             Notice::MachineAdded("laptop".into()),
             Notice::MachineApproved("laptop".into()),
-            Notice::RoleChanged { from: "member".into(), to: "admin".into() },
+            Notice::RoleChanged { to: "admin".into(), by: "olivia".into() },
             Notice::AddressChanged { new: "new@example.com".into() },
             Notice::AddressRemoved,
         ] {

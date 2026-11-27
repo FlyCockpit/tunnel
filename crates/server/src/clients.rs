@@ -45,19 +45,19 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if ok { Ok(()) } else { Err(format!("name must be 1..={MAX_NAME_LEN} characters: letters, digits, '.', '_', '-'")) }
+    if ok { Ok(()) } else { Err(format!("Name must be 1..={MAX_NAME_LEN} characters: letters, digits, '.', '_', '-'")) }
 }
 
 /// A name for a new or renamed machine or service: `validate_name`, and
 /// usable in `/v1/clients/{name}`-style URLs: not only dots (`.`/`..` are path
-/// segments) and not `enroll` (`/v1/clients/enroll` is the enrollment route).
+/// segments), or `enroll` (enrollment).
 pub fn validate_new_name(name: &str) -> Result<(), String> {
     validate_name(name)?;
     if name.bytes().all(|b| b == b'.') {
-        return Err("name must not be only dots".into());
+        return Err("Name must not be only dots".into());
     }
     if name.eq_ignore_ascii_case("enroll") {
-        return Err("`enroll` is reserved; pick another name".into());
+        return Err("The name `enroll` is reserved; pick another name".into());
     }
     Ok(())
 }
@@ -106,7 +106,9 @@ mod tests {
             assert!(super::validate_name(name).is_ok(), "{name}");
             assert!(super::validate_new_name(name).is_err(), "{name}");
         }
-        assert!(super::validate_new_name("enroll-2").is_ok());
+        for name in ["enroll-2", "self", "SELF"] {
+            assert!(super::validate_new_name(name).is_ok(), "{name}");
+        }
         for bad in ["", "has space", "slash/x", "ünï", &"x".repeat(65)] {
             assert!(super::validate_name(bad).is_err(), "{bad}");
         }

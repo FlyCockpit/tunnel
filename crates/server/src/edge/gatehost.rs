@@ -145,13 +145,19 @@ fn login_form(
     port: u16,
     id: &str,
     next: &str,
-    error: Option<&str>,
+    retry: Option<(&str, &str)>,
 ) -> Response<Body> {
+    let (error, username) = retry.map_or((None, ""), |(message, username)| (Some(message), username));
     let to = format!("{port}-{id}");
     let origin = preview_origin(state, port, id);
     // An empty list restricts the zone-host gate page to its own origin too.
     let frame_sources = headers::frame_sources(&state.config.frame_ancestors);
-    pages::login(status, &LoginTarget { to: &to, next, preview_origin: &origin, frame_sources: &frame_sources }, error)
+    pages::login(
+        status,
+        &LoginTarget { to: &to, next, preview_origin: &origin, frame_sources: &frame_sources },
+        error,
+        username,
+    )
 }
 
 async fn login(state: &Arc<AppState>, peer: SocketAddr, req: Request<Incoming>) -> Response<Body> {
@@ -190,6 +196,7 @@ async fn login(state: &Arc<AppState>, peer: SocketAddr, req: Request<Incoming>) 
                 return pages::not_found();
             };
             let next = form.next.clone();
+            let username = form.username.clone();
             match gate::login(state, peer.ip(), &tunnel, form, &cookies.values).await {
                 LoginOutcome::Granted(cookie) => {
                     let mut resp = pages::redirect(&format!("{}{next}", preview_origin(state, port, &id)));
@@ -199,7 +206,7 @@ async fn login(state: &Arc<AppState>, peer: SocketAddr, req: Request<Incoming>) 
                     }
                     resp
                 }
-                LoginOutcome::Retry(status, msg) => login_form(state, status, port, &id, &next, Some(msg)),
+                LoginOutcome::Retry(status, msg) => login_form(state, status, port, &id, &next, Some((msg, &username))),
                 LoginOutcome::RateLimited => pages::rate_limited(),
                 LoginOutcome::NotPassword => pages::not_found(),
                 LoginOutcome::Internal => text_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error"),
@@ -242,6 +249,48 @@ mod tests {
         assert!(handles("/__access/3000-abcdefghij/tnacc_x"));
         assert!(!handles("/__loginx"));
         assert!(!handles("/v1/tunnels"));
+    }
+
+    #[tokio::test]
+    async fn wrong_password_post_keeps_username_but_never_password() {
+        use http_body_util::BodyExt;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let state = crate::listener::tests::test_state(&[]);
+        crate::listener::tests::create_tunnel(&state, AccessMode::Password).await;
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        tokio::spawn(async move {
+            let service = service_fn(move |request| {
+                let state = state.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(handle(state, "127.0.0.1:1234".parse().unwrap(), request).await)
+                }
+            });
+            hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), service).await.unwrap();
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client)).await.unwrap();
+        tokio::spawn(connection);
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("to", "3000-abcdefghij")
+            .append_pair("next", "/app")
+            .append_pair("username", "<\"&")
+            .append_pair("password", "never-echo-this-password")
+            .finish();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/__login")
+            .header(header::HOST, "previews.example.com")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(crate::util::full(form))
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("name=\"username\" value=\"&lt;&quot;&amp;\""), "{html}");
+        assert!(!html.contains("never-echo-this-password"));
+        assert!(html.contains("Wrong username or password"));
     }
 
     #[test]

@@ -258,7 +258,7 @@ impl FocusAt {
     }
 
     /// The focus now, relative to the form with `form` as its id.
-    fn now(form: &str) -> Self {
+    pub fn now(form: &str) -> Self {
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return FocusAt::Nowhere };
         match doc.active_element() {
             None => FocusAt::Nowhere,
@@ -322,7 +322,12 @@ where
         let name = name.get_value();
         let form = form_id(&user.get_value());
         run(error, saving, async move {
-            let v = api::patch::<Value>(&path, &body).await?;
+            let v = api::patch(&path, &body).await?;
+            // The editor may be cancelled, but its page owns `saving` and
+            // still needs the result. Navigation disposes that page too.
+            if saving.is_disposed() {
+                return Ok(());
+            }
             // As a list row (the same decoding the list uses, so no extra code).
             let user = serde_json::from_value::<UserRow>(v["user"].clone()).ok().map(|r| r.user);
             saved(name, user, FocusAt::now(&form));

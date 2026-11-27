@@ -196,7 +196,7 @@ pub async fn device_token(
             "client_refused",
             match e {
                 NewClientError::Quota { limit, role } => {
-                    format!("approved, but {}", crate::limits::machine_limit_message(limit, role))
+                    format!("Approved. {}", crate::limits::machine_limit_message(limit, role))
                 }
                 NewClientError::NoUser => "approved, but the approving account was disabled".to_string(),
                 NewClientError::NameTaken => "approved, but no free machine name was left".to_string(),

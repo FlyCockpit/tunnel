@@ -39,8 +39,11 @@ pub fn path() -> anyhow::Result<PathBuf> {
 
 impl Login {
     pub fn load() -> anyhow::Result<Option<Self>> {
-        let p = path()?;
-        match std::fs::read(&p) {
+        Self::load_at(&path()?)
+    }
+
+    pub(crate) fn load_at(p: &std::path::Path) -> anyhow::Result<Option<Self>> {
+        match std::fs::read(p) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", p.display()))?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
@@ -273,6 +276,31 @@ fn open_url(url: &str) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogoutOutcome {
+    Revoked,
+    AlreadyInvalid,
+    Unconfirmed,
+}
+
+pub fn logout_message(outcome: LogoutOutcome, ui: Option<&str>) -> String {
+    let next = ui
+        .map(|u| format!("Machines in the web UI ({})", terminal_text(u)))
+        .unwrap_or_else(|| "Machines in the web UI".into());
+    match outcome {
+        LogoutOutcome::Revoked => {
+            "Logged out. The local login was removed and the machine's server login was revoked; its tunnels ended."
+                .into()
+        }
+        LogoutOutcome::AlreadyInvalid => {
+            "Logged out. The local login was removed; the server says the machine's login was already invalid.".into()
+        }
+        LogoutOutcome::Unconfirmed => format!(
+            "The local login was removed. The server did not confirm the revocation; the machine's login may still be valid: remove it under {next}."
+        ),
+    }
+}
+
 /// Management API calls made with this machine's client token.
 pub struct Api<'a> {
     login: &'a Login,
@@ -333,6 +361,25 @@ impl<'a> Api<'a> {
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http.request(method, format!("{}{path}", self.login.api)).bearer_auth(&self.login.token)
+    }
+
+    /// Bound the whole logout exchange, including discovering the Machines page.
+    pub async fn revoke_login(&self) -> (LogoutOutcome, Option<String>) {
+        let ui = match tokio::time::timeout(Duration::from_secs(2), async {
+            self.req(reqwest::Method::GET, "/v1/server").send().await?.json::<Value>().await
+        })
+        .await
+        {
+            Ok(Ok(body)) => body["ui_origin"].as_str().map(str::to_string),
+            _ => None,
+        };
+        let outcome = match self.req(reqwest::Method::DELETE, "/v1/login").timeout(Duration::from_secs(8)).send().await
+        {
+            Ok(r) if r.status() == reqwest::StatusCode::NO_CONTENT => LogoutOutcome::Revoked,
+            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => LogoutOutcome::AlreadyInvalid,
+            _ => LogoutOutcome::Unconfirmed,
+        };
+        (outcome, ui)
     }
 
     pub async fn create_tunnel(
@@ -564,5 +611,109 @@ mod tests {
         assert_eq!(parse_duration("2d").unwrap(), 172_800);
         assert!(parse_duration("0").is_err());
         assert!(parse_duration("abc").is_err());
+    }
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn logout_revokes_login_with_its_token_and_handles_server_answers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (status, expected) in [
+            (Some(204), LogoutOutcome::Revoked),
+            (Some(401), LogoutOutcome::AlreadyInvalid),
+            (Some(503), LogoutOutcome::Unconfirmed),
+            (Some(403), LogoutOutcome::Unconfirmed),
+            (Some(200), LogoutOutcome::Unconfirmed),
+            (Some(202), LogoutOutcome::Unconfirmed),
+            (Some(0), LogoutOutcome::Unconfirmed), // The server never answers before the timeout.
+            (None, LogoutOutcome::Unconfirmed),    // The response was lost after receiving DELETE.
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for path in ["GET /v1/server ", "DELETE /v1/login "] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        head.push(stream.read_u8().await.unwrap());
+                    }
+                    let head = String::from_utf8(head).unwrap();
+                    assert!(head.starts_with(path));
+                    assert!(head.to_ascii_lowercase().contains("authorization: bearer tncli_logout-test"));
+                    let (code, body) = if path.starts_with("GET") {
+                        (200, r#"{"ui_origin":"https://ui.example.com"}"#)
+                    } else if status == Some(0) {
+                        tokio::time::sleep(Duration::from_secs(9)).await;
+                        continue;
+                    } else if let Some(status) = status {
+                        (status, "")
+                    } else {
+                        // Closing without a reply cannot prove whether revocation happened.
+                        continue;
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let login =
+                Login { name: "old-name".into(), api, server: String::new(), token: "tncli_logout-test".into() };
+            let api = Api::new(&login).unwrap();
+            let (outcome, ui) = tokio::time::timeout(Duration::from_secs(10), api.revoke_login()).await.unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(ui.as_deref(), Some("https://ui.example.com"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_logout_returns_a_local_cleanup_outcome() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let login = Login {
+            name: "offline".into(),
+            api: "http://127.0.0.1:0".into(),
+            server: String::new(),
+            token: "tncli_logout-test".into(),
+        };
+        let api = Api::new(&login).unwrap();
+        let (outcome, ui) = tokio::time::timeout(Duration::from_secs(2), api.revoke_login()).await.unwrap();
+        assert_eq!(outcome, LogoutOutcome::Unconfirmed);
+        assert!(ui.is_none());
+    }
+
+    #[test]
+    fn logout_messages_explain_server_and_local_state() {
+        assert!(logout_message(LogoutOutcome::Revoked, None).contains("server login was revoked"));
+        assert!(logout_message(LogoutOutcome::AlreadyInvalid, None).contains("already invalid"));
+        let offline = logout_message(LogoutOutcome::Unconfirmed, Some("https://ui.example.com"));
+        assert_eq!(
+            offline,
+            "The local login was removed. The server did not confirm the revocation; the machine's login may still be valid: remove it under Machines in the web UI (https://ui.example.com)."
+        );
+        assert!(logout_message(LogoutOutcome::Unconfirmed, None).contains("remove it under Machines in the web UI"));
+    }
+
+    #[test]
+    fn logout_docs_describe_revocation_and_uncertainty() {
+        for doc in [
+            include_str!("../README.md"),
+            include_str!("../../../README.md"),
+            include_str!("../../../docs/agent/SKILL.md"),
+        ] {
+            let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+            for expected in
+                ["DELETE /v1/login", "local login", "did not confirm", "may still be valid", "Machines in the web UI"]
+            {
+                assert!(doc.contains(expected), "logout documentation must explain {expected}");
+            }
+            assert!(!doc.contains("`logout` only removes the local login"));
+        }
     }
 }

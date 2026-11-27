@@ -138,6 +138,14 @@ Unshare your own share when the user is done or when the task ends; do not
 leave tunnels running "just in case". The user can also see and delete
 tunnels and links in the server's web UI.
 
+`tunnel logout` revokes this machine's server login and ends all its tunnels,
+via `DELETE /v1/login`, then removes its local login. Only 204 confirms
+revocation; 401 means the login was already invalid. Offline, on timeout, or
+with any other answer, it still removes the local login and says the server
+did not confirm revocation and the login may still be valid. Remove the
+machine under Machines in the web UI (the output includes its URL when known)
+to ensure revocation. Use logout only when the user asks to log this machine out.
+
 ## Rules
 
 - Links are credentials: do not paste them into logs, commits, issues or

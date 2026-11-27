@@ -26,6 +26,11 @@ impl Role {
             _ => Self::Member,
         }
     }
+    /// Server-wide permission also lets members keep and create public tunnels.
+    pub fn may_public(self, can_public: bool, allow_all_public: bool) -> bool {
+        self.is_admin() || can_public || allow_all_public
+    }
+
     pub fn is_admin(self) -> bool {
         matches!(self, Self::Owner | Self::Admin)
     }

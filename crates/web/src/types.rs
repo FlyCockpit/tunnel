@@ -15,6 +15,8 @@ pub struct User {
     #[serde(default)]
     pub totp: bool,
     #[serde(default)]
+    pub recovery_codes_left: u64,
+    #[serde(default)]
     pub created_at: i64,
     /// Confirmed email address (servers that send mail).
     #[serde(default)]
@@ -212,16 +214,33 @@ pub struct Machine {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(try_from = "serde_json::Value")]
 pub struct UserRow {
-    #[serde(flatten)]
     pub user: User,
-    #[serde(default)]
     pub clients: i64,
-    #[serde(default)]
     pub tunnels: i64,
     /// Bytes this month.
-    #[serde(default)]
     pub traffic_bytes: u64,
+}
+
+impl TryFrom<serde_json::Value> for UserRow {
+    type Error = serde_json::Error;
+
+    fn try_from(mut row: serde_json::Value) -> Result<Self, Self::Error> {
+        fn count<T: serde::de::DeserializeOwned + Default>(
+            row: &mut serde_json::Value,
+            key: &str,
+        ) -> Result<T, serde_json::Error> {
+            row.get_mut(key).map(|v| serde_json::from_value(v.take())).unwrap_or_else(|| Ok(T::default()))
+        }
+
+        let clients = count(&mut row, "clients")?;
+        let tunnels = count(&mut row, "tunnels")?;
+        let traffic_bytes = count(&mut row, "traffic_bytes")?;
+        // Reuse User's Value decoder instead of serde's flatten content buffer.
+        let user = serde_json::from_value(row)?;
+        Ok(Self { user, clients, tunnels, traffic_bytes })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -288,4 +307,91 @@ pub struct DeviceRequest {
     pub ip: Option<String>,
     #[serde(default)]
     pub created_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// Keep the old wire decoder as an oracle, without shipping its content buffer.
+    #[derive(Deserialize)]
+    struct FlattenedRow {
+        #[serde(flatten)]
+        user: User,
+        #[serde(default)]
+        clients: i64,
+        #[serde(default)]
+        tunnels: i64,
+        #[serde(default)]
+        traffic_bytes: u64,
+    }
+
+    #[test]
+    fn the_session_keeps_the_remaining_recovery_count() {
+        for (extra, expected) in
+            [(json!({}), 0), (json!({ "recovery_codes_left": 1 }), 1), (json!({ "recovery_codes_left": 9 }), 9)]
+        {
+            let mut user = json!({ "id": "u1", "username": "alice", "role": "member", "totp": true });
+            user.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let session: SessionInfo = serde_json::from_value(json!({ "user": user })).unwrap();
+            assert_eq!(session.user.unwrap().recovery_codes_left, expected);
+        }
+    }
+
+    #[test]
+    fn sessions_keep_decoding_through_json_values() {
+        for session in [
+            json!({}),
+            json!({ "user": null, "csrf": null }),
+            json!({ "user": { "id": "u1", "username": "alice", "role": "owner" }, "csrf": "token" }),
+            json!({ "pending": true, "pending_user": "alice", "server": { "mail": true } }),
+            json!({ "usage": { "tunnels": u64::MAX }, "traffic": { "cap_bytes": null } }),
+            json!({ "user": { "id": "u1" } }),
+            json!({ "server": null }),
+            Value::Null,
+        ] {
+            let text = serde_json::to_string(&session).unwrap();
+            let expected = serde_json::from_str::<SessionInfo>(&text).ok();
+            let actual = serde_json::from_value::<SessionInfo>(session).ok();
+            assert_eq!(actual, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn user_rows_keep_the_flattened_wire_shape() {
+        let base = json!({ "id": "u1", "username": "alice", "role": "member" });
+        let mut cases = vec![base.clone(), Value::Null, json!([]), json!({})];
+        for (key, value) in [
+            ("clients", json!(i64::MAX)),
+            ("tunnels", json!(-1)),
+            ("traffic_bytes", json!(u64::MAX)),
+            ("traffic_bytes", json!(-1)),
+            ("clients", Value::Null),
+            ("tunnels", json!("3")),
+            ("clients", json!(1.5)),
+            ("disabled", json!(true)),
+            ("email", json!("alice@example.org")),
+            ("limits", json!({ "machines": { "setting": 3, "effective": 3 } })),
+            ("limits", Value::Null),
+            ("id", Value::Null),
+            ("extra", json!({ "future": true })),
+        ] {
+            let mut row = base.clone();
+            row[key] = value;
+            cases.push(row);
+        }
+        for row in cases {
+            let expected = serde_json::from_value::<FlattenedRow>(row.clone())
+                .map(|r| UserRow {
+                    user: r.user,
+                    clients: r.clients,
+                    tunnels: r.tunnels,
+                    traffic_bytes: r.traffic_bytes,
+                })
+                .ok();
+            let actual = serde_json::from_value::<UserRow>(row.clone()).ok();
+            assert_eq!(actual, expected, "{row}");
+        }
+    }
 }

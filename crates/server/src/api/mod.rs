@@ -74,7 +74,7 @@ where
         Err(e) => {
             tracing::error!(error = %e, "collecting api response failed");
             let body =
-                ErrorBody { error: ErrorDetail { code: "internal".into(), message: "internal server error".into() } };
+                ErrorBody { error: ErrorDetail { code: "internal".into(), message: "Internal server error".into() } };
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &body)
         }
     }
@@ -92,6 +92,7 @@ fn build_router() -> Router<Arc<AppState>> {
         .route("/v1/tunnels/{id}/turn-credentials", post(turn_credentials))
         .route("/v1/clients", post(create_client).get(list_clients))
         .route("/v1/clients/enroll", post(enroll_client))
+        .route("/v1/login", axum::routing::delete(revoke_login))
         .route("/v1/device/code", post(device::device_code))
         .route("/v1/device/token", post(device::device_token))
         .route("/v1/server", get(server_info))
@@ -129,15 +130,15 @@ impl ApiError {
     }
 
     pub(crate) fn unauthorized() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token")
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "Missing or invalid token")
     }
 
     pub(crate) fn not_found(what: &str) -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found", format!("{what} not found"))
+        Self::new(StatusCode::NOT_FOUND, "not_found", format!("No {what} found"))
     }
 
     pub(crate) fn expired() -> Self {
-        Self::new(StatusCode::CONFLICT, "tunnel_expired", "tunnel has expired or was deleted")
+        Self::new(StatusCode::CONFLICT, "tunnel_expired", "Tunnel has expired or was deleted")
     }
 
     pub(crate) fn validation(message: impl Into<String>) -> Self {
@@ -146,7 +147,7 @@ impl ApiError {
 
     pub(crate) fn internal(e: anyhow::Error) -> Self {
         tracing::error!(error = %format!("{e:#}"), "api request failed");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal server error")
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "Internal server error")
     }
 }
 
@@ -231,10 +232,10 @@ impl Caller {
     fn check_public(&self, mode: AccessMode, limits: &crate::config::Limits) -> ApiResult<()> {
         let allowed = match self {
             Self::Admin => true,
-            Self::Client { user, .. } => user.role.is_admin() || user.can_public,
-            Self::Service { .. } => false,
+            Self::Client { user, .. } => user.role.may_public(user.can_public, limits.allow_public_for_clients),
+            Self::Service { .. } => limits.allow_public_for_clients,
         };
-        if mode == AccessMode::Public && !allowed && !limits.allow_public_for_clients {
+        if mode == AccessMode::Public && !allowed {
             return Err(public_refused());
         }
         Ok(())
@@ -271,7 +272,7 @@ impl Caller {
     ) -> ApiResult<Option<i64>> {
         let limit = self.tunnel_ttl_limit(limits);
         match (ttl_s, never_expires) {
-            (Some(_), true) => Err(ApiError::validation("give ttl_s or never_expires, not both")),
+            (Some(_), true) => Err(ApiError::validation("Give ttl_s or never_expires, not both")),
             (None, false) => Ok(None),
             (None, true) => match limit {
                 Some(limit) => Err(ttl_refused(limit, self.account_role(), true)),
@@ -281,7 +282,7 @@ impl Caller {
                 let max = limit.unwrap_or(crate::limits::MAX_TTL_S);
                 if ttl < crate::limits::MIN_TUNNEL_TTL_S || (limit.is_none() && ttl > max) {
                     return Err(ApiError::validation(format!(
-                        "ttl_s must be within {}..={max}",
+                        "Ttl_s must be within {}..={max}",
                         crate::limits::MIN_TUNNEL_TTL_S
                     )));
                 }
@@ -308,11 +309,11 @@ fn quota_refused(q: TunnelQuotaExceeded) -> ApiError {
     let message = match q {
         TunnelQuotaExceeded::Account { limit, role } => crate::limits::tunnel_limit_message(limit, role),
         TunnelQuotaExceeded::Machine { limit } => format!(
-            "this machine's live-tunnel limit ({limit}, limits.max_tunnels_per_client) is reached; \
+            "This machine's live-tunnel limit ({limit}, limits.max_tunnels_per_client) is reached; \
              delete a tunnel first (`tunnel unshare`, or the Tunnels page)"
         ),
         TunnelQuotaExceeded::Service { limit } => format!(
-            "this service's live-tunnel quota ({limit}) is reached; delete a tunnel first, \
+            "This service's live-tunnel quota ({limit}) is reached; delete a tunnel first, \
              or ask the server's operator to raise it (`tunnel-server service set`)"
         ),
     };
@@ -323,7 +324,7 @@ fn public_refused() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
         "public_not_allowed",
-        "public previews need an admin's permission on this server; use access links or password mode",
+        "Public previews need an admin's permission on this server; use access links or password mode",
     )
 }
 
@@ -421,7 +422,7 @@ fn optional_json<T: DeserializeOwned + Default>(body: &Bytes) -> ApiResult<T> {
     if body.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(T::default());
     }
-    serde_json::from_slice(body).map_err(|e| ApiError::validation(format!("invalid JSON body: {e}")))
+    serde_json::from_slice(body).map_err(|e| ApiError::validation(format!("Invalid JSON body: {e}")))
 }
 
 // ----------------------------------------------------------------- schemas
@@ -645,6 +646,7 @@ pub struct TurnCredentialsResponse {
         create_client,
         list_clients,
         delete_client,
+        revoke_login,
         rename_client,
         enroll_client,
         create_service,
@@ -783,8 +785,15 @@ async fn healthz(
     Ok((status, Json(body)))
 }
 
-async fn openapi_json(_admin: Admin) -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+async fn openapi_json(caller: Caller) -> ApiResult<Json<utoipa::openapi::OpenApi>> {
+    if !matches!(caller, Caller::Admin) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "The API schema needs the admin token printed by setup (`tunnel-server token rotate` makes a new one); machine tokens cannot read it",
+        ));
+    }
+    Ok(Json(ApiDoc::openapi()))
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -913,10 +922,10 @@ async fn create_tunnel(
     let never = req.never_expires;
     let expires_at = caller
         .requested_expiry(req.ttl_s, req.never_expires, limits)?
-        .ok_or_else(|| ApiError::validation("ttl_s is required (or never_expires: true)"))?;
+        .ok_or_else(|| ApiError::validation("Ttl_s is required (or never_expires: true)"))?;
     let max_ports = req.max_ports.unwrap_or(limits.default_max_ports);
     if !(1..=limits.hard_max_ports).contains(&max_ports) {
-        return Err(ApiError::validation(format!("max_ports must be within 1..={}", limits.hard_max_ports)));
+        return Err(ApiError::validation(format!("Max_ports must be within 1..={}", limits.hard_max_ports)));
     }
     validate_label(req.label.as_deref())?;
     let name = match req.name.as_deref() {
@@ -926,7 +935,7 @@ async fn create_tunnel(
     if let Some(m) = &req.metadata
         && m.to_string().len() > MAX_METADATA_BYTES
     {
-        return Err(ApiError::validation(format!("metadata must be at most {MAX_METADATA_BYTES} bytes")));
+        return Err(ApiError::validation(format!("Metadata must be at most {MAX_METADATA_BYTES} bytes")));
     }
 
     if let Some(a) = &req.access {
@@ -1017,13 +1026,13 @@ fn pagination(query: Result<Query<Pagination>, QueryRejection>, clients: bool) -
 fn page_bounds(query: Pagination, clients: bool) -> ApiResult<(u32, Option<String>)> {
     let limit = query.limit.unwrap_or(100);
     if !(1..=500).contains(&limit) {
-        return Err(ApiError::validation("limit must be within 1..=500"));
+        return Err(ApiError::validation("Limit must be within 1..=500"));
     }
     if let Some(cursor) = &query.cursor {
         let valid =
             if clients { crate::clients::validate_name(cursor).is_ok() } else { tokens::is_valid_tunnel_id(cursor) };
         if !valid {
-            return Err(ApiError::validation("invalid cursor"));
+            return Err(ApiError::validation("Invalid cursor"));
         }
     }
     Ok((limit, query.cursor))
@@ -1302,18 +1311,18 @@ async fn mint_link(
     let remaining = (tunnel.expires_at - t).max(0) as u64;
     if req.ttl_s < MIN_LINK_TTL_S || req.ttl_s > remaining {
         return Err(ApiError::validation(format!(
-            "ttl_s must be within {MIN_LINK_TTL_S}..={remaining} (the tunnel's remaining lifetime)"
+            "Ttl_s must be within {MIN_LINK_TTL_S}..={remaining} (the tunnel's remaining lifetime)"
         )));
     }
     let session_ttl_s = match req.session_ttl_s {
-        Some(0) => return Err(ApiError::validation("session_ttl_s must be positive")),
+        Some(0) => return Err(ApiError::validation("Session_ttl_s must be positive")),
         Some(s) => s,
         None => state.config.limits.default_session_ttl_s,
     }
     .min(remaining);
     validate_label(req.label.as_deref())?;
     if req.port == Some(0) {
-        return Err(ApiError::validation("port must be 1..=65535"));
+        return Err(ApiError::validation("Port must be 1..=65535"));
     }
     let port = req.port.or_else(|| state.registry.get(&tunnel.id).and_then(|l| l.ports().first().copied()));
 
@@ -1469,7 +1478,7 @@ async fn turn_credentials(
     }
     let ttl_s = req.ttl_s.unwrap_or(webrtc.browser_ttl_s);
     if !(MIN_ICE_TTL_S..=webrtc.sandbox_ttl_s).contains(&ttl_s) {
-        return Err(ApiError::validation(format!("ttl_s must be within {MIN_ICE_TTL_S}..={}", webrtc.sandbox_ttl_s)));
+        return Err(ApiError::validation(format!("Ttl_s must be within {MIN_ICE_TTL_S}..={}", webrtc.sandbox_ttl_s)));
     }
     let tunnel = active_tunnel(&state, &caller, &id).await?;
     let ice = ice::mint(&state.config, &tunnel.id, API_SUBJECT, ttl_s);
@@ -1500,10 +1509,10 @@ pub fn tunnel_name(raw: &str) -> ApiResult<Option<String>> {
         return Ok(None);
     }
     if name.chars().count() > MAX_NAME_CHARS {
-        return Err(ApiError::validation(format!("name must be at most {MAX_NAME_CHARS} characters")));
+        return Err(ApiError::validation(format!("Name must be at most {MAX_NAME_CHARS} characters")));
     }
     if name.chars().any(|c| c.is_control() || hidden_char(c)) {
-        return Err(ApiError::validation("name must not contain control, zero-width or bidi characters"));
+        return Err(ApiError::validation("Name must not contain control, zero-width or bidi characters"));
     }
     Ok(Some(name.to_string()))
 }
@@ -1511,7 +1520,7 @@ pub fn tunnel_name(raw: &str) -> ApiResult<Option<String>> {
 fn validate_label(label: Option<&str>) -> ApiResult<()> {
     match label {
         Some(l) if l.chars().count() > MAX_LABEL_LEN => {
-            Err(ApiError::validation(format!("label must be at most {MAX_LABEL_LEN} characters")))
+            Err(ApiError::validation(format!("Label must be at most {MAX_LABEL_LEN} characters")))
         }
         _ => Ok(()),
     }
@@ -1528,19 +1537,19 @@ async fn build_access(
 ) -> ApiResult<Access> {
     if req.mode != AccessMode::Password {
         if req.username.is_some() || req.password.is_some() {
-            return Err(ApiError::validation("username and password apply only to access mode \"password\""));
+            return Err(ApiError::validation("Username and password apply only to access mode \"password\""));
         }
         return Ok(Access { mode: req.mode, password_user: None, password_hash: None });
     }
     let current = current.filter(|c| c.mode == AccessMode::Password);
     let username = match req.username.or_else(|| current.and_then(|c| c.password_user.clone())) {
         Some(u) => u,
-        None => return Err(ApiError::validation("access.username is required for password mode")),
+        None => return Err(ApiError::validation("Access.username is required for password mode")),
     };
     let len = username.chars().count();
     if !(1..=password::MAX_USERNAME_LEN).contains(&len) || username.chars().any(char::is_control) {
         return Err(ApiError::validation(format!(
-            "access.username must be 1..={} characters without control characters",
+            "Access.username must be 1..={} characters without control characters",
             password::MAX_USERNAME_LEN
         )));
     }
@@ -1549,7 +1558,7 @@ async fn build_access(
             let len = p.chars().count();
             if !(password::MIN_PASSWORD_LEN..=password::MAX_PASSWORD_LEN).contains(&len) {
                 return Err(ApiError::validation(format!(
-                    "access.password must be {}..={} characters",
+                    "Access.password must be {}..={} characters",
                     password::MIN_PASSWORD_LEN,
                     password::MAX_PASSWORD_LEN
                 )));
@@ -1559,7 +1568,7 @@ async fn build_access(
         // PATCH carries preservation to the transaction; never copy a hash
         // from this earlier read over a concurrent password rotation.
         None if current.is_some_and(|c| c.password_hash.is_some()) => None,
-        None => return Err(ApiError::validation("access.password is required for password mode")),
+        None => return Err(ApiError::validation("Access.password is required for password mode")),
     };
     Ok(Access { mode: AccessMode::Password, password_user: Some(username), password_hash })
 }

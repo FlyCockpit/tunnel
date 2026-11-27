@@ -58,11 +58,15 @@ struct Resp {
 }
 
 async fn send(state: &Arc<AppState>, req: Request<axum::body::Body>, ip: u8) -> Resp {
+    let ui_api = req.uri().path().starts_with("/ui/api/");
     let resp = super::handle(state.clone(), peer(ip), req).await;
     let status = resp.status();
     let set_cookie = resp.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string());
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if ui_api && let Some(message) = body["error"]["message"].as_str() {
+        assert!(message.chars().next().is_some_and(|c| c.is_uppercase()), "{message}");
+    }
     Resp { status, body, set_cookie }
 }
 
@@ -436,7 +440,10 @@ async fn totp_enrolment_login_replay_and_recovery_codes() {
     let code = codes.next();
     let r = b.call(&state, "POST", "/ui/api/login/totp", Some(json!({ "code": code }))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(b.call(&state, "GET", "/ui/api/session", None).await.body["user"]["username"], "olivia");
+    assert_eq!(r.body["recovery_code"], false);
+    let session = b.call(&state, "GET", "/ui/api/session", None).await;
+    assert_eq!(session.body["user"]["username"], "olivia");
+    assert_eq!(session.body["user"]["recovery_codes_left"], 10);
 
     // The same code again (another sign-in) is a replay.
     let mut c = Browser::new(8);
@@ -447,6 +454,8 @@ async fn totp_enrolment_login_replay_and_recovery_codes() {
     let r = c.call(&state, "POST", "/ui/api/login/totp", Some(json!({ "code": recovery[0].to_uppercase() }))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert_eq!(r.body["recovery_codes_left"], 9);
+    assert_eq!(r.body["recovery_code"], true);
+    assert_eq!(c.call(&state, "GET", "/ui/api/session", None).await.body["user"]["recovery_codes_left"], 9);
     let mut d = Browser::new(9);
     d.call(&state, "POST", "/ui/api/login", Some(json!({ "username": "olivia", "password": "olivia-password" }))).await;
     let r = d.call(&state, "POST", "/ui/api/login/totp", Some(json!({ "code": recovery[0] }))).await;
@@ -513,6 +522,10 @@ impl Codes {
 async fn password_change_ends_other_sessions_and_rotates_this_one() {
     let state = state();
     let mut owner = owner(&state).await;
+    let token = approve_machine(&state, &mut owner, "laptop").await;
+    let tunnel = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
+    let id = tunnel.body["id"].as_str().unwrap();
+    let _live = connect(&state, id, &[3000]);
     let mut other = Browser::new(2);
     other
         .call(&state, "POST", "/ui/api/login", Some(json!({ "username": "olivia", "password": "olivia-password" })))
@@ -528,6 +541,8 @@ async fn password_change_ends_other_sessions_and_rotates_this_one() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert_ne!(owner.cookie, before, "rotated");
+    assert_eq!(bearer(&state, "GET", "/v1/tunnels", &token, None).await.status, StatusCode::OK);
+    assert!(state.registry.get(id).is_some());
     assert_eq!(owner.call(&state, "GET", "/ui/api/session", None).await.body["user"]["username"], "olivia");
     assert!(other.call(&state, "GET", "/ui/api/session", None).await.body["user"].is_null());
 }
@@ -603,34 +618,6 @@ async fn members_see_and_manage_only_their_own_machines_tunnels_and_links() {
 }
 
 #[tokio::test]
-async fn public_previews_need_an_admin_or_permission() {
-    let state = state();
-    let mut owner = owner(&state).await;
-    let mut ann = member(&state, &mut owner, "ann", 2).await;
-    let ann_token = approve_machine(&state, &mut ann, "laptop").await;
-    let owner_token = approve_machine(&state, &mut owner, "server").await;
-    let r = create_tunnel(&state, &ann_token, json!({ "mode": "public" })).await;
-    assert_eq!((r.status, r.body["error"]["code"].clone()), (StatusCode::FORBIDDEN, json!("public_not_allowed")));
-    let info = bearer(&state, "GET", "/v1/server", &ann_token, None).await;
-    assert_eq!(info.body["limits"]["public_allowed"], false);
-    assert_eq!(info.body["ui_origin"], ORIGIN);
-    assert_eq!(create_tunnel(&state, &owner_token, json!({ "mode": "public" })).await.status, StatusCode::CREATED);
-    // Password mode stays allowed for members.
-    let r = create_tunnel(&state, &ann_token, json!({ "mode": "password", "username": "u", "password": "a-password" }))
-        .await;
-    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
-
-    let users = owner.call(&state, "GET", "/ui/api/users", None).await;
-    let ann_id = users.body["users"].as_array().unwrap().iter().find(|u| u["username"] == "ann").unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "can_public": true }))).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(create_tunnel(&state, &ann_token, json!({ "mode": "public" })).await.status, StatusCode::CREATED);
-}
-
-#[tokio::test]
 async fn member_quotas_and_ttl_cap() {
     let state = state_with(|c| {
         c.limits.member_max_tunnels = 2;
@@ -664,120 +651,6 @@ async fn member_quotas_and_ttl_cap() {
 }
 
 #[tokio::test]
-async fn device_flow_states_and_phishing_resistance() {
-    let state = state();
-    let mut owner = owner(&state).await;
-    let r = bearer_free(&state, "/v1/device/code", json!({ "client_name": "attacker-box" })).await;
-    let device_code = r.body["device_code"].as_str().unwrap().to_string();
-    let user_code = r.body["user_code"].as_str().unwrap().to_string();
-    assert!(!r.body["verification_uri"].as_str().unwrap().contains(&user_code), "no prefilled code");
-    let poll = || bearer_free(&state, "/v1/device/token", json!({ "device_code": device_code }));
-    assert_eq!(poll().await.body["error"]["code"], "authorization_pending");
-    assert_eq!(poll().await.body["error"]["code"], "slow_down", "polled faster than the interval");
-    // The approval page shows what is being approved.
-    let look = owner
-        .call(&state, "POST", "/ui/api/device/lookup", Some(json!({ "user_code": user_code.to_lowercase() })))
-        .await;
-    assert_eq!(look.body["request"]["client_name"], "attacker-box");
-    assert_eq!(look.body["request"]["ip"], "203.0.113.9");
-    // A wrong code finds nothing.
-    let r = owner.call(&state, "POST", "/ui/api/device/lookup", Some(json!({ "user_code": "BBBB-BBBB" }))).await;
-    assert_eq!(r.status, StatusCode::NOT_FOUND);
-    // Deny: the CLI hears access_denied, then the code is gone.
-    owner
-        .call(&state, "POST", "/ui/api/device/decide", Some(json!({ "user_code": user_code, "approve": false })))
-        .await;
-    state
-        .db
-        .call({
-            let h = tokens::hash_token(&device_code);
-            move |c| {
-                c.execute("UPDATE device_logins SET last_poll_at = 0 WHERE device_code_hash = ?1", [h])?;
-                Ok(())
-            }
-        })
-        .await
-        .unwrap();
-    assert_eq!(poll().await.body["error"]["code"], "access_denied");
-    assert_eq!(poll().await.body["error"]["code"], "invalid_grant");
-    // Expiry.
-    let r = bearer_free(&state, "/v1/device/code", json!({ "client_name": "slow" })).await;
-    let dc = r.body["device_code"].as_str().unwrap().to_string();
-    state
-        .db
-        .call({
-            let h = tokens::hash_token(&dc);
-            move |c| {
-                c.execute("UPDATE device_logins SET expires_at = 0 WHERE device_code_hash = ?1", [h])?;
-                Ok(())
-            }
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        bearer_free(&state, "/v1/device/token", json!({ "device_code": dc })).await.body["error"]["code"],
-        "expired_token"
-    );
-    // The token is handed out exactly once.
-    let r = bearer_free(&state, "/v1/device/code", json!({ "client_name": "once" })).await;
-    let dc = r.body["device_code"].as_str().unwrap().to_string();
-    owner
-        .call(
-            &state,
-            "POST",
-            "/ui/api/device/decide",
-            Some(json!({ "user_code": r.body["user_code"], "approve": true })),
-        )
-        .await;
-    let first = bearer_free(&state, "/v1/device/token", json!({ "device_code": dc })).await;
-    assert_eq!(first.status, StatusCode::OK);
-    assert_eq!(first.body["api"], "https://api.example.com");
-    assert_eq!(
-        bearer_free(&state, "/v1/device/token", json!({ "device_code": dc })).await.body["error"]["code"],
-        "invalid_grant"
-    );
-}
-
-#[tokio::test]
-async fn approving_a_machine_after_ten_minutes_needs_a_fresh_code() {
-    let state = state();
-    let mut owner = owner(&state).await;
-    let setup =
-        owner.call(&state, "POST", "/ui/api/account/totp/setup", Some(json!({ "password": "olivia-password" }))).await;
-    let mut codes = Codes::new(base32_decode(setup.body["secret"].as_str().unwrap()));
-    assert_eq!(
-        owner.call(&state, "POST", "/ui/api/account/totp/enable", Some(json!({ "code": codes.next() }))).await.status,
-        StatusCode::OK
-    );
-    state
-        .db
-        .call(|c| {
-            c.execute("UPDATE ui_sessions SET auth_at = auth_at - 3600", [])?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let r = bearer_free(&state, "/v1/device/code", json!({ "client_name": "box" })).await;
-    let user_code = r.body["user_code"].as_str().unwrap().to_string();
-    let look = owner.call(&state, "POST", "/ui/api/device/lookup", Some(json!({ "user_code": user_code }))).await;
-    assert_eq!(look.body["needs_code"], true);
-    let r = owner
-        .call(&state, "POST", "/ui/api/device/decide", Some(json!({ "user_code": user_code, "approve": true })))
-        .await;
-    assert_eq!(r.body["error"]["code"], "code_required");
-    let code = codes.next();
-    let r = owner
-        .call(
-            &state,
-            "POST",
-            "/ui/api/device/decide",
-            Some(json!({ "user_code": user_code, "approve": true, "code": code })),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-}
-
-#[tokio::test]
 async fn disabling_a_member_ends_sessions_machines_and_tunnels() {
     let state = state();
     let mut owner = owner(&state).await;
@@ -785,6 +658,9 @@ async fn disabling_a_member_ends_sessions_machines_and_tunnels() {
     let token = approve_machine(&state, &mut ann, "laptop").await;
     let t = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
     let id = t.body["id"].as_str().unwrap().to_string();
+    let _live = connect(&state, &id, &[3000]);
+    let epoch = state.registry.gate_epoch(&id);
+    assert!(matches!(&*state.tunnel(&id).await.unwrap(), crate::db::TunnelLookup::Live(_)));
     let users = owner.call(&state, "GET", "/ui/api/users", None).await;
     let ann_id = users.body["users"].as_array().unwrap().iter().find(|u| u["username"] == "ann").unwrap()["id"]
         .as_str()
@@ -792,6 +668,9 @@ async fn disabling_a_member_ends_sessions_machines_and_tunnels() {
         .to_string();
     let r = owner.call(&state, "PATCH", &format!("/ui/api/users/{ann_id}"), Some(json!({ "disabled": true }))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(state.registry.get(&id).is_none());
+    assert!(epoch.is_cancelled());
+    assert!(matches!(&*state.tunnel(&id).await.unwrap(), crate::db::TunnelLookup::Tombstoned));
     assert!(ann.call(&state, "GET", "/ui/api/session", None).await.body["user"].is_null());
     assert_eq!(bearer(&state, "GET", "/v1/tunnels", &token, None).await.status, StatusCode::UNAUTHORIZED);
     assert!(matches!(state.db.lookup_tunnel(id).await.unwrap(), crate::db::TunnelLookup::Tombstoned));
@@ -1076,33 +955,12 @@ async fn an_owner_reset_drops_logins_approved_before_it() {
             &state,
             "POST",
             "/ui/api/invite/accept",
-            Some(json!({ "token": reset, "password": "recovered-password", "revoke_machines": true })),
+            Some(json!({ "token": reset, "password": "recovered-password" })),
         )
         .await;
     assert_eq!(r.status, StatusCode::OK);
     let t = bearer_free(&state, "/v1/device/token", json!({ "device_code": device_code })).await;
     assert_eq!(t.body["error"]["code"], "invalid_grant", "no token for a login approved before the reset");
-}
-
-#[tokio::test]
-async fn adding_a_headless_machine_needs_a_fresh_code_too() {
-    let state = state();
-    let mut owner = owner(&state).await;
-    let mut codes = enable_totp(&state, &mut owner, "olivia-password").await;
-    state
-        .db
-        .call(|c| {
-            c.execute("UPDATE ui_sessions SET auth_at = auth_at - 3600", [])?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let r = owner.call(&state, "POST", "/ui/api/machines", Some(json!({ "name": "ci" }))).await;
-    assert_eq!(r.body["error"]["code"], "code_required");
-    let code = codes.next();
-    let r = owner.call(&state, "POST", "/ui/api/machines", Some(json!({ "name": "ci", "code": code }))).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert!(r.body["login_code"].as_str().unwrap().starts_with("tnenr_"));
 }
 
 #[tokio::test]
@@ -1152,21 +1010,23 @@ async fn machines_can_belong_to_an_owner_before_anyone_signs_up() {
 }
 
 #[tokio::test]
-async fn owner_reset_can_revoke_the_owners_machines() {
+async fn owner_reset_revokes_the_owners_machines_and_tunnels() {
     let state = state();
     let mut owner = owner(&state).await;
     let token = approve_machine(&state, &mut owner, "laptop").await;
+    let tunnel = create_tunnel(&state, &token, json!({ "mode": "link" })).await;
+    let id = tunnel.body["id"].as_str().unwrap();
+    let _live = connect(&state, id, &[3000]);
+    let ended = state.registry.get(id).unwrap().cancel.clone();
     let reset = invite_token(&state, InviteKind::OwnerReset, Role::Owner).await;
     let r = Browser::new(5)
-        .call(
-            &state,
-            "POST",
-            "/ui/api/invite/accept",
-            Some(json!({ "token": reset, "password": "a-new-password", "revoke_machines": true })),
-        )
+        .call(&state, "POST", "/ui/api/invite/accept", Some(json!({ "token": reset, "password": "a-new-password" })))
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert_eq!(bearer(&state, "GET", "/v1/tunnels", &token, None).await.status, StatusCode::UNAUTHORIZED);
+    assert!(state.registry.get(id).is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(2), ended.cancelled()).await.unwrap();
+    assert!(matches!(state.db.lookup_tunnel(id.into()).await.unwrap(), crate::db::TunnelLookup::Tombstoned));
 }
 
 /// Reaches the embedded shell, so CI's `server-ui` job also runs it by name
@@ -1267,7 +1127,18 @@ async fn admin_changes_are_authorized_inside_the_transaction() {
     let promote = crate::accounts::UserPatch { role: Some(Role::Admin), ..Default::default() };
     // The session ends (an owner recovery) while the request is in flight.
     state.db.delete_user_sessions(olivia.clone(), None).await.unwrap();
-    let r = state.db.admin_update_user(olivia.clone(), session.clone(), ann.clone(), promote, None).await.unwrap();
+    let r = state
+        .db
+        .admin_update_user(
+            olivia.clone(),
+            session.clone(),
+            ann.clone(),
+            promote,
+            None,
+            state.config.limits.allow_public_for_clients,
+        )
+        .await
+        .unwrap();
     assert_eq!(r.unwrap_err(), crate::accounts::AdminError::SignedOut);
     let invite = state
         .db
@@ -2013,3 +1884,27 @@ mod reset_tests;
 
 #[path = "email_tests.rs"]
 mod email_tests;
+
+#[tokio::test]
+async fn schema_requires_the_admin_token_and_distinguishes_invalid_tokens() {
+    let state = state();
+    let mut owner = owner(&state).await;
+    let mut ann = member(&state, &mut owner, "ann", 2).await;
+    let token = approve_machine(&state, &mut ann, "member-box").await;
+    let refused = bearer(&state, "GET", "/v1/openapi.json", &token, None).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        refused.body["error"]["message"],
+        "The API schema needs the admin token printed by setup (`tunnel-server token rotate` makes a new one); machine tokens cannot read it"
+    );
+    for token in ["", "tncli_invalid", "tnadm_invalid"] {
+        assert_eq!(bearer(&state, "GET", "/v1/openapi.json", token, None).await.status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(bearer(&state, "GET", "/v1/openapi.json", ADMIN_CREDENTIAL, None).await.status, StatusCode::OK);
+}
+
+#[path = "message_tests.rs"]
+mod message_tests;
+
+#[path = "device_tests.rs"]
+mod device_tests;

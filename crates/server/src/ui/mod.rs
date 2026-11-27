@@ -19,7 +19,6 @@ mod checks;
 mod email;
 mod handlers;
 
-pub use email::notify_user;
 pub mod totp;
 
 use std::net::{IpAddr, SocketAddr};
@@ -117,25 +116,25 @@ fn forbidden(code: &'static str, message: &str) -> ApiError {
 pub fn check_request(method: &Method, headers: &HeaderMap, ui_host: &str) -> Result<(), ApiError> {
     let safe = matches!(*method, Method::GET | Method::HEAD);
     if !safe && !matches!(*method, Method::POST | Method::PATCH | Method::DELETE | Method::PUT) {
-        return Err(forbidden("method", "method not allowed"));
+        return Err(forbidden("method", "Method not allowed"));
     }
     if headers.get(CSRF_HEADER).is_none_or(|v| v.is_empty()) {
-        return Err(forbidden("csrf", "missing X-Tunnel-CSRF header"));
+        return Err(forbidden("csrf", "Missing X-Tunnel-CSRF header"));
     }
     match headers.get(header::ORIGIN) {
         Some(origin) => {
             let expected = format!("https://{ui_host}");
             if !origin.as_bytes().eq_ignore_ascii_case(expected.as_bytes()) {
-                return Err(forbidden("origin", "cross-origin request refused"));
+                return Err(forbidden("origin", "Cross-origin request refused"));
             }
         }
-        None if !safe => return Err(forbidden("origin", "missing Origin header")),
+        None if !safe => return Err(forbidden("origin", "Missing Origin header")),
         None => {}
     }
     if let Some(site) = headers.get("sec-fetch-site")
         && site.as_bytes() != b"same-origin"
     {
-        return Err(forbidden("origin", "cross-site request refused"));
+        return Err(forbidden("origin", "Cross-site request refused"));
     }
     Ok(())
 }
@@ -263,14 +262,14 @@ impl FromRequestParts<Arc<AppState>> for Signed {
     async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
         let mut ctx = Ctx::from_request_parts(parts, state).await?;
         let Some((id, session)) = ctx.session.take().filter(|(_, s)| !s.pending) else {
-            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "sign in first"));
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "signed_out", "Sign in first"));
         };
         if !matches!(ctx.method, Method::GET | Method::HEAD) {
             let keys = state.ui.keys.as_ref().ok_or_else(|| ApiError::not_found("route"))?;
             let expected = keys.csrf_token(&id);
             let ok = ctx.csrf_header.as_deref().is_some_and(|got| tokens::hashes_equal(got, &expected));
             if !ok {
-                return Err(forbidden("csrf", "missing or stale CSRF token; reload the page"));
+                return Err(forbidden("csrf", "Missing or stale CSRF token; reload the page"));
             }
         }
         Ok(Self { ctx, session })
@@ -286,7 +285,7 @@ impl FromRequestParts<Arc<AppState>> for AdminSigned {
     async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
         let signed = Signed::from_request_parts(parts, state).await?;
         if !signed.user().role.is_admin() {
-            return Err(forbidden("admin_only", "only admins can do this"));
+            return Err(forbidden("admin_only", "Only admins can do this"));
         }
         Ok(Self(signed))
     }
